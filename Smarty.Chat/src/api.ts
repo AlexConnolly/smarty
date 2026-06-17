@@ -1,39 +1,4 @@
-export type Role = 'user' | 'assistant' | 'system'
-
-export interface ChatMessage {
-  role: Role
-  content: string
-}
-
-export interface ChatRequest {
-  system?: string
-  model?: string
-  enableTools?: boolean
-  messages: ChatMessage[]
-}
-
-export interface StreamHandlers {
-  onRun?: (runId: string) => void
-  /** Fired once when a resume connection succeeds, before replay — clear and rebuild from it. */
-  onResumed?: () => void
-  onContent?: (text: string) => void
-  onContentCleared?: () => void
-  onReasoning?: (text: string) => void
-  onToolStarted?: (name: string, args: string) => void
-  onToolCompleted?: (name: string, result: string) => void
-  onError?: (message: string) => void
-  onDone?: () => void
-}
-
-/** Resume an existing background run instead of starting a new one. */
-export interface Resume {
-  runId: string
-  from: number
-}
-
-const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
-
-/** Fetch the list of model names from the API (proxied to Ollama). */
+// Fetch the list of model names from the API (proxied to Ollama).
 export async function fetchModels(): Promise<string[]> {
   try {
     const res = await fetch('/api/models')
@@ -45,7 +10,7 @@ export async function fetchModels(): Promise<string[]> {
   }
 }
 
-/** Send a WAV voice note to the API and get back the transcribed text (local Whisper). */
+// Send a WAV voice note to the API and get back the transcribed text (local Whisper).
 export async function transcribe(wav: Blob): Promise<string> {
   const form = new FormData()
   form.append('audio', wav, 'note.wav')
@@ -55,75 +20,42 @@ export async function transcribe(wav: Blob): Promise<string> {
   return (data.text ?? '').trim()
 }
 
-/** Ask the server to stop a background run (the Stop button). */
-export async function cancelRun(runId: string): Promise<void> {
-  try {
-    await fetch(`/api/chat/${runId}`, { method: 'DELETE' })
-  } catch {
-    /* ignore */
-  }
+export interface SessionHandlers {
+  onMsgStart?: (id: number, role: string) => void
+  onContent?: (id: number, text: string) => void
+  onReasoning?: (id: number, text: string) => void
+  onMsgEnd?: (id: number) => void
+  onWorking?: (id: string, task: string) => void
+  onWorkingDone?: (id: string) => void
+}
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** Post a user message to the session. The reply (and any later results) arrive on the stream. */
+export async function sendMessage(sessionId: string, content: string): Promise<void> {
+  await fetch(`/api/session/${sessionId}/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  })
 }
 
 /**
- * Start (or resume) a background run and stream its events. The run lives on the server independent
- * of this connection, so a dropped network / backgrounded tab does NOT stop it — we just silently
- * reconnect from where we left off. A real server-side error surfaces via onError; onDone fires when
- * the run has truly finished.
+ * Open the session's persistent event stream and keep it open, transparently reconnecting on drops.
+ * Everything the assistant says — instant acks AND results pushed back asynchronously from background
+ * workers — arrives here. The stream never ends on its own; it runs until `signal` is aborted.
  */
-export async function streamChat(
-  body: ChatRequest,
-  handlers: StreamHandlers,
-  signal?: AbortSignal,
-  resume?: Resume,
+export async function openSessionStream(
+  sessionId: string,
+  handlers: SessionHandlers,
+  signal: AbortSignal,
 ): Promise<void> {
-  let runId = resume?.runId ?? ''
-  let received = resume?.from ?? 0
+  let received = 0
 
-  // 1) Create the run (unless resuming an existing one).
-  if (!runId) {
-    let res: Response
+  while (!signal.aborted) {
     try {
-      res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal,
-      })
-    } catch (err) {
-      handlers.onError?.(err instanceof Error ? err.message : 'request failed')
-      return
-    }
-    if (!res.ok) {
-      handlers.onError?.(`HTTP ${res.status}`)
-      return
-    }
-    try {
-      runId = (await res.json()).runId
-    } catch {
-      handlers.onError?.('unexpected response')
-      return
-    }
-    handlers.onRun?.(runId)
-  }
-
-  // 2) Subscribe, transparently reconnecting on transient drops, until the run is done or we abort.
-  let firstConnect = true
-  while (true) {
-    let finished = false
-    try {
-      const res = await fetch(`/api/chat/${runId}?from=${received}`, { signal })
-      if (res.status === 404) {
-        // The run is gone (almost always: the API was restarted, or it aged out). This is not an
-        // error worth shouting about — just stop quietly and leave the chat as it is.
-        handlers.onDone?.()
-        return
-      }
+      const res = await fetch(`/api/session/${sessionId}?from=${received}`, { signal })
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
-
-      if (firstConnect) {
-        firstConnect = false
-        if (resume) handlers.onResumed?.() // rebuild the message from a clean replay
-      }
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
@@ -141,34 +73,20 @@ export async function streamChat(
           const ev = parseFrame(frame)
           if (!ev) continue
           received++ // every buffered event counts, so reconnect offsets stay exact
-          if (ev.event === 'done') {
-            finished = true
-            break
-          }
           dispatch(ev, handlers)
         }
-        if (finished) break
       }
-    } catch (err) {
-      if (signal?.aborted) return
-      // Transient network drop — wait briefly and reconnect from `received`. The run kept going.
-      await delay(700)
-      continue
+    } catch {
+      if (signal.aborted) return
     }
-
-    if (finished) {
-      handlers.onDone?.()
-      return
-    }
-    if (signal?.aborted) return
-    // Connection closed without the terminal event (e.g. idle proxy timeout) — reconnect.
-    await delay(300)
+    if (signal.aborted) return
+    await delay(500) // the session lives on; reconnect from where we left off
   }
 }
 
 interface Frame {
   event: string
-  data: Record<string, string>
+  data: Record<string, unknown>
 }
 
 function parseFrame(frame: string): Frame | null {
@@ -186,26 +104,28 @@ function parseFrame(frame: string): Frame | null {
   }
 }
 
-function dispatch(ev: Frame, h: StreamHandlers): void {
+function dispatch(ev: Frame, h: SessionHandlers): void {
+  const d = ev.data as { id: number; role: string; text: string; task: string }
+  // Task events carry a string task id, separate from the numeric message id.
+  const taskId = String((ev.data as { id?: unknown }).id ?? '')
   switch (ev.event) {
-    case 'content':
-      h.onContent?.(ev.data.text)
+    case 'msg_start':
+      h.onMsgStart?.(d.id, d.role)
       break
-    case 'content_cleared':
-      h.onContentCleared?.()
+    case 'content':
+      h.onContent?.(d.id, d.text)
       break
     case 'reasoning':
-      h.onReasoning?.(ev.data.text)
+      h.onReasoning?.(d.id, d.text)
       break
-    case 'tool_started':
-      h.onToolStarted?.(ev.data.name, ev.data.arguments)
+    case 'msg_end':
+      h.onMsgEnd?.(d.id)
       break
-    case 'tool_completed':
-      h.onToolCompleted?.(ev.data.name, ev.data.result)
+    case 'working':
+      h.onWorking?.(taskId, d.task)
       break
-    case 'error':
-      h.onError?.(ev.data.message)
+    case 'working_done':
+      h.onWorkingDone?.(taskId)
       break
-    // 'completed' / 'cancelled' are informational; 'done' is handled by the caller.
   }
 }

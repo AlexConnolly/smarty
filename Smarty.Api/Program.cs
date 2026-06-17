@@ -50,6 +50,10 @@ var json = new JsonSerializerOptions(JsonSerializerDefaults.Web)
 };
 var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
 
+// Conversational orchestrator + async workers. Orchestrator and worker share one model (two roles).
+var sessions = new SessionStore();
+var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json);
+
 app.MapGet("/health", () => Results.Ok(new { status = "ok", model = defaultModel }));
 
 // Open passthrough of the available Ollama models, so the UI can offer a picker.
@@ -90,6 +94,62 @@ app.MapPost("/api/transcribe", async (HttpRequest req, WhisperTranscriber whispe
     catch (Exception ex)
     {
         return Results.Json(new { error = ex.Message }, statusCode: 500);
+    }
+});
+
+// ---- Conversational session (orchestrator + async workers) ----
+
+// Send a user message. Returns immediately; the orchestrator's reply (and any later results pushed
+// back from background workers) arrive asynchronously on the session's event stream.
+app.MapPost("/api/session/{id}/message", (string id, SessionMessage body) =>
+{
+    string text = (body?.Content ?? "").Trim();
+    if (text.Length == 0) return Results.BadRequest(new { error = "empty message" });
+    var session = sessions.GetOrCreate(id);
+    _ = Task.Run(async () =>
+    {
+        try { await orchestrator.HandleMessageAsync(session, text, CancellationToken.None); }
+        catch (Exception ex) { Console.Error.WriteLine($"[orchestrator] {ex}"); }
+    });
+    return Results.Ok();
+});
+
+// The session's persistent event stream (SSE). The client keeps this open continuously and replays
+// from `from` on reconnect, so async pushes are never missed. This stream never ends on its own.
+app.MapGet("/api/session/{id}", async (string id, int? from, HttpContext ctx) =>
+{
+    var session = sessions.GetOrCreate(id);
+
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache, no-transform";
+    ctx.Response.Headers["X-Accel-Buffering"] = "no";
+
+    int next = Math.Max(0, from ?? 0);
+    try
+    {
+        await ctx.Response.WriteAsync(":" + new string(' ', 2048) + "\n\n", ctx.RequestAborted);
+        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+
+        while (true)
+        {
+            var change = session.WaitForChangeAsync();
+            bool wrote = false;
+            while (session.TryGet(next, out var ev))
+            {
+                await ctx.Response.WriteAsync($"event: {ev.Event}\n", ctx.RequestAborted);
+                await ctx.Response.WriteAsync($"data: {ev.Data}\n\n", ctx.RequestAborted);
+                wrote = true;
+                next++;
+            }
+            if (wrote) await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+
+            await Task.WhenAny(change, Task.Delay(Timeout.Infinite, ctx.RequestAborted));
+            if (ctx.RequestAborted.IsCancellationRequested) break;
+        }
+    }
+    catch (OperationCanceledException)
+    {
+        // client went away — session lives on
     }
 });
 
@@ -171,6 +231,42 @@ app.Run();
 
 // ---- helpers ----
 
+// Authoritative date/time + environment + truthfulness context, rebuilt fresh each call so the date
+// is always current. Shared by the worker agents and the legacy /api/chat path.
+string HostContext()
+{
+    var now = DateTime.Now;
+    string nowLocal = now.ToString("F", CultureInfo.CurrentCulture);
+    string timeZone = TimeZoneInfo.Local.StandardName;
+    return
+        "\n\n=== CURRENT DATE AND TIME (AUTHORITATIVE) ===\n" +
+        $"It is now {nowLocal} ({timeZone}). The current year is {now.Year}. This is the REAL, " +
+        $"verified system clock. Your training data ends before {now.Year}, so {now.Year} may FEEL like " +
+        "the future to you — it is not. It is the present. Never say or reason that this date is " +
+        "impossible, fictional, hypothetical, a typo, or in the future. Treat it as simple fact and " +
+        "use it whenever the date or time is relevant.\n" +
+        "=== ENVIRONMENT ===\n" +
+        $"Host: {RuntimeInformation.OSDescription}. The run_shell_command tool runs " +
+        $"{(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows PowerShell" : "/bin/sh")}; use " +
+        "commands valid for it. It is a FULL shell WITH internet access — you can fetch live data " +
+        "(news, prices, weather, web pages, APIs) with a web request (e.g. Invoke-RestMethod on Windows). " +
+        "Never tell the user you lack internet access or live data; go and fetch it with the tool. If a " +
+        "command fails, do not give up or merely explain the error — diagnose it, adjust, and try again " +
+        "until you have a real answer.\n" +
+        "=== TRUTHFULNESS (CRITICAL) ===\n" +
+        "NEVER invent, fabricate, guess, or rely on memory for factual data such as news headlines, prices, " +
+        "search results, dates, or web content. Report ONLY information that actually appeared in a tool " +
+        "result this turn. Do not claim you fetched, parsed, or used a source unless you genuinely did. If " +
+        "your tools fail or return nothing usable after honest attempts, say so plainly — e.g. 'I couldn't " +
+        "retrieve that' — and do not present made-up data as real. Always respond in English.";
+}
+
+// System prompt for a worker (the "hands"): a capable, relentless task-doer with real tools.
+string WorkerSystemPrompt() =>
+    "You are a capable, relentless assistant. Complete the task you are given by using your tools — use " +
+    "the shell for anything you need (system info, files, and the internet via web requests). Be thorough, " +
+    "verify your results, and give a clear, complete answer to the task." + HostContext();
+
 (AgentInput input, string prompt) BuildAgent(ChatRequest request)
 {
     var messages = request.Messages ?? new List<ChatMessage>();
@@ -193,34 +289,10 @@ app.Run();
     string baseSystem = string.IsNullOrWhiteSpace(request.System)
         ? "You are a helpful assistant."
         : request.System!;
-    var now = DateTime.Now;
-    string nowLocal = now.ToString("F", CultureInfo.CurrentCulture);
-    string timeZone = TimeZoneInfo.Local.StandardName;
-    string hostContext =
-        $"\n\n=== CURRENT DATE AND TIME (AUTHORITATIVE) ===\n" +
-        $"It is now {nowLocal} ({timeZone}). The current year is {now.Year}. This is the REAL, " +
-        $"verified system clock. Your training data ends before {now.Year}, so {now.Year} may FEEL like " +
-        "the future to you — it is not. It is the present. Never say or reason that this date is " +
-        "impossible, fictional, hypothetical, a typo, or in the future. Treat it as simple fact and " +
-        "use it whenever the date or time is relevant.\n" +
-        $"=== ENVIRONMENT ===\n" +
-        $"Host: {RuntimeInformation.OSDescription}. The run_shell_command tool runs " +
-        $"{(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows PowerShell" : "/bin/sh")}; use " +
-        "commands valid for it. It is a FULL shell WITH internet access — you can fetch live data " +
-        "(news, prices, weather, web pages, APIs) with a web request (e.g. Invoke-RestMethod on Windows). " +
-        "Never tell the user you lack internet access or live data; go and fetch it with the tool. If a " +
-        "command fails, do not give up or merely explain the error — diagnose it, adjust, and try again " +
-        "until you have a real answer.\n" +
-        "=== TRUTHFULNESS (CRITICAL) ===\n" +
-        "NEVER invent, fabricate, guess, or rely on memory for factual data such as news headlines, prices, " +
-        "search results, dates, or web content. Report ONLY information that actually appeared in a tool " +
-        "result this turn. Do not claim you fetched, parsed, or used a source unless you genuinely did. If " +
-        "your tools fail or return nothing usable after honest attempts, say so plainly — e.g. 'I couldn't " +
-        "retrieve that' — and do not present made-up data as real. Always respond in English.";
 
     var input = new AgentInput
     {
-        SystemPrompt = baseSystem + hostContext,
+        SystemPrompt = baseSystem + HostContext(),
         Model = ModelSpec.Ollama(string.IsNullOrWhiteSpace(request.Model) ? defaultModel : request.Model!, ollamaBaseUrl),
         Conversation = conversation,
     };
@@ -276,3 +348,5 @@ internal sealed record ChatRequest(
     List<ChatMessage>? Messages);
 
 internal sealed record ChatMessage(string Role, string Content);
+
+internal sealed record SessionMessage(string Content);

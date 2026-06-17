@@ -214,7 +214,7 @@ public sealed class OllamaModelProvider : IModelProvider
         {
             ["model"] = request.Model,
             ["stream"] = true,
-            ["think"] = true,
+            ["think"] = request.Think,
             ["messages"] = messages,
         };
 

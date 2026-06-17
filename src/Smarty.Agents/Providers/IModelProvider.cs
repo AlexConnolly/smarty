@@ -35,6 +35,10 @@ public sealed class ModelRequest
 
     /// <summary>Abort the turn if it runs longer than this (cuts off a stuck generation).</summary>
     public TimeSpan? TurnTimeout { get; init; }
+
+    /// <summary>Whether the model should produce a chain-of-thought. Off = instant response (used by
+    /// the conversational orchestrator, which must reply immediately, not deliberate).</summary>
+    public bool Think { get; init; } = true;
 }
 
 /// <summary>What a model provider returns: a single assistant turn.</summary>

@@ -48,6 +48,11 @@ public sealed class AgentInput
     /// (keeping all prior work) instead of returning the runaway turn as the answer.</summary>
     public bool RecoverFromLoops { get; set; } = true;
 
+    /// <summary>Optional source of out-of-band messages, drained between iterations and appended to the
+    /// running conversation. Lets a caller steer or interrupt a long task while it is still working
+    /// (e.g. "actually, stop after the first batch"). Returns the messages to inject, or none.</summary>
+    public Func<IReadOnlyList<Message>>? DrainInbox { get; set; }
+
     /// <summary>The nudge injected when a turn produced no usable answer (looped, ran too long, or left
     /// the answer in its thinking instead of replying).</summary>
     public string LoopRecoveryNudge { get; set; } =

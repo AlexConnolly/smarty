@@ -47,6 +47,17 @@ public sealed class SmartyAgent
 
         for (int iteration = 0; iteration < _input.MaxIterations; iteration++)
         {
+            // Pull in any out-of-band messages a caller queued while we were working, so a long task
+            // can be steered or interrupted between turns rather than only before it starts.
+            if (_input.DrainInbox is { } drain)
+            {
+                foreach (var injected in drain())
+                {
+                    conversation.Add(injected);
+                    run.Messages.Add(injected);
+                }
+            }
+
             var request = new ModelRequest
             {
                 Model = _input.Model.Model,
