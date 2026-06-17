@@ -31,4 +31,29 @@ public sealed class AgentInput
         "or just explain the problem to the user. Work out what went wrong, then call the tool again " +
         "with a corrected command/arguments that are valid for this environment. Keep trying different " +
         "approaches until the tool succeeds and you can actually answer the question.";
+
+    /// <summary>Hard cap on tokens the model may generate per turn (backstop against runaway output).</summary>
+    public int MaxOutputTokensPerTurn { get; set; } = 16384;
+
+    /// <summary>Sampling repetition penalty. Keep this LOW (1.0 = off). Higher values push the model
+    /// off its normal vocabulary into degenerate, non-cyclic "token-salad" rambling on long outputs —
+    /// which the loop-detector can't catch (it only catches tight cyclic repetition). Real loops are
+    /// handled by the detector + recovery, so we don't lean on this at all.</summary>
+    public double RepeatPenalty { get; set; } = 1.0;
+
+    /// <summary>Abort a turn that runs longer than this (a stuck generation can't run forever).</summary>
+    public TimeSpan? TurnTimeout { get; set; } = TimeSpan.FromMinutes(3);
+
+    /// <summary>When a turn is cut off for looping or timing out, nudge the model to conclude and retry
+    /// (keeping all prior work) instead of returning the runaway turn as the answer.</summary>
+    public bool RecoverFromLoops { get; set; } = true;
+
+    /// <summary>The nudge injected when a turn produced no usable answer (looped, ran too long, or left
+    /// the answer in its thinking instead of replying).</summary>
+    public string LoopRecoveryNudge { get; set; } =
+        "You did NOT give the user a final answer (you may have only reasoned internally without " +
+        "replying, started repeating yourself, or run too long). Write your final answer NOW as your " +
+        "actual reply to the user — concise and complete. Put the answer in your response, not only in " +
+        "your private thinking. Do not repeat your earlier reasoning. If you genuinely still need " +
+        "information, call a tool — but do not loop or over-think.";
 }

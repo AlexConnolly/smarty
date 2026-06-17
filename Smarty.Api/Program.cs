@@ -13,7 +13,16 @@ builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
     policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 builder.Services.AddSingleton<AgentRunStore>();
 
-string url = builder.Configuration["Urls"] ?? "http://localhost:5179";
+// Local Whisper speech-to-text. Model is downloaded once to disk and cached.
+string whisperModelPath = builder.Configuration["Whisper:ModelPath"]
+    ?? Path.Combine(builder.Environment.ContentRootPath, "models", "ggml-base.bin");
+string whisperModelUrl = builder.Configuration["Whisper:ModelUrl"]
+    ?? "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
+builder.Services.AddSingleton(new WhisperTranscriber(whisperModelPath, whisperModelUrl));
+
+// Bind all interfaces so a phone on the same Wi-Fi can reach it directly (http://<pc-lan-ip>:5179)
+// — that path streams properly, unlike a free Cloudflare quick tunnel which buffers SSE.
+string url = builder.Configuration["Urls"] ?? "http://0.0.0.0:5179";
 builder.WebHost.UseUrls(url);
 
 var app = builder.Build();
@@ -57,6 +66,33 @@ app.MapGet("/api/models", async () =>
     }
 });
 
+// Transcribe a voice note (16 kHz mono WAV) to text via local Whisper.
+app.MapPost("/api/transcribe", async (HttpRequest req, WhisperTranscriber whisper, CancellationToken ct) =>
+{
+    Stream audio;
+    if (req.HasFormContentType)
+    {
+        var form = await req.ReadFormAsync(ct);
+        var file = form.Files.GetFile("audio") ?? form.Files.FirstOrDefault();
+        if (file is null) return Results.BadRequest(new { error = "no audio file" });
+        audio = file.OpenReadStream();
+    }
+    else
+    {
+        audio = req.Body;
+    }
+
+    try
+    {
+        var text = await whisper.TranscribeAsync(audio, ct);
+        return Results.Json(new { text });
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { error = ex.Message }, statusCode: 500);
+    }
+});
+
 // Start an agent run in the BACKGROUND and return its id immediately. The run keeps going whether
 // or not anyone is connected — disconnecting never loses the answer.
 app.MapPost("/api/chat", (ChatRequest request, AgentRunStore store) =>
@@ -80,12 +116,18 @@ app.MapGet("/api/chat/{id}", async (string id, int? from, AgentRunStore store, H
     }
 
     ctx.Response.Headers.ContentType = "text/event-stream";
-    ctx.Response.Headers.CacheControl = "no-cache";
+    ctx.Response.Headers.CacheControl = "no-cache, no-transform";
     ctx.Response.Headers["X-Accel-Buffering"] = "no";
 
     int next = Math.Max(0, from ?? 0);
     try
     {
+        // Defeat CDN/proxy buffering (e.g. Cloudflare quick tunnels otherwise hold the whole SSE
+        // response and deliver it all at once): a padding comment + immediate flush forces the edge
+        // to start streaming straight away. The ":" prefix makes it an SSE comment clients ignore.
+        await ctx.Response.WriteAsync(":" + new string(' ', 2048) + "\n\n", ctx.RequestAborted);
+        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+
         while (true)
         {
             var change = session.WaitForChangeAsync();
@@ -162,9 +204,19 @@ app.Run();
         "impossible, fictional, hypothetical, a typo, or in the future. Treat it as simple fact and " +
         "use it whenever the date or time is relevant.\n" +
         $"=== ENVIRONMENT ===\n" +
-        $"Host: {RuntimeInformation.OSDescription}. When you use the shell, use commands valid for this " +
-        "operating system. If a command fails, do not give up or merely explain the error — diagnose it, " +
-        "adjust, and try again until you have a real answer.";
+        $"Host: {RuntimeInformation.OSDescription}. The run_shell_command tool runs " +
+        $"{(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows PowerShell" : "/bin/sh")}; use " +
+        "commands valid for it. It is a FULL shell WITH internet access — you can fetch live data " +
+        "(news, prices, weather, web pages, APIs) with a web request (e.g. Invoke-RestMethod on Windows). " +
+        "Never tell the user you lack internet access or live data; go and fetch it with the tool. If a " +
+        "command fails, do not give up or merely explain the error — diagnose it, adjust, and try again " +
+        "until you have a real answer.\n" +
+        "=== TRUTHFULNESS (CRITICAL) ===\n" +
+        "NEVER invent, fabricate, guess, or rely on memory for factual data such as news headlines, prices, " +
+        "search results, dates, or web content. Report ONLY information that actually appeared in a tool " +
+        "result this turn. Do not claim you fetched, parsed, or used a source unless you genuinely did. If " +
+        "your tools fail or return nothing usable after honest attempts, say so plainly — e.g. 'I couldn't " +
+        "retrieve that' — and do not present made-up data as real. Always respond in English.";
 
     var input = new AgentInput
     {

@@ -13,16 +13,9 @@ public static class ShellTool
 {
     public static AgentTool Create(string name = "run_shell_command")
     {
-        bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-        string shell = isWindows ? "Windows PowerShell" : "/bin/sh (POSIX shell)";
-
         return new AgentTool(
             name,
-            $"Run a shell command on the local machine and return its combined stdout/stderr output. " +
-            $"This machine is {RuntimeInformation.OSDescription} and commands run via {shell}, so you MUST use " +
-            $"commands valid for {shell} (e.g. on Windows use PowerShell cmdlets like Get-CimInstance / " +
-            $"systeminfo, not Linux tools like 'free' or 'uname'). " +
-            "Use this to inspect the system (e.g. memory, disk, OS, processes).",
+            "Runs a command in the local system shell and returns its output. A capable fallback when no other tool fits.",
             new[]
             {
                 ToolParameter.String("command", "The command line to execute.", required: true),
@@ -54,7 +47,8 @@ public static class ShellTool
             psi.ArgumentList.Add("-NoProfile");
             psi.ArgumentList.Add("-NonInteractive");
             psi.ArgumentList.Add("-Command");
-            psi.ArgumentList.Add(command);
+            // Silence the progress stream — its prompts break Invoke-WebRequest in non-interactive mode.
+            psi.ArgumentList.Add("$ProgressPreference='SilentlyContinue'; " + command);
         }
         else
         {

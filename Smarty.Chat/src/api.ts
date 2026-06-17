@@ -45,6 +45,16 @@ export async function fetchModels(): Promise<string[]> {
   }
 }
 
+/** Send a WAV voice note to the API and get back the transcribed text (local Whisper). */
+export async function transcribe(wav: Blob): Promise<string> {
+  const form = new FormData()
+  form.append('audio', wav, 'note.wav')
+  const res = await fetch('/api/transcribe', { method: 'POST', body: form })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`)
+  return (data.text ?? '').trim()
+}
+
 /** Ask the server to stop a background run (the Stop button). */
 export async function cancelRun(runId: string): Promise<void> {
   try {

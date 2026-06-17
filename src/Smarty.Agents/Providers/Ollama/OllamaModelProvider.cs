@@ -53,17 +53,37 @@ public sealed class OllamaModelProvider : IModelProvider
         await using var stream = await httpResponse.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var reader = new StreamReader(stream);
 
+        // A per-turn time limit (so a stuck generation can't run forever).
+        using var timeoutCts = new CancellationTokenSource();
+        if (request.TurnTimeout is { } timeout && timeout > TimeSpan.Zero)
+            timeoutCts.CancelAfter(timeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
         var content = new StringBuilder();
         var reasoning = new StringBuilder();
         var toolCalls = new List<ToolCall>();
 
+        // Detection buffer over the live token stream (reasoning + content) to catch repetition loops.
+        var recent = new StringBuilder();
+        int sinceCheck = 0;
+        var finish = FinishReason.Stop;
+
         while (true)
         {
-            string? line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
+            string? line;
+            try
+            {
+                line = await reader.ReadLineAsync(linked.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                finish = FinishReason.Timeout; // our time limit, not a caller abort
+                break;
+            }
+
             if (line is null) break;
             if (line.Length == 0) continue;
 
-            // Parse the chunk synchronously, extract the deltas, then yield outside the using.
             string? contentDelta = null;
             string? reasoningDelta = null;
 
@@ -92,12 +112,38 @@ public sealed class OllamaModelProvider : IModelProvider
                         ExtractToolCalls(calls, toolCalls);
                     }
                 }
+
+                if (root.TryGetProperty("done_reason", out var dr) && dr.ValueKind == JsonValueKind.String &&
+                    string.Equals(dr.GetString(), "length", StringComparison.OrdinalIgnoreCase))
+                {
+                    finish = FinishReason.Length;
+                }
             }
 
             if (reasoningDelta is not null)
                 yield return new ModelStreamEvent.Reasoning(reasoningDelta);
             if (contentDelta is not null)
                 yield return new ModelStreamEvent.Content(contentDelta);
+
+            // Watch for a degenerate repetition loop and cut the generation off early.
+            string? delta = reasoningDelta ?? contentDelta;
+            if (delta is not null)
+            {
+                recent.Append(delta);
+                sinceCheck += delta.Length;
+                if (recent.Length > LoopWindow)
+                    recent.Remove(0, recent.Length - LoopWindow);
+
+                if (sinceCheck >= LoopCheckEvery && recent.Length >= LoopMinLength)
+                {
+                    sinceCheck = 0;
+                    if (LooksLikeLoop(recent))
+                    {
+                        finish = FinishReason.Loop;
+                        break; // disposing the response cancels the Ollama generation
+                    }
+                }
+            }
         }
 
         var response = new ModelResponse
@@ -105,8 +151,32 @@ public sealed class OllamaModelProvider : IModelProvider
             Content = content.Length > 0 ? content.ToString() : null,
             Reasoning = reasoning.Length > 0 ? reasoning.ToString() : null,
             ToolCalls = toolCalls,
+            Finish = finish,
         };
         yield return new ModelStreamEvent.Completed(response);
+    }
+
+    // Loop detection: treat the tail as degenerate if a short cycle (period 3..160) repeats
+    // back-to-back many times — exactly the "X = 78, X = 78, X = 78…" failure mode.
+    private const int LoopWindow = 1600;
+    private const int LoopCheckEvery = 160;
+    private const int LoopMinLength = 240;
+
+    private static bool LooksLikeLoop(StringBuilder sb)
+    {
+        int n = sb.Length;
+        const int repeats = 6;
+        for (int p = 3; p <= 160; p++)
+        {
+            if (n < p * repeats) continue;
+            bool same = true;
+            for (int i = n - 1; i >= n - p * repeats; i--)
+            {
+                if (sb[i] != sb[i - p]) { same = false; break; }
+            }
+            if (same) return true;
+        }
+        return false;
     }
 
     private static void ExtractToolCalls(JsonElement calls, List<ToolCall> sink)
@@ -155,6 +225,13 @@ public sealed class OllamaModelProvider : IModelProvider
                 tools.Add(SerializeTool(tool));
             payload["tools"] = tools;
         }
+
+        var options = new JsonObject { ["repeat_last_n"] = 256 };
+        if (request.RepeatPenalty is { } rp && rp > 0)
+            options["repeat_penalty"] = rp;
+        if (request.MaxOutputTokens is { } np && np > 0)
+            options["num_predict"] = np;
+        payload["options"] = options;
 
         return payload;
     }

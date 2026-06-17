@@ -53,6 +53,9 @@ public sealed class SmartyAgent
                 SystemPrompt = _input.SystemPrompt,
                 Messages = conversation,
                 Tools = _input.Tools,
+                MaxOutputTokens = _input.MaxOutputTokensPerTurn,
+                RepeatPenalty = _input.RepeatPenalty,
+                TurnTimeout = _input.TurnTimeout,
             };
 
             ModelResponse? final = null;
@@ -75,6 +78,23 @@ public sealed class SmartyAgent
             }
 
             final ??= new ModelResponse();
+
+            // Loop/timeout recovery: if the model got stuck (degenerate repetition or ran past the time
+            // limit) and produced no tool call, don't treat the runaway turn as the answer. Discard it,
+            // nudge the model to conclude using what it already has, and try again. Everything before
+            // this turn (prior tool calls/results) stays in the conversation.
+            // A turn that produced NO answer and NO tool call is a dead end — it looped, timed out, hit
+            // the token cap, or finished with its answer trapped in the thinking channel (no real
+            // content). Nudge the model to actually answer the user, and retry. (final.Finish carries
+            // the specific reason if needed; for recovery, "no answer + no tool" is what matters.)
+            bool noAnswer = string.IsNullOrWhiteSpace(final.Content);
+            if (noAnswer && !final.HasToolCalls && _input.RecoverFromLoops && iteration < _input.MaxIterations - 1)
+            {
+                var recovery = Message.System(_input.LoopRecoveryNudge);
+                conversation.Add(recovery);
+                run.Messages.Add(recovery);
+                continue;
+            }
 
             // Some models (notably small qwen) sometimes "chat" the tool call — emitting it as JSON
             // text in the content instead of as a structured call. Recover it so we actually run the
@@ -128,9 +148,13 @@ public sealed class SmartyAgent
             }
         }
 
-        // Iterations exhausted — emit whatever text we last produced.
+        // Iterations exhausted — emit whatever text we last produced, or a graceful message if we
+        // never got a clean answer (e.g. the model kept looping).
+        var lastText = run.Messages.LastOrDefault(m => m.Role == Role.Assistant)?.Content;
         yield return new AgentEvent.Completed(
-            run.Messages.LastOrDefault(m => m.Role == Role.Assistant)?.Content ?? "");
+            string.IsNullOrWhiteSpace(lastText)
+                ? "I got stuck and couldn't finish that — please try rephrasing your request."
+                : lastText);
     }
 
     /// <summary>Ask the agent a question and get its final answer text (buffered).</summary>

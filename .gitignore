@@ -2,3 +2,5 @@ bin/
 obj/
 *.user
 .vs/
+# Local Whisper GGML model (downloaded on first use, ~140MB)
+Smarty.Api/models/

@@ -1,5 +1,21 @@
 namespace Smarty.Agents;
 
+/// <summary>Why a model turn stopped generating.</summary>
+public enum FinishReason
+{
+    /// <summary>The model finished normally.</summary>
+    Stop,
+
+    /// <summary>Hit the output-token cap.</summary>
+    Length,
+
+    /// <summary>Detected degenerate repetition (the model got stuck in a loop) and was cut off.</summary>
+    Loop,
+
+    /// <summary>The per-turn time limit elapsed and the turn was cut off.</summary>
+    Timeout,
+}
+
 /// <summary>What the agent sends to a model provider for one completion.</summary>
 public sealed class ModelRequest
 {
@@ -10,6 +26,15 @@ public sealed class ModelRequest
     public required IReadOnlyList<Message> Messages { get; init; }
 
     public IReadOnlyList<AgentTool> Tools { get; init; } = Array.Empty<AgentTool>();
+
+    /// <summary>Cap on tokens generated this turn (a hard backstop against runaway generation).</summary>
+    public int? MaxOutputTokens { get; init; }
+
+    /// <summary>Repetition penalty to discourage loops at the sampling level.</summary>
+    public double? RepeatPenalty { get; init; }
+
+    /// <summary>Abort the turn if it runs longer than this (cuts off a stuck generation).</summary>
+    public TimeSpan? TurnTimeout { get; init; }
 }
 
 /// <summary>What a model provider returns: a single assistant turn.</summary>
@@ -23,6 +48,9 @@ public sealed class ModelResponse
 
     /// <summary>Any tools the model wants to invoke this turn.</summary>
     public IReadOnlyList<ToolCall> ToolCalls { get; init; } = Array.Empty<ToolCall>();
+
+    /// <summary>Why generation stopped.</summary>
+    public FinishReason Finish { get; init; } = FinishReason.Stop;
 
     public bool HasToolCalls => ToolCalls.Count > 0;
 
