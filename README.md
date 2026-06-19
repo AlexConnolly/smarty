@@ -16,46 +16,21 @@ a local model you control.
 
 ## What is it?
 
-Most "AI assistants" are a chat box bolted to someone else's servers — you type, you **wait**, you get
-one answer, repeat. Smarty isn't that. It's a **local-first personal assistant built to work the way a
-real assistant actually would**: you ask, it gets going, and you both carry on.
+Most AI assistants are a chat box bolted to someone else's servers — you type, you **wait**, you get one
+answer. Smarty works the way a real assistant would: you ask, it gets going, and you both carry on.
 
-## ⚡ The magic: it works *while you keep talking*
+## ⚡ It works while you keep talking
 
-This is the whole point of Smarty, and it's what makes it feel different from every other chatbot.
+Ask Smarty for something real and it doesn't freeze the chat — it gets going in the background and hands
+the conversation straight back to you:
 
-When you ask Smarty to do something real, it doesn't freeze the chat and leave you watching a spinner.
-It says **"on it"** and goes off to do the work **in the background** — so you can keep chatting, ask
-something else, or fire off *more* jobs. Smarty runs them **all at once**, keeps you posted while
-they're going, and drops each result back into the conversation the moment it's ready.
-
-And because the work is *live*, you can **change your mind mid-flight** — add a detail, narrow it
-down, or call the whole thing off — and Smarty folds it into the job that's already running instead of
-starting from scratch.
-
-Here's what that actually feels like:
-
-> **You:** Find me somewhere nice for dinner in Soho this Friday.
+> **You:** What's the latest news?
 >
-> **Smarty:** On it — give me a sec. 🍝 *(starts researching in the background)*
->
-> **You:** Oh, what's the weather looking like Friday night?
->
-> **Smarty:** Clear and mild, around 14°C — lovely evening for it. *(answered instantly, while the restaurant search keeps running)*
->
-> **You:** Actually, make the dinner search vegetarian-friendly.
->
-> **Smarty:** Got it — folding that into the search.
->
-> **Smarty:** *(a moment later)* Found a few good ones — Mildreds, Mao Chow, and Temple of Seitan all have tables Friday. Want me to book?
+> **Smarty:** Checking that out for you now — anything else I can help with while I work on it?
 
-No waiting. No "please hold." Three things happened at once — a restaurant search, a weather question,
-and a mid-task change — and **you never stopped talking.** That's the difference: it's less "chatbot,"
-more "handing things to someone capable."
-
-Under the hood you talk to one friendly voice — the **orchestrator** — which routes real work to
-background **workers**, juggles however many are running, lets you steer or cancel them on the fly, and
-relays everything back in plain language.
+So you keep chatting, kick off more jobs, or change your mind mid-task. Smarty runs them all at once,
+re-steers when you do, and drops each result in the moment it's ready. Less chatbot, more handing things
+to someone capable.
 
 ## 🧰 What it can actually do — tools
 
