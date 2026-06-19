@@ -15,3 +15,7 @@ Smarty.Api/run.log.err
 *.log
 Smarty.Api/sid.txt
 Smarty.Api/sse_*.txt
+
+# Personal memory store
+Smarty.Api/data/
+data/

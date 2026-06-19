@@ -55,8 +55,14 @@ var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
 string trainingDir = builder.Configuration["Training:Dir"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "training-data");
 var trainingLog = new TrainingLog(trainingDir, json);
+
+// Long-term memory of the user — structured facts, persisted to disk (see MEMORY_SPEC.md).
+string memoryPath = builder.Configuration["Memory:Path"]
+    ?? Path.Combine(builder.Environment.ContentRootPath, "data", "memory.json");
+var memory = new MemoryStore(memoryPath, json);
+
 var sessions = new SessionStore();
-var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog);
+var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory);
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok", model = defaultModel }));
 
@@ -309,7 +315,9 @@ string WorkerSystemPrompt() =>
     "question to read that page and pull out the answer. Use the shell (run_shell_command) for system " +
     "info, files, local commands, or APIs the web tools can't handle. Base every factual claim ONLY on " +
     "what a tool actually returned this turn — if the tools don't give you the answer, say so rather than " +
-    "filling it in from memory. Be efficient: one or two good sources is usually enough — STOP and answer " +
+    "filling it in from memory. You also have search_memory (recall what's known about the user — search " +
+    "keywords) and set_memory (remember a durable fact they share); use them when personal context helps. " +
+    "Be efficient: one or two good sources is usually enough — STOP and answer " +
     "as soon as a tool has given you what the task needs. Only keep going if a source failed or the answer " +
     "is genuinely incomplete; don't pile on extra sources for thoroughness' sake. Give a clear, complete " +
     "answer to the task." +

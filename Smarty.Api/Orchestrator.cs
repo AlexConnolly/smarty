@@ -19,6 +19,7 @@ public sealed class Orchestrator
     private readonly Func<string> _workerSystem;
     private readonly JsonSerializerOptions _json;
     private readonly TrainingLog _log;
+    private readonly MemoryStore _memory;
 
     // Bound the per-turn tool loop: a turn may call a data tool (list/status), read the result, then
     // voice it — but it must not spin.
@@ -30,7 +31,7 @@ public sealed class Orchestrator
     private static string Snip(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : "…" + s[^max..]).Replace("\n", " ⏎ ");
 
-    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log)
+    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory)
     {
         _provider = new OllamaModelProvider(ollamaBaseUrl);
         _model = model;
@@ -38,7 +39,15 @@ public sealed class Orchestrator
         _workerSystem = workerSystem;
         _json = json;
         _log = log;
+        _memory = memory;
+        // The orchestrator's tools = the task tools + the two memory-access tools (executed in HandleToolCall).
+        _orchestratorTools = OrchestratorTools
+            .Append(MemoryTools.SearchTool(memory))
+            .Append(MemoryTools.SetTool(memory))
+            .ToArray();
     }
+
+    private readonly AgentTool[] _orchestratorTools;
 
     // Project agent messages/tools into clean, training-shaped JSON (system + messages + tools → output).
     private static object ProjectMessages(IEnumerable<Message> messages) =>
@@ -77,6 +86,11 @@ public sealed class Orchestrator
         "its scope, or steer it.\n" +
         "- cancel_task(id): stop a running task.\n" +
         "- list_tasks(): see what's running. task_status(id): check how one task is going.\n" +
+        "- search_memory(query): recall what you know about the user — search KEYWORDS (\"home\", \"diet\"), " +
+        "not sentences. Check it when personal context would help (where they live, preferences, people).\n" +
+        "- set_memory(type, key, value, context): remember a durable fact they share — a preference, a " +
+        "person, where they live. Do it naturally when something's worth keeping; a new value for an " +
+        "existing key updates it. Don't store passing one-off details.\n" +
         "\n" +
         "HOW TO DECIDE:\n" +
         "- Small talk, greetings, jokes, opinions, or things you already know — just answer. No tools.\n" +
@@ -110,7 +124,7 @@ public sealed class Orchestrator
             // refine-vs-new, cancel). Let the model think here so it gets them right; re-voice
             // turns stay think:false for speed.
             string content = await RunOrchestratorTurnAsync(
-                session, session.History, OrchestratorTools, think: true, ct).ConfigureAwait(false);
+                session, session.History, _orchestratorTools, think: true, ct).ConfigureAwait(false);
             Trace("[turn] orchestrator user-turn done (ack streamed)");
 
             session.History.Add(Message.Assistant(string.IsNullOrWhiteSpace(content) ? "(on it)" : content));
@@ -291,6 +305,22 @@ public sealed class Orchestrator
                 return $"Message passed along to task #{t.Id}; it'll pick it up shortly.";
             }
 
+            case "search_memory":
+            {
+                dataReturning = true;
+                return _memory.Search(call.Arguments.GetStringOrNull("query") ?? "");
+            }
+
+            case "set_memory":
+            {
+                dataReturning = true;
+                return _memory.Set(
+                    call.Arguments.GetStringOrNull("type") ?? "",
+                    call.Arguments.GetStringOrNull("key") ?? "",
+                    call.Arguments.GetStringOrNull("value") ?? "",
+                    call.Arguments.GetStringOrNull("context"));
+            }
+
             default:
                 dataReturning = true;
                 return $"Unknown tool '{call.Name}'.";
@@ -326,6 +356,8 @@ public sealed class Orchestrator
                     ShellTool.Create(),
                     WebResearch.SearchTool(),
                     WebResearch.PageAnswerTool(provider, _model),
+                    MemoryTools.SearchTool(_memory),
+                    MemoryTools.SetTool(_memory),
                 },
                 DrainInbox = () => DrainInbox(task),
                 // Honesty over speed: with reasoning on, the worker inspects tool output, notices junk
