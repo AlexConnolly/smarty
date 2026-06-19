@@ -16,33 +16,72 @@ a local model you control.
 
 ## What is it?
 
-Most "AI assistants" are a chat box wired to someone else's servers. Smarty is the opposite: a
-**local-first personal assistant** that lives on your computer and works for *you*.
+Most "AI assistants" are a chat box bolted to someone else's servers — you type, you **wait**, you get
+one answer, repeat. Smarty isn't that. It's a **local-first personal assistant built to work the way a
+real assistant actually would**: you ask, it gets going, and you both carry on.
 
-You chat with one friendly voice. Behind it, Smarty acts like a little team — the part you talk to
-hands real work to background workers that have actual tools (web search, your shell, system info),
-then relays what they found back to you, in plain language. Ask it for the latest news and it really
-goes and reads the news. Ask how much disk you've got and it really checks. It thinks before it
-answers, and when it can't get something it tells you — instead of making it up.
+## ⚡ The magic: it works *while you keep talking*
 
-It's early, it's local, and it's yours.
+This is the whole point of Smarty, and it's what makes it feel different from every other chatbot.
 
-### ✨ Highlights
+When you ask Smarty to do something real, it doesn't freeze the chat and leave you watching a spinner.
+It says **"on it"** and goes off to do the work **in the background** — so you can keep chatting, ask
+something else, or fire off *more* jobs. Smarty runs them **all at once**, keeps you posted while
+they're going, and drops each result back into the conversation the moment it's ready.
 
-- 🧠 **Conversational orchestrator + background workers** — instant, natural replies up front; the heavy
-  lifting happens asynchronously so the chat never blocks.
-- 🌐 **Grounded web research** — it searches (with engine fallback), reads the actual page, and answers
-  from what it found, not from memory.
-- 🖥️ **Knows your machine** — disk, memory, OS, and anything your shell can reach.
-- 🎙️ **Voice notes** — talk to it; local Whisper transcribes on-device.
-- ✅ **Task manager** — start, check, steer, and cancel long-running jobs by just talking.
-- 📈 **Learns from use** — every interaction (and your 👍/👎) is logged locally to build a fine-tune
-  dataset over time.
-- 🔒 **100% local** — your data never leaves the machine.
+And because the work is *live*, you can **change your mind mid-flight** — add a detail, narrow it
+down, or call the whole thing off — and Smarty folds it into the job that's already running instead of
+starting from scratch.
+
+Here's what that actually feels like:
+
+> **You:** Find me somewhere nice for dinner in Soho this Friday.
+>
+> **Smarty:** On it — give me a sec. 🍝 *(starts researching in the background)*
+>
+> **You:** Oh, what's the weather looking like Friday night?
+>
+> **Smarty:** Clear and mild, around 14°C — lovely evening for it. *(answered instantly, while the restaurant search keeps running)*
+>
+> **You:** Actually, make the dinner search vegetarian-friendly.
+>
+> **Smarty:** Got it — folding that into the search.
+>
+> **Smarty:** *(a moment later)* Found a few good ones — Mildreds, Mao Chow, and Temple of Seitan all have tables Friday. Want me to book?
+
+No waiting. No "please hold." Three things happened at once — a restaurant search, a weather question,
+and a mid-task change — and **you never stopped talking.** That's the difference: it's less "chatbot,"
+more "handing things to someone capable."
+
+Under the hood you talk to one friendly voice — the **orchestrator** — which routes real work to
+background **workers**, juggles however many are running, lets you steer or cancel them on the fly, and
+relays everything back in plain language.
+
+## 🧰 What it can actually do — tools
+
+Smarty's workers don't just talk; they have real **tools** and use them to get you real answers:
+
+- 🌐 **`web_search`** — searches the web, with automatic engine fallback so a rate-limit doesn't dead-end it.
+- 📄 **`get_page_answer`** — actually opens a page, reads it, and extracts the answer — *grounded in the
+  real content,* not guessed from memory.
+- 🖥️ **`run_shell_command`** — your machine's shell: system info, files, scripts, local APIs — anything
+  you could type yourself.
+- 📊 **System info** — disk, memory, CPU, and OS, read straight from the OS.
+
+It's all built on a small, **tool-first agent framework** (`Smarty.Agents`), so adding a new capability
+is just adding a tool: give it a name, a one-line description, and what to run — and the model can use
+it. Want Smarty to control your lights, hit your calendar, or query your database? That's a tool.
 
 <div align="center">
 <img src="docs/chat.png" alt="Smarty answering a question" width="800" />
 </div>
+
+### Also in the box
+
+- 🎙️ **Voice notes** — talk to it; local Whisper transcribes on-device.
+- 🧠 **Thinks before it answers** — and tells you when it *can't* get something instead of fabricating.
+- 📈 **Learns from use** — every interaction (and your 👍/👎) is logged locally toward a future fine-tune.
+- 🔒 **100% local** — your data never leaves the machine.
 
 ---
 
