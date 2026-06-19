@@ -15,7 +15,6 @@ public sealed class TaskInfo
     public string? LatestThought { get; set; } // the worker's recent reasoning, for status peeks
     public string? Result { get; set; } // the final answer once finished
     public DateTimeOffset StartedAt { get; } = DateTimeOffset.UtcNow;
-    public DateTimeOffset LastStatusAt { get; set; } = DateTimeOffset.UtcNow; // last proactive nudge we pushed
     public CancellationTokenSource Cts { get; } = new();
 
     /// <summary>Out-of-band messages handed to the running worker between iterations (steer / interrupt).</summary>

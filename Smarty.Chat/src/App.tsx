@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { openSessionStream, sendMessage, transcribe, type SessionHandlers } from './api'
+import { cancelTask, openSessionStream, sendFeedback, sendMessage, transcribe, type SessionHandlers } from './api'
 import { formatDuration, toWav16k, type RecordedAudio } from './audio'
 
 interface AudioNote {
@@ -26,6 +26,12 @@ const EXAMPLES = ['What is the current system status?', "What's the latest news?
 
 function getSessionId(): string {
   try {
+    // ?s=<id> opens a specific session (handy for reopening or sharing a conversation).
+    const fromUrl = new URLSearchParams(window.location.search).get('s')
+    if (fromUrl) {
+      localStorage.setItem(SESSION_KEY, fromUrl)
+      return fromUrl
+    }
     let id = localStorage.getItem(SESSION_KEY)
     if (!id) {
       id = crypto.randomUUID()
@@ -40,6 +46,7 @@ function getSessionId(): string {
 export default function App() {
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [working, setWorking] = useState<{ id: string; task: string }[]>([])
+  const [tasksOpen, setTasksOpen] = useState(false)
   const [input, setInput] = useState('')
   const [recording, setRecording] = useState(false)
   const [recPeaks, setRecPeaks] = useState<number[]>([])
@@ -77,7 +84,9 @@ export default function App() {
       },
       onContent: (id, text) => upsert(id, (m) => ({ ...m, content: m.content + text })),
       onReasoning: (id, text) => upsert(id, (m) => ({ ...m, reasoning: m.reasoning + text })),
-      onMsgEnd: (id) => upsert(id, (m) => ({ ...m, streaming: false })),
+      // Snap to the server's authoritative full text — heals any delta dropped during live streaming.
+      onMsgEnd: (id, text) =>
+        upsert(id, (m) => ({ ...m, streaming: false, content: text && text.length > 0 ? text : m.content })),
       onWorking: (id, task) => setWorking((w) => (w.some((x) => x.id === id) ? w : [...w, { id, task }])),
       onWorkingDone: (id) => setWorking((w) => w.filter((x) => x.id !== id)),
     }
@@ -102,6 +111,10 @@ export default function App() {
     el.style.height = 'auto'
     el.style.height = Math.min(Math.max(el.scrollHeight, 64), 220) + 'px'
   }, [input])
+
+  useEffect(() => {
+    if (working.length === 0) setTasksOpen(false)
+  }, [working.length])
 
   function send(text?: string) {
     const body = (text ?? input).trim()
@@ -136,6 +149,15 @@ export default function App() {
     setWorking([])
     // restart the stream on the new session
     window.location.reload()
+  }
+
+  async function cancelRunningTask(id: string) {
+    setWorking((w) => w.filter((x) => x.id !== id))
+    try {
+      await cancelTask(sessionId.current, id)
+    } catch {
+      /* the stream will restore state if the task is still running */
+    }
   }
 
   // ---- recording ----
@@ -201,15 +223,22 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col overflow-x-hidden bg-slate-950 text-slate-100">
-      <header className="flex items-center gap-3 border-b border-white/5 bg-slate-900/60 px-4 py-2.5 backdrop-blur">
+      <header className="relative flex items-center gap-3 border-b border-white/5 bg-slate-900/60 px-4 py-2.5 backdrop-blur">
         <span className="grid h-7 w-7 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-sm font-bold text-white shadow-lg shadow-indigo-500/20">
           S
         </span>
         <h1 className="text-sm font-semibold tracking-tight">Smarty</h1>
         <span className="hidden text-xs text-slate-500 sm:inline">personal assistant</span>
+        <TaskPill
+          tasks={working}
+          open={tasksOpen}
+          onToggle={() => setTasksOpen((open) => !open)}
+          onClose={() => setTasksOpen(false)}
+          onCancel={cancelRunningTask}
+        />
         <button
           onClick={newChat}
-          className="ml-auto rounded-lg border border-white/10 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-white/5"
+          className="rounded-lg border border-white/10 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-white/5"
         >
           New chat
         </button>
@@ -222,10 +251,7 @@ export default function App() {
           ) : (
             <div className="space-y-5">
               {messages.map((m) => (
-                <MessageRow key={m.id} message={m} />
-              ))}
-              {working.map((w) => (
-                <WorkingRow key={`w${w.id}`} task={w.task} />
+                <MessageRow key={m.id} message={m} sessionId={sessionId.current} />
               ))}
             </div>
           )}
@@ -308,7 +334,7 @@ function Empty({ onPick }: { onPick: (prompt: string) => void }) {
   )
 }
 
-function MessageRow({ message }: { message: UiMessage }) {
+function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: string }) {
   if (message.role === 'user') {
     if (message.audio) return <VoiceBubble message={message} />
     return (
@@ -342,8 +368,9 @@ function MessageRow({ message }: { message: UiMessage }) {
           </div>
         ) : null}
         {message.content && !message.streaming && (
-          <div className="pt-0.5">
+          <div className="flex items-center gap-1 pt-0.5">
             <CopyButton text={message.content} />
+            <FeedbackButtons sessionId={sessionId} messageId={message.id} />
           </div>
         )}
       </div>
@@ -351,7 +378,126 @@ function MessageRow({ message }: { message: UiMessage }) {
   )
 }
 
-function WorkingRow({ task }: { task: string }) {
+// Thumbs up/down — labels the logged interaction as a good/bad training example.
+function FeedbackButtons({ sessionId, messageId }: { sessionId: string; messageId: number }) {
+  const [rated, setRated] = useState<'up' | 'down' | null>(null)
+  function rate(r: 'up' | 'down') {
+    setRated(r)
+    sendFeedback(sessionId, messageId, r)
+  }
+  return (
+    <span className="inline-flex items-center gap-0.5">
+      <button
+        onClick={() => rate('up')}
+        title="Good response"
+        className={`grid h-7 w-7 place-items-center rounded-md transition hover:bg-white/5 ${rated === 'up' ? 'text-emerald-400' : 'text-slate-500 hover:text-slate-300'}`}
+      >
+        <ThumbIcon up />
+      </button>
+      <button
+        onClick={() => rate('down')}
+        title="Bad response"
+        className={`grid h-7 w-7 place-items-center rounded-md transition hover:bg-white/5 ${rated === 'down' ? 'text-rose-400' : 'text-slate-500 hover:text-slate-300'}`}
+      >
+        <ThumbIcon />
+      </button>
+    </span>
+  )
+}
+
+function ThumbIcon({ up }: { up?: boolean }) {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={up ? undefined : { transform: 'rotate(180deg)' }}
+    >
+      <path d="M7 10v12" />
+      <path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z" />
+    </svg>
+  )
+}
+
+function TaskPill({
+  tasks,
+  open,
+  onToggle,
+  onClose,
+  onCancel,
+}: {
+  tasks: { id: string; task: string }[]
+  open: boolean
+  onToggle: () => void
+  onClose: () => void
+  onCancel: (id: string) => void
+}) {
+  if (tasks.length === 0) return <div className="ml-auto" />
+
+  return (
+    <div className="relative ml-auto">
+      <button
+        onClick={onToggle}
+        className="inline-flex items-center gap-2 rounded-full border border-amber-300/20 bg-amber-400/10 px-3 py-1.5 text-xs font-medium text-amber-100 shadow-sm shadow-amber-950/20 hover:bg-amber-400/15"
+        aria-expanded={open}
+        aria-label={`${tasks.length} running ${tasks.length === 1 ? 'task' : 'tasks'}`}
+      >
+        <Spinner />
+        <span>{tasks.length} running</span>
+      </button>
+
+      {open && (
+        <>
+          <button className="fixed inset-0 z-10 cursor-default" aria-label="Close tasks" onClick={onClose} />
+          <div className="absolute right-0 top-10 z-20 w-80 max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-white/10 bg-slate-950 shadow-2xl shadow-black/40">
+            <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-100">Running tasks</div>
+                <div className="text-xs text-slate-500">Cancel anything you no longer need.</div>
+              </div>
+              <button onClick={onClose} className="grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-slate-200">
+                <XIcon />
+              </button>
+            </div>
+            <div className="max-h-80 overflow-y-auto p-2">
+              {tasks.map((task) => (
+                <div key={task.id} className="rounded-xl px-3 py-2.5 hover:bg-white/[0.04]">
+                  <div className="flex gap-3">
+                    <div className="pt-1">
+                      <Spinner />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Task #{task.id}</div>
+                      <div className="mt-0.5 line-clamp-3 text-sm leading-snug text-slate-200">{task.task}</div>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => onCancel(task.id)}
+                    className="mt-2 rounded-lg border border-rose-300/20 px-2.5 py-1.5 text-xs text-rose-200 hover:bg-rose-400/10"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function Spinner() {
+  return <span className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-amber-200/25 border-t-amber-200" />
+}
+
+/*
+function OldWorkingRow({ task }: { task: string }) {
   return (
     <div className="flex gap-3">
       <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-xs font-bold text-white">
@@ -369,6 +515,7 @@ function WorkingRow({ task }: { task: string }) {
   )
 }
 
+*/
 function VoiceBubble({ message }: { message: UiMessage }) {
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const [playing, setPlaying] = useState(false)

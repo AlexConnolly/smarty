@@ -51,8 +51,12 @@ var json = new JsonSerializerOptions(JsonSerializerDefaults.Web)
 var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
 
 // Conversational orchestrator + async workers. Orchestrator and worker share one model (two roles).
+// Passive capture of interactions + feedback → a fine-tune dataset that builds from real usage.
+string trainingDir = builder.Configuration["Training:Dir"]
+    ?? Path.Combine(builder.Environment.ContentRootPath, "training-data");
+var trainingLog = new TrainingLog(trainingDir, json);
 var sessions = new SessionStore();
-var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json);
+var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog);
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok", model = defaultModel }));
 
@@ -112,6 +116,42 @@ app.MapPost("/api/session/{id}/message", (string id, SessionMessage body) =>
         catch (Exception ex) { Console.Error.WriteLine($"[orchestrator] {ex}"); }
     });
     return Results.Ok();
+});
+
+// Thumbs up/down on an assistant message — the label that turns a logged interaction into a good/bad
+// training example. Joins back to the interaction log by (session, msg_id).
+app.MapPost("/api/session/{id}/feedback", (string id, FeedbackMessage body) =>
+{
+    if (body is null) return Results.BadRequest();
+    trainingLog.Feedback(new
+    {
+        ts = DateTimeOffset.UtcNow,
+        session = id,
+        msg_id = body.MessageId,
+        rating = body.Rating,
+        note = body.Note,
+    });
+    return Results.Ok();
+});
+
+// Quietly cancel a running background task from the UI. This intentionally does not add a chat
+// message; the task pill is the control surface for this.
+app.MapDelete("/api/session/{id}/task/{taskId}", (string id, string taskId) =>
+{
+    var session = sessions.Get(id);
+    if (session is null) return Results.NotFound(new { error = "session not found" });
+
+    taskId = taskId.TrimStart('#').Trim();
+    if (!session.Tasks.TryGetValue(taskId, out var task))
+        return Results.NotFound(new { error = $"task #{taskId} not found" });
+
+    if (!task.IsRunning)
+        return Results.Ok(new { id = task.Id, status = task.Status });
+
+    task.Status = "cancelled";
+    task.Cts.Cancel();
+    session.Append("working_done", JsonSerializer.Serialize(new { id = task.Id, status = task.Status }, json));
+    return Results.Ok(new { id = task.Id, status = task.Status });
 });
 
 // The session's persistent event stream (SSE). The client keeps this open continuously and replays
@@ -263,9 +303,17 @@ string HostContext()
 
 // System prompt for a worker (the "hands"): a capable, relentless task-doer with real tools.
 string WorkerSystemPrompt() =>
-    "You are a capable, relentless assistant. Complete the task you are given by using your tools — use " +
-    "the shell for anything you need (system info, files, and the internet via web requests). Be thorough, " +
-    "verify your results, and give a clear, complete answer to the task." + HostContext();
+    "You are a capable, relentless assistant. Complete the task you are given by using your tools. For " +
+    "anything that needs live or web information (news, prices, facts, current events, a specific site), " +
+    "use web_search to find relevant pages, then get_page_answer with a real result URL and a precise " +
+    "question to read that page and pull out the answer. Use the shell (run_shell_command) for system " +
+    "info, files, local commands, or APIs the web tools can't handle. Base every factual claim ONLY on " +
+    "what a tool actually returned this turn — if the tools don't give you the answer, say so rather than " +
+    "filling it in from memory. Be efficient: one or two good sources is usually enough — STOP and answer " +
+    "as soon as a tool has given you what the task needs. Only keep going if a source failed or the answer " +
+    "is genuinely incomplete; don't pile on extra sources for thoroughness' sake. Give a clear, complete " +
+    "answer to the task." +
+    HostContext();
 
 (AgentInput input, string prompt) BuildAgent(ChatRequest request)
 {
@@ -298,7 +346,13 @@ string WorkerSystemPrompt() =>
     };
 
     if (request.EnableTools ?? true)
+    {
+        string modelName = string.IsNullOrWhiteSpace(request.Model) ? defaultModel : request.Model!;
+        var provider = new OllamaModelProvider(ollamaBaseUrl);
         input.Tools.Add(ShellTool.Create());
+        input.Tools.Add(WebResearch.SearchTool());
+        input.Tools.Add(WebResearch.PageAnswerTool(provider, modelName));
+    }
 
     return (input, prompt);
 }
@@ -350,3 +404,5 @@ internal sealed record ChatRequest(
 internal sealed record ChatMessage(string Role, string Content);
 
 internal sealed record SessionMessage(string Content);
+
+internal sealed record FeedbackMessage(int MessageId, string Rating, string? Note);

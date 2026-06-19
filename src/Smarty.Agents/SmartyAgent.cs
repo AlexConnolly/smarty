@@ -67,6 +67,7 @@ public sealed class SmartyAgent
                 MaxOutputTokens = _input.MaxOutputTokensPerTurn,
                 RepeatPenalty = _input.RepeatPenalty,
                 TurnTimeout = _input.TurnTimeout,
+                Think = _input.Think,
             };
 
             ModelResponse? final = null;

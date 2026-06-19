@@ -18,24 +18,47 @@ public sealed class Orchestrator
     private readonly string _ollamaBaseUrl;
     private readonly Func<string> _workerSystem;
     private readonly JsonSerializerOptions _json;
+    private readonly TrainingLog _log;
 
     // Bound the per-turn tool loop: a turn may call a data tool (list/status), read the result, then
     // voice it — but it must not spin.
     private const int MaxTurnIterations = 4;
 
-    // Proactive status: once a task has been running this long with the user quiet, drop a brief "still
-    // on it" line; repeat at this cadence. Stay silent if the user spoke within the quiet window.
-    private static readonly TimeSpan StatusInterval = TimeSpan.FromSeconds(60);
-    private static readonly TimeSpan QuietWindow = TimeSpan.FromSeconds(45);
+    // Set SMARTY_TRACE=1 to log worker tool calls/results and the final result to stderr (debugging).
+    private static readonly bool TraceOn = Environment.GetEnvironmentVariable("SMARTY_TRACE") == "1";
+    private static void Trace(string msg) { if (TraceOn) Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {msg}"); }
+    private static string Snip(string s, int max) =>
+        string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : "…" + s[^max..]).Replace("\n", " ⏎ ");
 
-    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json)
+    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log)
     {
         _provider = new OllamaModelProvider(ollamaBaseUrl);
         _model = model;
         _ollamaBaseUrl = ollamaBaseUrl;
         _workerSystem = workerSystem;
         _json = json;
+        _log = log;
     }
+
+    // Project agent messages/tools into clean, training-shaped JSON (system + messages + tools → output).
+    private static object ProjectMessages(IEnumerable<Message> messages) =>
+        messages.Select(m => new
+        {
+            role = m.Role.ToString().ToLowerInvariant(),
+            content = m.Content,
+            reasoning = m.Reasoning,
+            tool_calls = m.ToolCalls?.Select(c => new { id = c.Id, name = c.Name, arguments = c.Arguments.ToString() }),
+            tool_name = m.ToolName,
+            tool_call_id = m.ToolCallId,
+        }).ToList();
+
+    private static object ProjectTools(IReadOnlyList<AgentTool> tools) =>
+        tools.Select(t => new
+        {
+            name = t.Name,
+            description = t.Description,
+            parameters = t.Parameters.Select(p => new { name = p.Name, type = p.Type, description = p.Description, required = p.Required }),
+        }).ToList();
 
     private const string OrchestratorSystem =
         "You are the user's personal assistant and their single point of contact. Your goal is simple: " +
@@ -62,8 +85,10 @@ public sealed class Orchestrator
         "- A message with BOTH (e.g. \"tell me a joke and also check my disk\") — do both in the same reply: " +
         "answer the easy part in your words AND call delegate for the work part. Don't drop either.\n" +
         "- The user refines or changes something you're ALREADY doing (\"actually make it X\", \"also include " +
-        "Y\", \"wait — C and D, not just C\") — do NOT start a second task. Call message_task on the running " +
-        "task with the change.\n" +
+        "Y\", \"wait — C and D, not just C\") — call message_task on the running task with the change, and " +
+        "that's the WHOLE action. Do NOT also call delegate for it: the running task will fold in your " +
+        "message and come back with one combined result. Messaging it AND starting a new task duplicates " +
+        "the work and the user gets the answer twice.\n" +
         "- The user backs off something in progress (\"actually, don't worry\", \"never mind\", \"forget it\", " +
         "\"stop\", \"cancel that\", \"leave it\") — call cancel_task on that task.\n" +
         "\n" +
@@ -76,15 +101,17 @@ public sealed class Orchestrator
         await session.TurnLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            Trace("[turn] user message received");
             session.LastUserMessageAt = DateTimeOffset.UtcNow;
             EmitMessage(session, "user", userText);
             session.History.Add(Message.User(userText));
 
             // The user-facing turn is where the real decisions live (which tools, answer-and-delegate,
-            // refine-vs-new, cancel). Let the model think here so it gets them right; re-voice/status
+            // refine-vs-new, cancel). Let the model think here so it gets them right; re-voice
             // turns stay think:false for speed.
             string content = await RunOrchestratorTurnAsync(
                 session, session.History, OrchestratorTools, think: true, ct).ConfigureAwait(false);
+            Trace("[turn] orchestrator user-turn done (ack streamed)");
 
             session.History.Add(Message.Assistant(string.IsNullOrWhiteSpace(content) ? "(on it)" : content));
         }
@@ -116,7 +143,7 @@ public sealed class Orchestrator
             var request = new ModelRequest
             {
                 Model = _model,
-                SystemPrompt = OrchestratorSystem + RunningTasksNote(session),
+                SystemPrompt = OrchestratorSystem + DateContext() + RunningTasksNote(session),
                 Messages = convo,
                 Tools = tools,
                 RepeatPenalty = 1.0,
@@ -125,6 +152,7 @@ public sealed class Orchestrator
                 Think = think, // user turns think (right tool choices); re-voice/status don't (speed)
             };
 
+            var sentMessages = convo.ToList(); // exact input for this inference (before we append its output)
             var turnText = new StringBuilder();
             ModelResponse? final = null;
             await foreach (var ev in _provider.StreamAsync(request, ct).ConfigureAwait(false))
@@ -145,6 +173,26 @@ public sealed class Orchestrator
                 }
             }
             final ??= new ModelResponse();
+
+            _log.Interaction(new
+            {
+                ts = DateTimeOffset.UtcNow,
+                session = session.Id,
+                msg_id = msgId,
+                role = "orchestrator",
+                model = _model,
+                think,
+                system = request.SystemPrompt,
+                messages = ProjectMessages(sentMessages),
+                tools = ProjectTools(tools),
+                output = new
+                {
+                    content = turnText.ToString(),
+                    reasoning = final.Reasoning,
+                    tool_calls = final.ToolCalls.Select(c => new { id = c.Id, name = c.Name, arguments = c.Arguments.ToString() }),
+                },
+                finish = final.Finish.ToString(),
+            });
 
             var calls = final.ToolCalls;
             convo.Add(Message.Assistant(turnText.ToString(), final.Reasoning, calls.Count > 0 ? calls : null));
@@ -173,7 +221,10 @@ public sealed class Orchestrator
             session.Append("content", Json(new { id = msgId, text = ack }));
         }
 
-        session.Append("msg_end", Json(new { id = msgId }));
+        // Carry the complete text on msg_end so the client can snap to the authoritative final string —
+        // streamed deltas are best-effort for the live "typing" feel; if any were dropped in transit, this
+        // self-heals the message without a refresh.
+        session.Append("msg_end", Json(new { id = msgId, text = spoken.ToString() }));
         return spoken.ToString();
     }
 
@@ -253,7 +304,6 @@ public sealed class Orchestrator
         session.Tasks[task.Id] = task;
         session.Append("working", Json(new { id = task.Id, task = description }));
         _ = Task.Run(() => RunWorkerAsync(session, task));
-        _ = Task.Run(() => MonitorTaskAsync(session, task));
         return task;
     }
 
@@ -263,14 +313,26 @@ public sealed class Orchestrator
     {
         string result = "(no result)";
         bool cancelled = false;
+        Trace($"[worker #{task.Id}] start: {Snip(task.Description, 120)}");
         try
         {
+            var provider = new OllamaModelProvider(_ollamaBaseUrl);
             var input = new AgentInput
             {
                 SystemPrompt = _workerSystem(),
                 Model = ModelSpec.Ollama(_model, _ollamaBaseUrl),
-                Tools = { ShellTool.Create() },
+                Tools =
+                {
+                    ShellTool.Create(),
+                    WebResearch.SearchTool(),
+                    WebResearch.PageAnswerTool(provider, _model),
+                },
                 DrainInbox = () => DrainInbox(task),
+                // Honesty over speed: with reasoning on, the worker inspects tool output, notices junk
+                // (e.g. a blank free-space field) and either recovers or says it couldn't — instead of
+                // fabricating. Reliability past that is a model problem, fixed by a better model, not by
+                // bolting model-specific crutches into this (deliberately model-agnostic) system.
+                Think = true,
             };
             var worker = new SmartyAgent(input);
 
@@ -289,12 +351,33 @@ public sealed class Orchestrator
                         break;
                     case AgentEvent.ToolStarted ts:
                         task.LatestThought = $"running {ts.ToolName}…";
+                        Trace($"[tool] start {ts.ToolName} {Snip(ts.Arguments, 160)}");
+                        break;
+                    case AgentEvent.ToolCompleted tc:
+                        Trace($"[tool] done  {tc.ToolName} -> {Snip(tc.Result, 300)}");
                         break;
                     case AgentEvent.Completed done:
                         result = done.Answer;
                         break;
                 }
             }
+
+            // Capture the full worker transcript (task → tool calls → results → answer) for the dataset.
+            if (worker.LastRun is { } run)
+                _log.Interaction(new
+                {
+                    ts = DateTimeOffset.UtcNow,
+                    session = session.Id,
+                    task_id = task.Id,
+                    role = "worker",
+                    model = _model,
+                    think = true,
+                    system = input.SystemPrompt,
+                    tools = ProjectTools(input.Tools),
+                    task = task.Description,
+                    transcript = ProjectMessages(run.Messages),
+                    result,
+                });
         }
         catch (OperationCanceledException)
         {
@@ -311,6 +394,7 @@ public sealed class Orchestrator
         if (task.Status == "running") task.Status = "done";
 
         session.Append("working_done", Json(new { id = task.Id, status = task.Status }));
+        Trace($"[worker #{task.Id}] RESULT >>> {Snip(result, 500)}");
 
         // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
         if (cancelled) return;
@@ -324,73 +408,19 @@ public sealed class Orchestrator
                     $"A background task you delegated has finished.\nTask: {task.Description}\nResult:\n{result}\n\n" +
                     "Relay this to the user now in a natural, friendly, concise way — as if you just finished " +
                     "checking for them. Do not mention tasks, workers, delegation, or any internal mechanics; " +
-                    "just give them the answer conversationally."),
+                    "just give them the answer conversationally.\n" +
+                    "CRITICAL: this result came from live tools with real, current data — you do NOT. Relay its " +
+                    "findings faithfully. Do NOT contradict, second-guess, water down, or 'correct' them using " +
+                    "your own memory or assumptions about what year it is. If the result says something is " +
+                    "happening now, it is happening now."),
             };
 
+            Trace($"[worker #{task.Id}] re-voice start");
             string content = await RunOrchestratorTurnAsync(
                 session, convo, Array.Empty<AgentTool>(), think: false, CancellationToken.None).ConfigureAwait(false);
+            Trace($"[worker #{task.Id}] re-voice done (user now sees the answer)");
 
             session.History.Add(Message.Assistant(string.IsNullOrWhiteSpace(content) ? result : content));
-        }
-        finally
-        {
-            session.TurnLock.Release();
-        }
-    }
-
-    /// <summary>Watch a running task; if it runs long while the user is quiet, push a brief status line.</summary>
-    private async Task MonitorTaskAsync(Session session, TaskInfo task)
-    {
-        while (task.IsRunning)
-        {
-            try
-            {
-                await Task.Delay(StatusInterval, task.Cts.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                return; // task finished or was cancelled
-            }
-
-            if (!task.IsRunning) return;
-
-            var now = DateTimeOffset.UtcNow;
-            if (now - session.LastUserMessageAt < QuietWindow) continue; // don't interrupt an active chat
-            if (now - task.LastStatusAt < StatusInterval) continue;       // don't nag
-
-            await PushStatusUpdateAsync(session, task).ConfigureAwait(false);
-        }
-    }
-
-    /// <summary>Peek the worker's latest progress and voice a short "still on it" line — if nothing else
-    /// is mid-turn and the user is still quiet.</summary>
-    private async Task PushStatusUpdateAsync(Session session, TaskInfo task)
-    {
-        // Don't queue behind an in-flight turn; if the chat is busy, skip and try again next tick.
-        if (!await session.TurnLock.WaitAsync(0).ConfigureAwait(false)) return;
-        try
-        {
-            if (!task.IsRunning) return;
-            if (DateTimeOffset.UtcNow - session.LastUserMessageAt < QuietWindow) return;
-
-            task.LastStatusAt = DateTimeOffset.UtcNow;
-            var peek = string.IsNullOrWhiteSpace(task.LatestThought)
-                ? "still working on it, nothing's gone wrong so far"
-                : task.LatestThought;
-
-            var convo = new List<Message>(session.History)
-            {
-                Message.System(
-                    $"You're still working on something for the user (\"{task.Description}\") and it's taking a " +
-                    $"little while. Here's where it's at: {peek}. Send the user ONE short, friendly line so they " +
-                    "know you're still on it. Don't mention tasks, workers, or internals, and don't ask a question."),
-            };
-
-            string content = await RunOrchestratorTurnAsync(
-                session, convo, Array.Empty<AgentTool>(), think: false, CancellationToken.None).ConfigureAwait(false);
-
-            if (!string.IsNullOrWhiteSpace(content))
-                session.History.Add(Message.Assistant(content));
         }
         finally
         {
@@ -408,6 +438,22 @@ public sealed class Orchestrator
                 $"While you've been working, the user sent a follow-up about this task: \"{m}\". " +
                 "Take it into account and adjust what you're doing accordingly."));
         return msgs;
+    }
+
+    // Anchor the orchestrator in real time. Without this it drifts to its training-era "now" and treats
+    // the present as the future (e.g. "the 2026 World Cup hasn't happened yet"), and answers current-events
+    // questions from stale memory instead of delegating for live data.
+    private static string DateContext()
+    {
+        var now = DateTime.Now;
+        return
+            $"\n\nCURRENT DATE/TIME (authoritative — from the real system clock): {now:dddd, d MMMM yyyy, HH:mm}. " +
+            $"The current year is {now.Year}. This is the real present. Your training data is older, so {now.Year} " +
+            "may feel like the future to you — it is NOT. Never say that a date in the present or past is in the " +
+            "future, hasn't happened yet, is fictional, or is impossible. And you do NOT know current or live " +
+            "facts (today's news, scores, prices, weather, what's happening 'now/today/latest/this year') from " +
+            "memory — for anything current, you MUST delegate to fetch the real answer rather than guessing from " +
+            "what you remember.";
     }
 
     // A live snapshot of in-flight tasks, appended to the system prompt so the orchestrator always knows
@@ -450,7 +496,7 @@ public sealed class Orchestrator
         int id = session.NextMessageId();
         session.Append("msg_start", Json(new { id, role }));
         session.Append("content", Json(new { id, text }));
-        session.Append("msg_end", Json(new { id }));
+        session.Append("msg_end", Json(new { id, text }));
     }
 
     // The orchestrator's tools. Schemas only — calls are read off the response and handled against the

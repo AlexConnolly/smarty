@@ -4,3 +4,14 @@ obj/
 .vs/
 # Local Whisper GGML model (downloaded on first use, ~140MB)
 Smarty.Api/models/
+
+# Captured interactions/feedback for fine-tuning (personal data)
+Smarty.Api/training-data/
+training-data/
+
+# Local run/scratch artifacts
+Smarty.Api/run.log
+Smarty.Api/run.log.err
+*.log
+Smarty.Api/sid.txt
+Smarty.Api/sse_*.txt

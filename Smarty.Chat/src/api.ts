@@ -24,12 +24,30 @@ export interface SessionHandlers {
   onMsgStart?: (id: number, role: string) => void
   onContent?: (id: number, text: string) => void
   onReasoning?: (id: number, text: string) => void
-  onMsgEnd?: (id: number) => void
+  onMsgEnd?: (id: number, text?: string) => void
   onWorking?: (id: string, task: string) => void
   onWorkingDone?: (id: string) => void
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** Rate an assistant message (thumbs up/down) — labels the logged interaction for the fine-tune dataset. */
+export async function sendFeedback(
+  sessionId: string,
+  messageId: number,
+  rating: 'up' | 'down',
+  note?: string,
+): Promise<void> {
+  try {
+    await fetch(`/api/session/${sessionId}/feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messageId, rating, note }),
+    })
+  } catch {
+    /* feedback is best-effort */
+  }
+}
 
 /** Post a user message to the session. The reply (and any later results) arrive on the stream. */
 export async function sendMessage(sessionId: string, content: string): Promise<void> {
@@ -38,6 +56,13 @@ export async function sendMessage(sessionId: string, content: string): Promise<v
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content }),
   })
+}
+
+export async function cancelTask(sessionId: string, taskId: string): Promise<void> {
+  const res = await fetch(`/api/session/${sessionId}/task/${encodeURIComponent(taskId)}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
 }
 
 /**
@@ -119,7 +144,7 @@ function dispatch(ev: Frame, h: SessionHandlers): void {
       h.onReasoning?.(d.id, d.text)
       break
     case 'msg_end':
-      h.onMsgEnd?.(d.id)
+      h.onMsgEnd?.(d.id, d.text)
       break
     case 'working':
       h.onWorking?.(taskId, d.task)
