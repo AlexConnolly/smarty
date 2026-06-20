@@ -230,21 +230,28 @@ public sealed class Orchestrator
 
             if (calls.Count == 0)
             {
-                // Safety net for "narrated the call instead of making it": if the model named a tool (in its
-                // reasoning or reply) but called nothing all turn, it likely meant to act and forgot. Nudge it
-                // once to actually call it. This is deterministic and tool-agnostic — it checks the real tool
-                // list — and won't fire on plain chat (no tool named) or on a post-tool confirmation (a tool
-                // was already called this turn).
-                var named = anyToolCalled || nudgedNoTool
-                    ? null
-                    : ReferencesUncalledTool(turnText.ToString(), final.Reasoning, tools);
-                if (named is not null)
+                // Two failure shapes to rescue once (both deterministic, tool-agnostic):
+                // (a) the model emitted NO message to the user and called nothing — it dumped its reply into
+                //     reasoning and "stopped after thinking"; a turn with no words and no action is always broken.
+                // (b) it NAMED a tool (in reasoning/reply) but didn't call it — meant to act, forgot. (Skipped
+                //     when a tool was already called this turn, so a post-tool confirmation isn't nudged.)
+                string? nudge = null;
+                if (!nudgedNoTool)
+                {
+                    if (turnText.Length == 0)
+                        nudge = "Your reply had only internal reasoning — no message to the user and no tool " +
+                                "call, so nothing actually happened. If you meant to do something, call the " +
+                                "tool now; otherwise write your actual reply to the user.";
+                    else if (!anyToolCalled &&
+                             ReferencesUncalledTool(turnText.ToString(), final.Reasoning, tools) is { } named)
+                        nudge = $"You referred to the {named} tool but didn't actually call it, so nothing " +
+                                $"happened. A tool call is the only way to do it — if you meant to, call {named} " +
+                                "now. If you were only chatting and no action was needed, just reply normally.";
+                }
+                if (nudge is not null)
                 {
                     nudgedNoTool = true;
-                    convo.Add(Message.System(
-                        $"You referred to the {named} tool but didn't actually call it, so nothing happened. " +
-                        $"A tool call is the only way to do it — if you meant to, call {named} now. If you were " +
-                        "only chatting and no action was needed, just reply normally."));
+                    convo.Add(Message.System(nudge));
                     continue;
                 }
                 break;
@@ -270,6 +277,14 @@ public sealed class Orchestrator
             const string ack = "Sure — let me look into that for you.";
             spoken.Append(ack);
             session.Append("content", Json(new { id = msgId, text = ack }));
+        }
+        // Last-resort: the turn produced no message and no delegated work (e.g. the model only reasoned and
+        // the nudge didn't recover it). Never leave the user staring at an empty reply.
+        else if (spoken.Length == 0)
+        {
+            const string fallback = "Sorry — I trailed off there. Could you say that again?";
+            spoken.Append(fallback);
+            session.Append("content", Json(new { id = msgId, text = fallback }));
         }
 
         // Carry the complete text on msg_end so the client can snap to the authoritative final string —
@@ -389,7 +404,11 @@ public sealed class Orchestrator
             }
 
             default:
-                return Data($"Unknown tool '{call.Name}'.");
+                // Bad/hallucinated tool name — tell the model the real ones so it can correct itself, rather
+                // than guess again and burn iterations.
+                return Data($"There's no tool called '{call.Name}'. Available tools: " +
+                            $"{string.Join(", ", _orchestratorTools.Select(t => t.Name))}. Use one of those, " +
+                            "or just reply if no tool is needed.");
         }
     }
 

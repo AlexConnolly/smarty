@@ -180,7 +180,8 @@ public sealed class SmartyAgent
     private async Task<ToolOutput> ExecuteToolAsync(ToolCall call, CancellationToken ct)
     {
         if (!_tools.TryGetValue(call.Name, out var tool))
-            return ToolOutput.Error($"Error: no tool named '{call.Name}' is available.");
+            return ToolOutput.Error($"Error: no tool named '{call.Name}' is available. Available tools: " +
+                                    $"{string.Join(", ", _tools.Keys)}. Use one of those.");
 
         try
         {
