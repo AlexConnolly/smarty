@@ -126,8 +126,16 @@ public sealed class SmartyAgent
 
             if (toolCalls.Count == 0)
             {
-                yield return new AgentEvent.Completed(answerText);
-                yield break;
+                if (!string.IsNullOrWhiteSpace(answerText))
+                {
+                    yield return new AgentEvent.Completed(answerText);
+                    yield break;
+                }
+                // No tool call AND no answer text (the model reasoned but said nothing, on the final
+                // iteration where loop-recovery no longer kicks in). Don't return an empty result — fall
+                // through to the graceful "couldn't finish" message so the agent admits defeat rather than
+                // handing the caller a blank to invent around.
+                break;
             }
 
             // This turn is a tool-call turn — discard any answer text we optimistically streamed

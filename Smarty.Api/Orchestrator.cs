@@ -594,43 +594,34 @@ public sealed class Orchestrator
         // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
         if (cancelled) return;
 
-        // If the worker came back with nothing usable, say so honestly and DETERMINISTICALLY — never hand an
-        // empty result to the re-voice, which otherwise invents a plausible-sounding answer (it once
-        // fabricated a whole "latest news" rundown from a blank result). No model = no fabrication.
-        if (string.IsNullOrWhiteSpace(result) ||
-            string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase))
-        {
-            Trace($"[worker #{task.Id}] empty result → honest fallback (no fabrication)");
-            await session.TurnLock.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                const string honest = "Sorry — I went to check on that but couldn't get anything back just now. Want me to try again?";
-                EmitMessage(session, "assistant", honest);
-                session.History.Add(Message.Assistant(honest));
-            }
-            finally { session.TurnLock.Release(); }
-            return;
-        }
+        // Did the task come back with nothing usable? Then we must NOT relay it as if it had data — the
+        // re-voice would otherwise invent a plausible answer (it once fabricated a whole "latest news"
+        // rundown from a blank result). We still let the MODEL phrase the reply (so it matches the user's
+        // language — no hard-coded line), but on a strict "it failed, invent nothing" instruction.
+        bool failed = string.IsNullOrWhiteSpace(result)
+            || string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase);
 
         await session.TurnLock.WaitAsync().ConfigureAwait(false);
         try
         {
-            var convo = new List<Message>(session.History)
-            {
-                Message.System(
-                    $"A background task you delegated has finished.\nTask: {task.Description}\nResult:\n{result}\n\n" +
-                    "Relay this to the user now in a natural, friendly, concise way — as if you just finished " +
-                    "checking for them. Do not mention tasks, workers, delegation, or any internal mechanics; " +
-                    "just give them the answer conversationally.\n" +
-                    "CRITICAL: this result came from live tools with real, current data — you do NOT. Relay its " +
-                    "findings faithfully. Do NOT contradict, second-guess, water down, or 'correct' them using " +
-                    "your own memory or assumptions about what year it is. If the result says something is " +
-                    "happening now, it is happening now. But if the result is empty or says it couldn't find/get " +
-                    "anything, tell the user you couldn't get it right now — NEVER invent, pad, or fill it in " +
-                    "from your own knowledge."),
-            };
+            var instruction = failed
+                ? $"A background task you tried could not be completed (it returned no result).\nTask: {task.Description}\n\n" +
+                  "Tell the user — in the SAME language they have been speaking — that you weren't able to get " +
+                  "this just now, and offer to try again. Do NOT invent, pad, guess, or fill in any answer from " +
+                  "your own knowledge. Don't mention tasks, workers, delegation, or any internal mechanics."
+                : $"A background task you delegated has finished.\nTask: {task.Description}\nResult:\n{result}\n\n" +
+                  "Relay this to the user now in a natural, friendly, concise way — as if you just finished " +
+                  "checking for them. Do not mention tasks, workers, delegation, or any internal mechanics; " +
+                  "just give them the answer conversationally.\n" +
+                  "CRITICAL: this result came from live tools with real, current data — you do NOT. Relay its " +
+                  "findings faithfully. Do NOT contradict, second-guess, water down, or 'correct' them using " +
+                  "your own memory or assumptions about what year it is. If the result says something is " +
+                  "happening now, it is happening now. But if it says it couldn't find/get something, tell the " +
+                  "user that plainly — never invent or pad it.";
 
-            Trace($"[worker #{task.Id}] re-voice start");
+            var convo = new List<Message>(session.History) { Message.System(instruction) };
+
+            Trace($"[worker #{task.Id}] re-voice start{(failed ? " (failed task — honest, no invent)" : "")}");
             string content = await RunOrchestratorTurnAsync(
                 session, convo, Array.Empty<AgentTool>(), think: false, CancellationToken.None).ConfigureAwait(false);
             Trace($"[worker #{task.Id}] re-voice done (user now sees the answer)");
