@@ -95,9 +95,10 @@ public sealed class Orchestrator
         "- list_tasks() / task_status(id): what's running / how it's going (use the ids you're shown).\n" +
         "- search_memory(query): recall what you know about the USER — keywords, not sentences. Only when " +
         "their request actually needs personal context (where they live, preferences, people). Don't fish.\n" +
-        "- set_memory(type, key, value, context): remember a durable fact — a decision, a booking, a detail. " +
-        "While you're focused on a project it's saved AGAINST that project; otherwise it's a fact about the " +
-        "USER. A new value for an existing key updates it. Not one-off trivia.\n" +
+        "- set_memory(type, key, value, context): remember a durable fact about the USER (where they live, " +
+        "diet, people); a new value for an existing key updates it. Not one-off trivia. A PROJECT detail — a " +
+        "booking, decision or date for a project — is NOT saved here: delegate it into the project so the " +
+        "project's worker records it (the authority on that project, with its context loaded).\n" +
         "- find_project(statement): when a message refers to ongoing work without naming it (\"the flights\", " +
         "\"book the table\"), resolve WHICH project it's about before acting. If it finds none, ask the user; " +
         "never assume.\n" +
@@ -106,8 +107,9 @@ public sealed class Orchestrator
         "house move, any multi-step undertaking. The moment a request is more than a single question or a " +
         "couple of quick back-and-forths — especially \"help me plan/organise/sort out X\" — treat it as a " +
         "project, NOT a one-off task: propose one, and once the user's happy create it (resolve with " +
-        "find_project first; never auto-create or duplicate), then delegate the work with its slug so the " +
-        "worker has the context. Only genuine one-offs (a single fact, a quick lookup) need no project.\n" +
+        "find_project first; never auto-create or duplicate). Creating a project just SETS IT UP — do NOT " +
+        "kick off work or delegate open-ended planning on your own; only delegate when the user actually asks " +
+        "for something specific to be done (tag that task with the slug). Only genuine one-offs need no project.\n" +
         "\n" +
         "Just answer (no tools) for chat, jokes, opinions, or things you already know. If a message has both " +
         "an easy part and a work part, answer the easy part AND delegate the work part in the same reply. " +
@@ -392,19 +394,23 @@ public sealed class Orchestrator
 
             case "set_memory":
             {
-                // Scope: an explicit project arg wins; otherwise the project in focus (so details stated while
-                // discussing a project land ON that project, not in the global profile); otherwise global.
+                // Project facts are the authority's job: written by a worker running INSIDE the project, with
+                // the project's context loaded, so the write is reconciled — never recorded here. Scope =
+                // explicit project arg, else the project in focus. If that's a real project, DON'T write: tell
+                // the model to delegate the recording into it. set_memory here only saves facts about the user.
                 var proj = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
                 if (string.IsNullOrEmpty(proj)) proj = session.CurrentProject;
-                if (!string.IsNullOrEmpty(proj) && !_projects.Exists(proj)) proj = null;
-                var result = _memory.Set(
+                if (!string.IsNullOrEmpty(proj) && _projects.Exists(proj))
+                    return Data($"That's a detail for project \"{proj}\" — record it via the project's worker, " +
+                                $"not here. delegate with project: \"{proj}\" and a task that simply tells the " +
+                                "worker to SAVE these exact details to memory (e.g. \"Record to memory: …the " +
+                                "facts…\"). Make clear it's just saving given facts — not researching, booking, " +
+                                "or confirming anything. set_memory here is only for facts about the USER.");
+                return Data(_memory.Set(
                     call.Arguments.GetStringOrNull("type") ?? "",
                     call.Arguments.GetStringOrNull("key") ?? "",
                     call.Arguments.GetStringOrNull("value") ?? "",
-                    call.Arguments.GetStringOrNull("context"),
-                    proj);
-                if (!string.IsNullOrEmpty(proj)) _ = RegenerateReadmeAsync(proj); // project touched → refresh README
-                return Data(result);
+                    call.Arguments.GetStringOrNull("context")));
             }
 
             default:
@@ -791,8 +797,9 @@ public sealed class Orchestrator
         if (p is null) { session.CurrentProject = null; return ""; } // project gone — drop the stale focus
 
         var sb = new StringBuilder($"\n\nYou're currently focused on the project \"{p.Title}\" (slug: {slug}). ");
-        sb.Append("Durable details you record with set_memory now are saved against THIS project. If the user " +
-                  "clearly moves on to something else, drop the focus.\n");
+        sb.Append("To record a new detail about it (a booking, decision, date), delegate that into this " +
+                  "project — its worker is the authority and records it with the project's context; don't " +
+                  "set_memory it here. If the user clearly moves on, drop the focus.\n");
         var facts = await _memory.RelevantTo(message, k: 5, project: slug, ct: ct).ConfigureAwait(false);
         if (facts.Count > 0)
         {

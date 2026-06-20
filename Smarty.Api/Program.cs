@@ -368,7 +368,9 @@ string WorkerSystemPrompt() =>
     "info, files, local commands, or APIs the web tools can't handle. Base every factual claim ONLY on " +
     "what a tool actually returned this turn — if the tools don't give you the answer, say so rather than " +
     "filling it in from memory. You also have search_memory (recall what's known about the user — search " +
-    "keywords) and set_memory (remember a durable fact they share); use them when personal context helps. " +
+    "keywords) and set_memory (store a durable fact). If the task is to RECORD, note, log or save details " +
+    "you've been GIVEN, just store them with set_memory and confirm — do NOT web-search, verify or 'confirm' " +
+    "facts the user already stated; there's nothing to look up. Use them when personal/project context helps. " +
     "Be efficient: one or two good sources is usually enough — STOP and answer " +
     "as soon as a tool has given you what the task needs. Only keep going if a source failed or the answer " +
     "is genuinely incomplete; don't pile on extra sources for thoroughness' sake. Give a clear, complete " +
