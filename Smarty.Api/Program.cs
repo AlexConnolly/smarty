@@ -57,9 +57,26 @@ string trainingDir = builder.Configuration["Training:Dir"]
 var trainingLog = new TrainingLog(trainingDir, json);
 
 // Long-term memory of the user — structured facts, persisted to disk (see MEMORY_SPEC.md).
+// Embedder: turns text into a vector via a local Ollama embed model, so memory relevance is semantic.
+string embedModel = builder.Configuration["Memory:EmbedModel"] ?? "nomic-embed-text";
+Func<string, CancellationToken, Task<float[]?>> embed = async (text, ct) =>
+{
+    try
+    {
+        var payload = JsonSerializer.Serialize(new { model = embedModel, prompt = text }, json);
+        using var content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
+        using var resp = await http.PostAsync($"{ollamaBaseUrl}/api/embeddings", content, ct);
+        if (!resp.IsSuccessStatusCode) return null;
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
+        return doc.RootElement.TryGetProperty("embedding", out var arr) && arr.ValueKind == JsonValueKind.Array
+            ? arr.EnumerateArray().Select(e => (float)e.GetDouble()).ToArray()
+            : null;
+    }
+    catch { return null; } // embedding is best-effort; the store falls back to keyword matching
+};
 string memoryPath = builder.Configuration["Memory:Path"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "data", "memory.json");
-var memory = new MemoryStore(memoryPath, json);
+var memory = new MemoryStore(memoryPath, json, embed);
 
 var sessions = new SessionStore();
 var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory);

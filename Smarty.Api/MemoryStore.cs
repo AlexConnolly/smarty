@@ -15,6 +15,7 @@ public sealed class MemoryFact
     public DateTimeOffset Asserted { get; set; }    // when it became true / was last reaffirmed
     public string Status { get; set; } = "active";  // active | superseded | retired
     public string? SupersededBy { get; set; }
+    public float[]? Embedding { get; set; }         // semantic vector for relevance retrieval (lazy-filled)
 }
 
 /// <summary>
@@ -27,15 +28,21 @@ public sealed class MemoryStore
     private readonly object _lock = new();
     private readonly string _path;
     private readonly JsonSerializerOptions _json;
+    private readonly Func<string, CancellationToken, Task<float[]?>>? _embed;
     private readonly List<MemoryFact> _facts = new();
     private int _next;
 
-    public MemoryStore(string path, JsonSerializerOptions json)
+    public MemoryStore(string path, JsonSerializerOptions json, Func<string, CancellationToken, Task<float[]?>>? embed = null)
     {
         _path = path;
         _json = json;
+        _embed = embed;
         Load();
     }
+
+    // The text we embed for a fact — its meaning, not its plumbing.
+    private static string FactText(MemoryFact f) =>
+        string.Join(' ', new[] { f.Key, f.Value, f.Context }.Where(s => !string.IsNullOrWhiteSpace(s)));
 
     /// <summary>Remember a durable fact. Same (type,key) with a new value supersedes the old; same value
     /// reaffirms; otherwise it's inserted. Returns a short confirmation for the model to relay.</summary>
@@ -127,21 +134,58 @@ public sealed class MemoryStore
     /// <summary>The active facts most relevant to a message — for auto-surfacing context per turn (the
     /// system retrieves; the model doesn't have to decide to search). Keyword-scored for now; this is the
     /// seam where embeddings/vectors slot in to make "relevant" semantic.</summary>
-    public IReadOnlyList<MemoryFact> RelevantTo(string message, int k)
+    public async Task<IReadOnlyList<MemoryFact>> RelevantTo(string message, int k, CancellationToken ct = default)
     {
+        if (string.IsNullOrWhiteSpace(message)) return Array.Empty<MemoryFact>();
+        List<MemoryFact> active;
+        lock (_lock) active = _facts.Where(f => f.Status == "active").ToList();
+        if (active.Count == 0) return Array.Empty<MemoryFact>();
+
+        // Semantic path: embed the query + any facts missing a vector (nomic prefixes), rank by cosine.
+        if (_embed is not null)
+        {
+            var qv = await _embed("search_query: " + message, ct).ConfigureAwait(false);
+            if (qv is not null)
+            {
+                bool changed = false;
+                foreach (var f in active.Where(f => f.Embedding is null))
+                {
+                    f.Embedding = await _embed("search_document: " + FactText(f), ct).ConfigureAwait(false);
+                    changed |= f.Embedding is not null;
+                }
+                if (changed) lock (_lock) Save();
+
+                var scored = active.Where(f => f.Embedding is not null)
+                    .Select(f => (f, sim: Cosine(qv, f.Embedding!)))
+                    .OrderByDescending(x => x.sim)
+                    .ToList();
+                if (Environment.GetEnvironmentVariable("SMARTY_TRACE") == "1")
+                    Console.Error.WriteLine("[mem] sims: " + string.Join(", ", scored.Select(x => $"{x.f.Key}={x.sim:F2}")));
+                var ranked = scored.Where(x => x.sim >= RelevanceThreshold).Take(k).Select(x => x.f).ToList();
+                if (ranked.Count > 0) return ranked;
+            }
+        }
+
+        // Keyword fallback — no embedder, embedding failed, or nothing cleared the semantic bar.
         var terms = Terms(message);
         if (terms.Count == 0) return Array.Empty<MemoryFact>();
-        lock (_lock)
-        {
-            return _facts.Where(f => f.Status == "active")
-                .Select(f => (f, s: Score(f, terms)))
-                .Where(x => x.s > 0)
-                .OrderByDescending(x => x.s)
-                .ThenByDescending(x => x.f.Asserted)
-                .Take(k)
-                .Select(x => x.f)
-                .ToList();
-        }
+        return active.Select(f => (f, s: Score(f, terms)))
+            .Where(x => x.s > 0)
+            .OrderByDescending(x => x.s)
+            .ThenByDescending(x => x.f.Asserted)
+            .Take(k)
+            .Select(x => x.f)
+            .ToList();
+    }
+
+    private const double RelevanceThreshold = 0.5; // cosine; tune against real queries
+
+    private static double Cosine(float[] a, float[] b)
+    {
+        if (a.Length != b.Length || a.Length == 0) return 0;
+        double dot = 0, na = 0, nb = 0;
+        for (int i = 0; i < a.Length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+        return (na == 0 || nb == 0) ? 0 : dot / (Math.Sqrt(na) * Math.Sqrt(nb));
     }
 
     private static List<string> Terms(string s) =>

@@ -133,7 +133,8 @@ public sealed class Orchestrator
         // Surfacing the profile here also means personal facts (allergies, where they live) are ALWAYS in
         // front of the model, so it doesn't have to decide to search for them.
         var message = convo.LastOrDefault(m => m.Role == Role.User)?.Content ?? "";
-        var dynamicContext = (DateContext() + ProfileNote(message) + RunningTasksNote(session)).TrimStart();
+        var profile = await ProfileNote(message, ct).ConfigureAwait(false);
+        var dynamicContext = (DateContext() + profile + RunningTasksNote(session)).TrimStart();
         if (dynamicContext.Length > 0)
             convo.Insert(Math.Max(0, convo.Count - 1), Message.System(dynamicContext));
 
@@ -481,9 +482,9 @@ public sealed class Orchestrator
     // The facts RELEVANT TO THIS MESSAGE, surfaced automatically so the model always has the personal
     // context it needs (allergies, where they live) without deciding to search — but only what's relevant,
     // not the whole store. The system does the retrieval; embeddings will make "relevant" semantic later.
-    private string ProfileNote(string message)
+    private async Task<string> ProfileNote(string message, CancellationToken ct)
     {
-        var facts = _memory.RelevantTo(message, k: 6);
+        var facts = await _memory.RelevantTo(message, k: 6, ct).ConfigureAwait(false);
         Trace($"[mem] relevant-to({Snip(message, 50)}) -> {(facts.Count == 0 ? "(none)" : string.Join(", ", facts.Select(f => f.Key + "=" + f.Value)))}");
         if (facts.Count == 0) return "";
         var sb = new StringBuilder("\n\nRelevant to this, here's what you know about the user (apply it; never advise against it):\n");
