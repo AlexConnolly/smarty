@@ -594,6 +594,24 @@ public sealed class Orchestrator
         // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
         if (cancelled) return;
 
+        // If the worker came back with nothing usable, say so honestly and DETERMINISTICALLY — never hand an
+        // empty result to the re-voice, which otherwise invents a plausible-sounding answer (it once
+        // fabricated a whole "latest news" rundown from a blank result). No model = no fabrication.
+        if (string.IsNullOrWhiteSpace(result) ||
+            string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase))
+        {
+            Trace($"[worker #{task.Id}] empty result → honest fallback (no fabrication)");
+            await session.TurnLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                const string honest = "Sorry — I went to check on that but couldn't get anything back just now. Want me to try again?";
+                EmitMessage(session, "assistant", honest);
+                session.History.Add(Message.Assistant(honest));
+            }
+            finally { session.TurnLock.Release(); }
+            return;
+        }
+
         await session.TurnLock.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -607,7 +625,9 @@ public sealed class Orchestrator
                     "CRITICAL: this result came from live tools with real, current data — you do NOT. Relay its " +
                     "findings faithfully. Do NOT contradict, second-guess, water down, or 'correct' them using " +
                     "your own memory or assumptions about what year it is. If the result says something is " +
-                    "happening now, it is happening now."),
+                    "happening now, it is happening now. But if the result is empty or says it couldn't find/get " +
+                    "anything, tell the user you couldn't get it right now — NEVER invent, pad, or fill it in " +
+                    "from your own knowledge."),
             };
 
             Trace($"[worker #{task.Id}] re-voice start");
