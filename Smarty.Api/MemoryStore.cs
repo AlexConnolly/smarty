@@ -118,11 +118,39 @@ public sealed class MemoryStore
         }
     }
 
-    /// <summary>Everything currently known, for injecting a profile into a prompt (Phase 1.5).</summary>
+    /// <summary>Everything currently known.</summary>
     public IReadOnlyList<MemoryFact> Active()
     {
         lock (_lock) return _facts.Where(f => f.Status == "active").ToList();
     }
+
+    /// <summary>The active facts most relevant to a message — for auto-surfacing context per turn (the
+    /// system retrieves; the model doesn't have to decide to search). Keyword-scored for now; this is the
+    /// seam where embeddings/vectors slot in to make "relevant" semantic.</summary>
+    public IReadOnlyList<MemoryFact> RelevantTo(string message, int k)
+    {
+        var terms = Terms(message);
+        if (terms.Count == 0) return Array.Empty<MemoryFact>();
+        lock (_lock)
+        {
+            return _facts.Where(f => f.Status == "active")
+                .Select(f => (f, s: Score(f, terms)))
+                .Where(x => x.s > 0)
+                .OrderByDescending(x => x.s)
+                .ThenByDescending(x => x.f.Asserted)
+                .Take(k)
+                .Select(x => x.f)
+                .ToList();
+        }
+    }
+
+    private static List<string> Terms(string s) =>
+        s.ToLowerInvariant()
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(t => t.Trim('.', ',', '?', '!', ';', ':', '"', '\'', '(', ')'))
+            .Where(t => t.Length >= 3)
+            .Distinct()
+            .ToList();
 
     private static int Score(MemoryFact f, IEnumerable<string> terms)
     {

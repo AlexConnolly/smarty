@@ -132,7 +132,8 @@ public sealed class Orchestrator
         // just before the latest message: the model still sees it, but the cacheable prefix stays intact.
         // Surfacing the profile here also means personal facts (allergies, where they live) are ALWAYS in
         // front of the model, so it doesn't have to decide to search for them.
-        var dynamicContext = (DateContext() + ProfileNote() + RunningTasksNote(session)).TrimStart();
+        var message = convo.LastOrDefault(m => m.Role == Role.User)?.Content ?? "";
+        var dynamicContext = (DateContext() + ProfileNote(message) + RunningTasksNote(session)).TrimStart();
         if (dynamicContext.Length > 0)
             convo.Insert(Math.Max(0, convo.Count - 1), Message.System(dynamicContext));
 
@@ -477,14 +478,16 @@ public sealed class Orchestrator
             "(news, scores, prices, weather, what's happening now) from memory; delegate to fetch anything live.";
     }
 
-    // The user's known facts, surfaced every turn so personal context (allergies, where they live,
-    // preferences) is ALWAYS in front of the model — no decision to search required.
-    private string ProfileNote()
+    // The facts RELEVANT TO THIS MESSAGE, surfaced automatically so the model always has the personal
+    // context it needs (allergies, where they live) without deciding to search — but only what's relevant,
+    // not the whole store. The system does the retrieval; embeddings will make "relevant" semantic later.
+    private string ProfileNote(string message)
     {
-        var facts = _memory.Active();
+        var facts = _memory.RelevantTo(message, k: 6);
+        Trace($"[mem] relevant-to({Snip(message, 50)}) -> {(facts.Count == 0 ? "(none)" : string.Join(", ", facts.Select(f => f.Key + "=" + f.Value)))}");
         if (facts.Count == 0) return "";
-        var sb = new StringBuilder("\n\nWhat you know about the user (apply it; never give advice that contradicts it):\n");
-        foreach (var f in facts.OrderBy(f => f.Type, StringComparer.Ordinal))
+        var sb = new StringBuilder("\n\nRelevant to this, here's what you know about the user (apply it; never advise against it):\n");
+        foreach (var f in facts)
         {
             sb.Append($"- {f.Key}: {f.Value}");
             if (!string.IsNullOrWhiteSpace(f.Context)) sb.Append($" ({f.Context})");
