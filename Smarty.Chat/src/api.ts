@@ -61,6 +61,7 @@ export interface ProjectDetail {
   title: string
   description: string
   status: string
+  readme?: string | null
   memories: ProjectMemory[]
   runs: ProjectRun[]
 }

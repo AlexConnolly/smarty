@@ -22,6 +22,7 @@ public sealed class Orchestrator
     private readonly MemoryStore _memory;
     private readonly ProjectStore _projects;
     private readonly ProjectRunStore _runs;
+    private readonly ProjectReadmeStore _readmes;
 
     // Bound the per-turn tool loop: a turn may call a data tool (list/status), read the result, then
     // voice it — but it must not spin.
@@ -33,7 +34,7 @@ public sealed class Orchestrator
     private static string Snip(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : "…" + s[^max..]).Replace("\n", " ⏎ ");
 
-    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects, ProjectRunStore runs)
+    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects, ProjectRunStore runs, ProjectReadmeStore readmes)
     {
         _provider = new OllamaModelProvider(ollamaBaseUrl);
         _model = model;
@@ -44,6 +45,7 @@ public sealed class Orchestrator
         _memory = memory;
         _projects = projects;
         _runs = runs;
+        _readmes = readmes;
         // The orchestrator's tools = task tools + global memory-access + project create/list (all executed
         // in HandleToolCall by name).
         _orchestratorTools = OrchestratorTools
@@ -312,9 +314,13 @@ public sealed class Orchestrator
             }
 
             case "create_project":
-                return Data(_projects.Create(
+            {
+                var (msg, newSlug) = _projects.Create(
                     call.Arguments.GetStringOrNull("title") ?? "",
-                    call.Arguments.GetStringOrNull("description") ?? ""));
+                    call.Arguments.GetStringOrNull("description") ?? "");
+                if (newSlug is not null) _ = RegenerateReadmeAsync(newSlug); // initial README in the background
+                return Data(msg);
+            }
 
             case "list_projects":
                 return Data(_projects.List());
@@ -540,6 +546,7 @@ public sealed class Orchestrator
         // Record what the sub-agent did, scoped to its project (work with no project isn't logged here —
         // it isn't shown anywhere). Read back by the project overview.
         if (!string.IsNullOrEmpty(task.Project) && transcript is not null)
+        {
             _runs.Add(new ProjectRun
             {
                 Id = Guid.NewGuid().ToString("N")[..8],
@@ -551,6 +558,9 @@ public sealed class Orchestrator
                 Steps = BuildSteps(transcript),
                 Result = result,
             });
+            // The project was just touched — refresh its living README in the background.
+            _ = RegenerateReadmeAsync(task.Project!);
+        }
 
         // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
         if (cancelled) return;
@@ -583,6 +593,72 @@ public sealed class Orchestrator
             session.TurnLock.Release();
         }
     }
+
+    private const string ReadmeSystem =
+        "You keep a living README for a personal project — a short, friendly markdown summary the user reads " +
+        "to catch up at a glance. Plain, warm, concise language. NO internal jargon: no slugs, ids, tool " +
+        "names, statuses, or mechanics. Use a few short sections with ## headings — what this project is, " +
+        "where it's at now, what's been decided/settled, and what's next or still open. If little is known " +
+        "yet, keep it to a sentence or two and note it's just getting started. Output ONLY the markdown.";
+
+    // Regenerate a project's living README from its current facts + run history — a plain-language catch-up
+    // the overview shows instead of raw key/value jargon. Runs in the background whenever the project is
+    // touched (a run finishes, or it's created). Best-effort: never throws into the caller.
+    private async Task RegenerateReadmeAsync(string slug, CancellationToken ct = default)
+    {
+        try
+        {
+            var p = _projects.Get(slug);
+            if (p is null) return;
+
+            var facts = _memory.Active(slug);
+            var runs = _runs.ForProject(slug);
+
+            var state = new StringBuilder();
+            state.Append($"Project: {p.Title}\n");
+            if (!string.IsNullOrWhiteSpace(p.Description)) state.Append($"About: {p.Description}\n");
+            state.Append("\nKnown details:\n");
+            if (facts.Count == 0) state.Append("- (nothing recorded yet)\n");
+            else
+                foreach (var f in facts.OrderBy(f => f.Type, StringComparer.Ordinal))
+                    state.Append($"- {f.Key}: {f.Value}{(string.IsNullOrWhiteSpace(f.Context) ? "" : $" ({f.Context})")}\n");
+            state.Append("\nWork done so far (newest first):\n");
+            if (runs.Count == 0) state.Append("- (no background work yet)\n");
+            else
+                foreach (var r in runs.Take(8))
+                    state.Append($"- {r.Task} → {Head(r.Result ?? "", 300)}\n");
+
+            var request = new ModelRequest
+            {
+                Model = _model,
+                SystemPrompt = ReadmeSystem,
+                Messages = new List<Message>
+                {
+                    Message.User("Here is the project's current state:\n\n" + state.ToString().TrimEnd() +
+                                 "\n\nWrite the project's README now."),
+                },
+                Tools = Array.Empty<AgentTool>(),
+                MaxOutputTokens = 1024,
+                TurnTimeout = TimeSpan.FromSeconds(60),
+                Think = false, // a summary — speed over deliberation
+            };
+
+            var md = new StringBuilder();
+            await foreach (var ev in _provider.StreamAsync(request, ct).ConfigureAwait(false))
+                if (ev is ModelStreamEvent.Content c) md.Append(c.Text);
+
+            var text = md.ToString().Trim();
+            if (text.Length > 0)
+            {
+                _readmes.Set(slug, text);
+                Trace($"[readme] {slug} refreshed ({text.Length} chars)");
+            }
+        }
+        catch (Exception ex) { Trace($"[readme] {slug} failed: {ex.Message}"); }
+    }
+
+    private static string Head(string s, int max) =>
+        string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max].TrimEnd() + "…");
 
     // If the model's reasoning/reply names one of its tools by name but it called nothing, return that tool
     // name (so we can nudge it to actually call it). Matches the literal tool identifiers (e.g. set_memory,

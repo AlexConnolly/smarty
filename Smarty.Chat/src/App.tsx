@@ -453,6 +453,18 @@ function ProjectOverview({
           ) : (
             <>
               <section>
+                {project.readme ? (
+                  <div className="rounded-2xl border border-white/5 bg-white/[0.03] px-5 py-4">
+                    <Markdown text={project.readme} />
+                  </div>
+                ) : (
+                  <div className="rounded-2xl border border-dashed border-white/10 px-5 py-4 text-sm text-slate-500">
+                    A summary will appear here once there's something to catch up on.
+                  </div>
+                )}
+              </section>
+
+              <section>
                 <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
                   What I know ({project.memories.length})
                 </h2>

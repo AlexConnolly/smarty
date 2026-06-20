@@ -33,11 +33,12 @@ public sealed class ProjectStore
         Load();
     }
 
-    /// <summary>Create a project (deliberate, confirmed act). Returns a confirmation incl. the slug.</summary>
-    public string Create(string title, string description)
+    /// <summary>Create a project (deliberate, confirmed act). Returns a confirmation message and, when a
+    /// project was actually created, its slug (null if it was a no-op — empty title or a near-duplicate).</summary>
+    public (string Message, string? Slug) Create(string title, string description)
     {
         title = title.Trim();
-        if (title.Length == 0) return "A project needs a title.";
+        if (title.Length == 0) return ("A project needs a title.", null);
 
         lock (_lock)
         {
@@ -46,8 +47,8 @@ public sealed class ProjectStore
             var dup = _projects.FirstOrDefault(p =>
                 p.Status == "active" && Words(p.Title).Intersect(words).Count() >= 2);
             if (dup is not null)
-                return $"There's already a similar project: \"{dup.Title}\" (slug: {dup.Slug}). Use that one " +
-                       "instead of creating a duplicate.";
+                return ($"There's already a similar project: \"{dup.Title}\" (slug: {dup.Slug}). Use that one " +
+                        "instead of creating a duplicate.", null);
 
             var slug = Slugify(title);
             string baseSlug = slug;
@@ -62,7 +63,7 @@ public sealed class ProjectStore
                 Created = DateTimeOffset.UtcNow,
             });
             Save();
-            return $"Project created: \"{title}\" (slug: {slug}). Tag work to it with that slug.";
+            return ($"Project created: \"{title}\" (slug: {slug}). Tag work to it with that slug.", slug);
         }
     }
 
@@ -149,7 +150,7 @@ public static class ProjectTools
             ToolParameter.String("title", "Short title, e.g. \"Holiday with my sister\".", required: true),
             ToolParameter.String("description", "One line on what it's about.", required: false),
         },
-        (args, _) => Task.FromResult(ToolOutput.Ok(store.Create(args.GetString("title"), args.GetStringOrNull("description") ?? ""))));
+        (args, _) => Task.FromResult(ToolOutput.Ok(store.Create(args.GetString("title"), args.GetStringOrNull("description") ?? "").Message)));
 
     public static AgentTool ListTool(ProjectStore store) => new(
         "list_projects",
