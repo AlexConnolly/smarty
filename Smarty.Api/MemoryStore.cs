@@ -187,6 +187,55 @@ public sealed class MemoryStore
             .ToList();
     }
 
+    /// <summary>How well a statement matches a project — its strongest hit across the project's title,
+    /// description and accumulated facts (a single strong fact, e.g. destination=Lisbon, is enough).</summary>
+    public readonly record struct ProjectMatch(string Slug, string Title, double Score, string Matched);
+
+    /// <summary>Rank projects by how well a free-text statement resolves to each — searching not just their
+    /// titles/descriptions but the facts recorded inside them. This is how "the flights next week" finds the
+    /// Lisbon holiday even though neither word is in its title. Embeddings-backed; empty without an embedder.</summary>
+    public async Task<IReadOnlyList<ProjectMatch>> RankProjects(
+        string statement, IReadOnlyList<(string Slug, string Title, string Description)> projects, CancellationToken ct = default)
+    {
+        var results = new List<ProjectMatch>();
+        if (_embed is null || projects.Count == 0 || string.IsNullOrWhiteSpace(statement)) return results;
+
+        var qv = await _embed("search_query: " + statement, ct).ConfigureAwait(false);
+        if (qv is null) return results;
+
+        bool changed = false;
+        foreach (var (slug, title, description) in projects)
+        {
+            double best = 0; string matched = "";
+
+            var head = (title + " " + description).Trim();
+            var hv = await _embed("search_document: " + head, ct).ConfigureAwait(false);
+            if (hv is not null) { var s = Cosine(qv, hv); if (s > best) { best = s; matched = title; } }
+
+            List<MemoryFact> facts;
+            lock (_lock) facts = _facts.Where(f => f.Status == "active" && f.Project == slug).ToList();
+            foreach (var f in facts)
+            {
+                if (f.Embedding is null)
+                {
+                    f.Embedding = await _embed("search_document: " + FactText(f), ct).ConfigureAwait(false);
+                    changed |= f.Embedding is not null;
+                }
+                if (f.Embedding is null) continue;
+                var s = Cosine(qv, f.Embedding);
+                if (s > best) { best = s; matched = $"{f.Key}: {f.Value}"; }
+            }
+
+            results.Add(new ProjectMatch(slug, title, best, matched));
+        }
+        if (changed) lock (_lock) Save();
+
+        if (Environment.GetEnvironmentVariable("SMARTY_TRACE") == "1")
+            Console.Error.WriteLine("[proj] resolve: " + string.Join(", ", results.OrderByDescending(r => r.Score).Select(r => $"{r.Slug}={r.Score:F2}")));
+
+        return results.OrderByDescending(r => r.Score).ToList();
+    }
+
     private const double RelevanceThreshold = 0.5; // cosine; tune against real queries
 
     private static double Cosine(float[] a, float[] b)

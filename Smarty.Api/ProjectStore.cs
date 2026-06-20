@@ -74,6 +74,14 @@ public sealed class ProjectStore
 
     public bool Exists(string slug) => Get(slug) is not null;
 
+    /// <summary>The active projects (slug/title/description), for resolving a statement against them.</summary>
+    public IReadOnlyList<(string Slug, string Title, string Description)> ActiveProjects()
+    {
+        lock (_lock)
+            return _projects.Where(p => p.Status == "active")
+                .Select(p => (p.Slug, p.Title, p.Description)).ToList();
+    }
+
     public string List()
     {
         lock (_lock)

@@ -90,10 +90,13 @@ public sealed class Orchestrator
         "their request actually needs personal context (where they live, preferences, people). Don't fish.\n" +
         "- set_memory(type, key, value, context): remember a durable fact they share; a new value for an " +
         "existing key updates it. Not passing one-off details.\n" +
+        "- find_project(statement): when a message refers to ongoing work without naming it (\"the flights\", " +
+        "\"book the table\"), resolve WHICH project it's about before acting. If it finds none, ask the user; " +
+        "never assume.\n" +
         "- create_project(title, description) / list_projects(): for genuinely long-running endeavours (a " +
-        "holiday being planned, a house move). Propose a project and confirm before creating; don't make " +
-        "one for a one-off. To work on a project, delegate the task with its project slug — that gives the " +
-        "worker the project's context. Most tasks need no project.\n" +
+        "holiday being planned, a house move). Before creating, resolve with find_project; only create once " +
+        "the user confirms — never auto-create or duplicate. To work on a project, delegate with its slug " +
+        "(that gives the worker the project's context). Most tasks need no project.\n" +
         "\n" +
         "Just answer (no tools) for chat, jokes, opinions, or things you already know. If a message has both " +
         "an easy part and a work part, answer the easy part AND delegate the work part in the same reply. " +
@@ -218,10 +221,10 @@ public sealed class Orchestrator
             bool needAnotherTurn = false;
             foreach (var call in calls)
             {
-                string result = HandleToolCall(session, call, out bool dataReturning, out bool wasDelegate);
-                delegatedSomething |= wasDelegate;
-                needAnotherTurn |= dataReturning;
-                convo.Add(Message.ToolResult(call.Id, call.Name, result));
+                var r = await HandleToolCall(session, call, ct).ConfigureAwait(false);
+                delegatedSomething |= r.WasDelegate;
+                needAnotherTurn |= r.DataReturning;
+                convo.Add(Message.ToolResult(call.Id, call.Name, r.Text));
             }
 
             if (!needAnotherTurn)
@@ -243,115 +246,141 @@ public sealed class Orchestrator
         return spoken.ToString();
     }
 
-    /// <summary>Execute one orchestrator tool call against the session's task registry. Returns the text
-    /// result; <paramref name="dataReturning"/> is true when the model should voice that result.</summary>
-    private string HandleToolCall(Session session, ToolCall call, out bool dataReturning, out bool wasDelegate)
-    {
-        dataReturning = false;
-        wasDelegate = false;
+    /// <summary>The outcome of one orchestrator tool call: the text result, whether the model should voice
+    /// it next iteration, and whether it kicked off a background task.</summary>
+    private readonly record struct ToolResultInfo(string Text, bool DataReturning, bool WasDelegate);
 
+    private static ToolResultInfo Data(string text) => new(text, DataReturning: true, WasDelegate: false);
+
+    /// <summary>Execute one orchestrator tool call against the session's task registry / stores.</summary>
+    private async Task<ToolResultInfo> HandleToolCall(Session session, ToolCall call, CancellationToken ct)
+    {
         switch (call.Name.ToLowerInvariant())
         {
             case "delegate":
             {
                 var desc = call.Arguments.GetStringOrNull("task");
                 if (string.IsNullOrWhiteSpace(desc))
-                {
-                    dataReturning = true;
-                    return "No task description was provided — ask the user what they'd like done.";
-                }
+                    return Data("No task description was provided — ask the user what they'd like done.");
                 // delegate validates a project; it never creates one.
                 var project = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
                 if (!string.IsNullOrEmpty(project) && !_projects.Exists(project))
-                {
-                    dataReturning = true;
-                    return $"There's no project \"{project}\". Use list_tasks/list_projects to find the right one, " +
-                           "or create_project if this is genuinely a new ongoing thing (confirm with the user first).";
-                }
-                wasDelegate = true;
+                    return Data($"There's no project \"{project}\". Use find_project to resolve which one this is, " +
+                                "or create_project if it's genuinely new (confirm with the user first).");
                 var task = StartTask(session, desc!.Trim(), string.IsNullOrEmpty(project) ? null : project);
-                return $"Task #{task.Id} started in the background{(task.Project is null ? "" : $" (project: {task.Project})")}; its result will come back to you to relay.";
+                return new ToolResultInfo(
+                    $"Task #{task.Id} started in the background{(task.Project is null ? "" : $" (project: {task.Project})")}; its result will come back to you to relay.",
+                    DataReturning: false, WasDelegate: true);
             }
+
+            case "find_project":
+                return Data(await ResolveProjectAsync(call.Arguments.GetStringOrNull("statement") ?? "", ct).ConfigureAwait(false));
 
             case "create_project":
-            {
-                dataReturning = true;
-                return _projects.Create(
+                return Data(_projects.Create(
                     call.Arguments.GetStringOrNull("title") ?? "",
-                    call.Arguments.GetStringOrNull("description") ?? "");
-            }
+                    call.Arguments.GetStringOrNull("description") ?? ""));
 
             case "list_projects":
-            {
-                dataReturning = true;
-                return _projects.List();
-            }
+                return Data(_projects.List());
 
             case "list_tasks":
             {
-                dataReturning = true;
                 var all = OrderedTasks(session);
-                if (all.Count == 0) return "No tasks have been started yet.";
-                return string.Join("\n", all.Select(t => $"#{t.Id} [{t.Status}] {t.Description}"));
+                if (all.Count == 0) return Data("No tasks have been started yet.");
+                return Data(string.Join("\n", all.Select(t => $"#{t.Id} [{t.Status}] {t.Description}")));
             }
 
             case "task_status":
             {
-                dataReturning = true;
-                if (!TryResolve(session, call, out var t, out var miss)) return miss;
+                if (!TryResolve(session, call, out var t, out var miss)) return Data(miss);
                 var age = (DateTimeOffset.UtcNow - t.StartedAt).TotalSeconds;
                 var progress = string.IsNullOrWhiteSpace(t.LatestThought) ? "(no detail yet)" : t.LatestThought;
                 var line = $"#{t.Id} [{t.Status}] {t.Description}\nRunning {age:F0}s. Latest: {progress}";
                 if (t.Status == "done" && !string.IsNullOrWhiteSpace(t.Result))
                     line += $"\nResult: {t.Result}";
-                return line;
+                return Data(line);
             }
 
             case "cancel_task":
             {
-                dataReturning = true;
-                if (!TryResolve(session, call, out var t, out var miss)) return miss;
-                if (!t.IsRunning) return $"Task #{t.Id} is already {t.Status}.";
+                if (!TryResolve(session, call, out var t, out var miss)) return Data(miss);
+                if (!t.IsRunning) return Data($"Task #{t.Id} is already {t.Status}.");
                 t.Status = "cancelled";
                 t.Cts.Cancel();
-                return $"Task #{t.Id} ({t.Description}) has been cancelled.";
+                return Data($"Task #{t.Id} ({t.Description}) has been cancelled.");
             }
 
             case "message_task":
             {
-                dataReturning = true;
-                if (!TryResolve(session, call, out var t, out var miss)) return miss;
-                if (!t.IsRunning) return $"Task #{t.Id} is already {t.Status}; it can't take a message.";
+                if (!TryResolve(session, call, out var t, out var miss)) return Data(miss);
+                if (!t.IsRunning) return Data($"Task #{t.Id} is already {t.Status}; it can't take a message.");
                 var msg = call.Arguments.GetStringOrNull("message");
-                if (string.IsNullOrWhiteSpace(msg)) return "No message text was provided.";
+                if (string.IsNullOrWhiteSpace(msg)) return Data("No message text was provided.");
                 t.Inbox.Enqueue(msg!.Trim());
-                return $"Message passed along to task #{t.Id}; it'll pick it up shortly.";
+                return Data($"Message passed along to task #{t.Id}; it'll pick it up shortly.");
             }
 
             case "search_memory":
             {
-                dataReturning = true;
                 var q = call.Arguments.GetStringOrNull("query") ?? "";
                 var r = _memory.Search(q);
                 Trace($"[mem] search({q}) -> {Snip(r, 160)}");
-                return r;
+                return Data(r);
             }
 
             case "set_memory":
-            {
-                dataReturning = true;
-                return _memory.Set(
+                return Data(_memory.Set(
                     call.Arguments.GetStringOrNull("type") ?? "",
                     call.Arguments.GetStringOrNull("key") ?? "",
                     call.Arguments.GetStringOrNull("value") ?? "",
-                    call.Arguments.GetStringOrNull("context"));
-            }
+                    call.Arguments.GetStringOrNull("context")));
 
             default:
-                dataReturning = true;
-                return $"Unknown tool '{call.Name}'.";
+                return Data($"Unknown tool '{call.Name}'.");
         }
     }
+
+    // Resolve a free-text statement ("what time are the flights next week") to the project it belongs to,
+    // by searching the projects' titles, descriptions and the facts recorded inside them. The hard rule:
+    // if it doesn't resolve confidently, we say so and tell the model to ASK — never to invent a project.
+    private async Task<string> ResolveProjectAsync(string statement, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(statement))
+            return "Give me the user's statement and I'll work out which project it's about.";
+
+        var active = _projects.ActiveProjects();
+        if (active.Count == 0)
+            return "There are no projects yet. If this is the start of a genuinely ongoing thing, ASK the user " +
+                   "before creating a project — don't assume.";
+
+        var ranked = await _memory.RankProjects(statement, active, ct).ConfigureAwait(false);
+        var top = ranked.Count > 0 ? ranked[0] : default;
+
+        // A clear winner: strong score and no near-rival.
+        if (ranked.Count > 0 && top.Score >= ResolveStrong &&
+            (ranked.Count < 2 || ranked[1].Score < ResolveStrong))
+            return $"That's the project \"{top.Title}\" (slug: {top.Slug}) — matched on \"{top.Matched}\". " +
+                   "Use that slug.";
+
+        // Nothing close enough — don't guess, don't create.
+        if (ranked.Count == 0 || top.Score < ResolveWeak)
+            return "No existing project matches that. Do NOT create one yourself — ask the user whether this " +
+                   "belongs to something they're already planning, or whether to start a new project for it.";
+
+        // In the ambiguous band (or two strong rivals): surface candidates and let the user decide.
+        var cands = ranked.Where(r => r.Score >= ResolveWeak).Take(3);
+        return "Couldn't pin that to one project. It might be:\n" +
+               string.Join("\n", cands.Select(c => $"- {c.Slug}: {c.Title} (matched \"{c.Matched}\")")) +
+               "\nAsk the user which one it is — or whether it's something new.";
+    }
+
+    // Calibrated against nomic-embed-text, whose cosines have a compressed range: unrelated statements
+    // still sit ~0.42–0.51 (topical adjacency), while a genuine reference scores ~0.61+. So the bar for
+    // "confident" is 0.55 (true matches clear it, noise doesn't); anything below the weak floor is treated
+    // as no-match → ask the user. Biasing uncertainty toward "ask" is deliberate: never assume or invent.
+    private const double ResolveStrong = 0.55; // a confident statement→project match
+    private const double ResolveWeak = 0.52;    // below this, treat as "no match" (ask, don't guess)
 
     /// <summary>Register a delegated task, announce it, and spawn its worker + status monitor.</summary>
     private TaskInfo StartTask(Session session, string description, string? project = null)
@@ -612,6 +641,13 @@ public sealed class Orchestrator
                 ToolParameter.String("task", "A clear, self-contained description of the work to do.", required: true),
                 ToolParameter.String("project", "Optional project slug to run the task within.", required: false),
             },
+            NoOp),
+        new("find_project",
+            "Work out which existing project a statement refers to when it isn't named (\"the flights next " +
+            "week\", \"book the table\"). Searches the projects' titles AND the facts recorded inside them, so " +
+            "a passing detail resolves to the right one. If nothing matches, it tells you to ask the user — it " +
+            "never invents a project. Pass the user's words.",
+            new[] { ToolParameter.String("statement", "The user's statement to resolve to a project.", required: true) },
             NoOp),
         new("list_tasks",
             "List the background tasks that have been started and their current status.",

@@ -153,3 +153,41 @@ you).
   relevance struggles.
 - One chat entry point → routes each message to a project (or none) → injects that context → workers
   inherit it.
+
+---
+
+## 10. Routing as reference resolution (Phase 3, built)
+
+The naive view of routing is *classification* — "which bucket does this message belong to?" That fails
+fast, because a project's **title and its contents drift apart almost immediately**. You start
+`holiday-with-my-sister-emma`, then everything you say is "the flights", "the Lisbon trip", "Emma's
+dates" — none of which are in the title. Title-matching is dead on arrival.
+
+So routing is **reference resolution**, not classification. "The flights next week" is a pronoun-like
+reference; the job is to resolve *what it points at* by searching the project's accumulated **facts**,
+not just its name. The project's memory **is** its searchable surface area.
+
+**`find_project(statement)`** (orchestrator tool, `MemoryStore.RankProjects`):
+- Embeds the statement once; for each active project, scores the **max cosine** across its
+  title+description **and every fact recorded inside it**. One strong fact hit (`destination: Lisbon`)
+  is enough to surface the project — that's the whole point.
+- Returns the resolved slug **only on a confident match**; otherwise it tells the model to **ask the
+  user**. It never invents a project. Creation stays an explicit, confirmed act.
+
+**Calibration** (against `nomic-embed-text`): its cosines have a compressed range — unrelated statements
+still sit ~0.42–0.51 on topical adjacency, while a genuine reference scores ~0.61+. Measured:
+
+| statement | vs title | vs fact (Lisbon) |
+|---|---|---|
+| "what time are the flights next week" | 0.527 | **0.611** |
+| "book the table for the Lisbon trip" | 0.470 | **0.679** |
+| "renew my car insurance" | 0.448 | 0.382 |
+| "capital of France" | 0.426 | 0.510 |
+
+→ `strong = 0.55` (true matches clear it; noise doesn't), `weak floor = 0.52` (below = no match → ask).
+Uncertainty biases to **ask**, never assume. The fact, not the title, is what makes "the flights"
+resolve — confirming the drift problem this solves.
+
+**Still open:** `find_project` resolves *which* project, and `delegate(project)` routes the *worker*.
+But chat-level `set_memory` still writes globally — so telling the orchestrator a project detail in
+plain chat doesn't yet tag it to the resolved project. That write-routing is the remaining seam.
