@@ -102,6 +102,9 @@ public sealed class Orchestrator
         "- find_project(statement): when a message refers to ongoing work without naming it (\"the flights\", " +
         "\"book the table\"), resolve WHICH project it's about before acting. If it finds none, ask the user; " +
         "never assume.\n" +
+        "- project_summary(project): when the user asks how a project is GOING / where it stands / what's left, " +
+        "pull its summary and relay that — don't answer from memory. Resolve with find_project first if unsure " +
+        "which project they mean.\n" +
         "- create_project(title, description) / list_projects(): a project is for anything with several " +
         "moving parts you'll come back to — planning or organising an EVENT or party, a trip or holiday, a " +
         "house move, any multi-step undertaking. The moment a request is more than a single question or a " +
@@ -329,6 +332,44 @@ public sealed class Orchestrator
                 var (text, slug) = await ResolveProjectAsync(call.Arguments.GetStringOrNull("statement") ?? "", ct).ConfigureAwait(false);
                 if (slug is not null) session.CurrentProject = slug; // focus the conversation on the resolved project
                 return Data(text);
+            }
+
+            case "project_summary":
+            {
+                var slug = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
+                if (string.IsNullOrEmpty(slug)) slug = session.CurrentProject;
+                if (string.IsNullOrEmpty(slug))
+                    return Data("Which project? Resolve it with find_project first (or have the user name it), then ask again.");
+                var p = _projects.Get(slug);
+                if (p is null)
+                    return Data($"There's no project \"{slug}\". Use find_project to work out which one, or list_projects.");
+
+                session.CurrentProject = slug; // stay focused on what we're reporting on
+                var facts = _memory.Active(slug);
+                var sb = new StringBuilder($"Project \"{p.Title}\"");
+                if (!string.IsNullOrWhiteSpace(p.Description)) sb.Append($" — {p.Description}");
+                sb.Append(".\n\n");
+
+                // Live facts FIRST — these are always current. The narrative summary is regenerated in the
+                // background so it can lag a few seconds behind a just-made change; the facts can't, so they're
+                // the source of truth to report from.
+                if (facts.Count > 0)
+                {
+                    sb.Append("On record now (current):\n");
+                    foreach (var f in facts.OrderBy(f => f.Type, StringComparer.Ordinal))
+                        sb.Append($"- {f.Key}: {f.Value}{(string.IsNullOrWhiteSpace(f.Context) ? "" : $" ({f.Context})")}\n");
+                    sb.Append('\n');
+                }
+
+                var readme = _readmes.Get(slug);
+                if (!string.IsNullOrWhiteSpace(readme))
+                    sb.Append("Summary:\n").Append(readme!.Trim());
+                else if (facts.Count == 0)
+                    sb.Append("Nothing recorded yet — it's only just been set up.");
+
+                var runs = _runs.CountFor(slug);
+                if (runs > 0) sb.Append($"\n\n({runs} background {(runs == 1 ? "task has" : "tasks have")} run for it.)");
+                return Data(sb.ToString().TrimEnd());
             }
 
             case "create_project":
@@ -914,6 +955,12 @@ public sealed class Orchestrator
             "a passing detail resolves to the right one. If nothing matches, it tells you to ask the user — it " +
             "never invents a project. Pass the user's words.",
             new[] { ToolParameter.String("statement", "The user's statement to resolve to a project.", required: true) },
+            NoOp),
+        new("project_summary",
+            "Get a project's up-to-date summary — what's been decided/booked and what work has run — so you " +
+            "can tell the user how it's going, what's left, or where things stand. Pass the project slug (or " +
+            "leave blank if one's already in focus). If unsure which project, resolve it with find_project first.",
+            new[] { ToolParameter.String("project", "Project slug (optional if one is already in focus).", required: false) },
             NoOp),
         new("list_tasks",
             "List the background tasks that have been started and their current status.",

@@ -30,6 +30,8 @@ interface UiMessage {
   reasoning: string
   streaming: boolean
   audio?: AudioNote
+  thinkStart?: number // when reasoning first arrived
+  thinkMs?: number // how long it spent thinking (frozen once the answer starts)
 }
 
 const SESSION_KEY = 'smarty-session-id'
@@ -99,11 +101,22 @@ export default function App() {
         if (audio) pendingAudio.current = null
         upsert(id, (m) => ({ ...m, role: role as 'user' | 'assistant', streaming: true, audio: audio ?? m.audio }), role as 'user' | 'assistant')
       },
-      onContent: (id, text) => upsert(id, (m) => ({ ...m, content: m.content + text })),
-      onReasoning: (id, text) => upsert(id, (m) => ({ ...m, reasoning: m.reasoning + text })),
+      // First content token = thinking just ended; freeze the elapsed thinking time.
+      onContent: (id, text) =>
+        upsert(id, (m) => ({
+          ...m,
+          content: m.content + text,
+          thinkMs: m.thinkMs ?? (m.thinkStart ? Date.now() - m.thinkStart : undefined),
+        })),
+      onReasoning: (id, text) => upsert(id, (m) => ({ ...m, reasoning: m.reasoning + text, thinkStart: m.thinkStart ?? Date.now() })),
       // Snap to the server's authoritative full text — heals any delta dropped during live streaming.
       onMsgEnd: (id, text) =>
-        upsert(id, (m) => ({ ...m, streaming: false, content: text && text.length > 0 ? text : m.content })),
+        upsert(id, (m) => ({
+          ...m,
+          streaming: false,
+          content: text && text.length > 0 ? text : m.content,
+          thinkMs: m.thinkMs ?? (m.thinkStart ? Date.now() - m.thinkStart : undefined),
+        })),
       onWorking: (id, task) => setWorking((w) => (w.some((x) => x.id === id) ? w : [...w, { id, task, startedAt: Date.now() }])),
       onWorkingDone: (id) => setWorking((w) => w.filter((x) => x.id !== id)),
     }
@@ -668,13 +681,15 @@ function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: str
             // While the answer hasn't started and the turn is still streaming, the model is still thinking
             // — keep the block labelled "Thinking…" (with a spinner) until that reasoning block closes.
             const thinking = message.streaming && message.content.length === 0
+            const secs = message.thinkMs ? Math.max(1, Math.round(message.thinkMs / 1000)) : 0
+            const label = thinking ? 'Thinking…' : secs ? `Thought for ${secs}s` : 'thought'
             return (
-              <details className="py-0.5 text-xs text-slate-500 marker:text-slate-600">
-                <summary className="inline-flex cursor-pointer select-none items-center gap-1.5 text-slate-400">
+              <details className="py-0.5 text-xs text-slate-500 marker:text-slate-500">
+                <summary className="cursor-pointer select-none text-slate-400">
                   {thinking && (
-                    <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-slate-600 border-t-slate-300" />
+                    <span className="mr-1.5 inline-block h-3 w-3 animate-spin rounded-full border-2 border-slate-600 border-t-slate-300 align-middle" />
                   )}
-                  {thinking ? 'Thinking…' : 'thought'}
+                  {label}
                 </summary>
                 <pre className="mt-2 whitespace-pre-wrap font-sans leading-relaxed text-slate-500">{message.reasoning}</pre>
               </details>
