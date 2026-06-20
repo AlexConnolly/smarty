@@ -16,14 +16,30 @@ namespace Smarty.Agents;
 /// </summary>
 public static class WebResearch
 {
-    private static readonly HttpClient Http = new()
+    // Present as a real browser. A bare "Mozilla/5.0" plus a custom product token gets 403'd by sites behind
+    // Cloudflare/WAFs that block non-browser clients — so we send a full Chrome User-Agent and the headers a
+    // browser actually sends, and transparently decompress gzip/brotli responses.
+    private static readonly HttpClient Http = CreateBrowserClient();
+
+    private static HttpClient CreateBrowserClient()
     {
-        Timeout = TimeSpan.FromSeconds(20),
-        DefaultRequestHeaders =
+        var handler = new HttpClientHandler
         {
-            UserAgent = { new("Mozilla", "5.0"), new("SmartyWebResearch", "1.0") },
-        },
-    };
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+        };
+        var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
+        var h = http.DefaultRequestHeaders;
+        h.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+        h.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
+        h.AcceptLanguage.ParseAdd("en-GB,en;q=0.9");
+        h.Add("Sec-Fetch-Dest", "document");
+        h.Add("Sec-Fetch-Mode", "navigate");
+        h.Add("Sec-Fetch-Site", "none");
+        h.Add("Sec-Fetch-User", "?1");
+        h.Add("Upgrade-Insecure-Requests", "1");
+        return http;
+    }
 
     private static readonly Regex TagRegex = new("<[^>]+>", RegexOptions.Compiled | RegexOptions.Singleline);
     private static readonly Regex WordRegex = new(@"[\p{L}\p{N}][\p{L}\p{N}'-]*", RegexOptions.Compiled);
@@ -220,10 +236,21 @@ public static class WebResearch
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-            request.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5");
             using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
-                return ToolOutput.Error($"Could not fetch {uri}: HTTP {(int)response.StatusCode} {response.ReasonPhrase}.");
+            {
+                int status = (int)response.StatusCode;
+                // A bot wall (Cloudflare/WAF JS challenge, rate-limit) we can't pass without a real browser.
+                // Don't fail the task on it — tell the model to read a DIFFERENT search result instead.
+                bool blocked = status is 401 or 403 or 429 or 503
+                    || (response.Headers.Server?.ToString() ?? "").Contains("cloudflare", StringComparison.OrdinalIgnoreCase)
+                    || response.Headers.Contains("cf-mitigated");
+                if (blocked)
+                    return ToolOutput.Error(
+                        $"{uri} blocks automated access (HTTP {status} — a bot/Cloudflare challenge that needs a " +
+                        "real browser). Don't retry this URL; pick a DIFFERENT result from web_search and read that.");
+                return ToolOutput.Error($"Could not fetch {uri}: HTTP {status} {response.ReasonPhrase}.");
+            }
             string mediaType = response.Content.Headers.ContentType?.MediaType ?? "";
             if (mediaType.Length > 0 && !mediaType.Contains("html", StringComparison.OrdinalIgnoreCase) &&
                 !mediaType.Contains("text", StringComparison.OrdinalIgnoreCase) &&
@@ -240,6 +267,11 @@ public static class WebResearch
         string text = WebSearcherTool.ToPlainText(html);
         if (text.Length == 0)
             return ToolOutput.Error($"Fetched {uri}, but no readable text could be extracted.");
+        // Some walls answer 200 with a challenge/"verify you're human" interstitial instead of the page.
+        if (text.Length < 2000 && BlockRegex.IsMatch(text))
+            return ToolOutput.Error(
+                $"{uri} served a bot-check page instead of content (needs a real browser). Don't retry it; " +
+                "pick a DIFFERENT result from web_search and read that.");
 
         var chunks = Chunk(text, size: 1200, overlap: 200);
         var top = RankByQuestion(chunks, question, take: 4);
