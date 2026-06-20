@@ -127,6 +127,15 @@ public sealed class Orchestrator
     {
         var convo = new List<Message>(baseMessages);
 
+        // Keep the big system prompt STATIC so its KV cache is reused every turn (lower time-to-first-token).
+        // The per-turn dynamic context — date, running tasks, and the user's profile — goes in a late block
+        // just before the latest message: the model still sees it, but the cacheable prefix stays intact.
+        // Surfacing the profile here also means personal facts (allergies, where they live) are ALWAYS in
+        // front of the model, so it doesn't have to decide to search for them.
+        var dynamicContext = (DateContext() + ProfileNote() + RunningTasksNote(session)).TrimStart();
+        if (dynamicContext.Length > 0)
+            convo.Insert(Math.Max(0, convo.Count - 1), Message.System(dynamicContext));
+
         int msgId = session.NextMessageId();
         session.Append("msg_start", Json(new { id = msgId, role = "assistant" }));
 
@@ -138,7 +147,7 @@ public sealed class Orchestrator
             var request = new ModelRequest
             {
                 Model = _model,
-                SystemPrompt = OrchestratorSystem + DateContext() + RunningTasksNote(session),
+                SystemPrompt = OrchestratorSystem, // static → KV cache reused every turn; dynamic context is in `convo`
                 Messages = convo,
                 Tools = tools,
                 RepeatPenalty = 1.0,
@@ -289,7 +298,10 @@ public sealed class Orchestrator
             case "search_memory":
             {
                 dataReturning = true;
-                return _memory.Search(call.Arguments.GetStringOrNull("query") ?? "");
+                var q = call.Arguments.GetStringOrNull("query") ?? "";
+                var r = _memory.Search(q);
+                Trace($"[mem] search({q}) -> {Snip(r, 160)}");
+                return r;
             }
 
             case "set_memory":
@@ -463,6 +475,22 @@ public sealed class Orchestrator
             $"\n\nToday is {now:dddd, d MMMM yyyy}. {now.Year} is the real present, not the future — never call a " +
             "present or past date impossible, fictional, or not-yet-happened. You can't know current/live facts " +
             "(news, scores, prices, weather, what's happening now) from memory; delegate to fetch anything live.";
+    }
+
+    // The user's known facts, surfaced every turn so personal context (allergies, where they live,
+    // preferences) is ALWAYS in front of the model — no decision to search required.
+    private string ProfileNote()
+    {
+        var facts = _memory.Active();
+        if (facts.Count == 0) return "";
+        var sb = new StringBuilder("\n\nWhat you know about the user (apply it; never give advice that contradicts it):\n");
+        foreach (var f in facts.OrderBy(f => f.Type, StringComparer.Ordinal))
+        {
+            sb.Append($"- {f.Key}: {f.Value}");
+            if (!string.IsNullOrWhiteSpace(f.Context)) sb.Append($" ({f.Context})");
+            sb.Append('\n');
+        }
+        return sb.ToString();
     }
 
     // A live snapshot of in-flight tasks, appended to the system prompt so the orchestrator always knows
