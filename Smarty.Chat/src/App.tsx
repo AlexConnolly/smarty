@@ -58,7 +58,7 @@ function getSessionId(): string {
 
 export default function App() {
   const [messages, setMessages] = useState<UiMessage[]>([])
-  const [working, setWorking] = useState<{ id: string; task: string }[]>([])
+  const [working, setWorking] = useState<{ id: string; task: string; startedAt: number }[]>([])
   const [tasksOpen, setTasksOpen] = useState(false)
   const [input, setInput] = useState('')
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -104,7 +104,7 @@ export default function App() {
       // Snap to the server's authoritative full text — heals any delta dropped during live streaming.
       onMsgEnd: (id, text) =>
         upsert(id, (m) => ({ ...m, streaming: false, content: text && text.length > 0 ? text : m.content })),
-      onWorking: (id, task) => setWorking((w) => (w.some((x) => x.id === id) ? w : [...w, { id, task }])),
+      onWorking: (id, task) => setWorking((w) => (w.some((x) => x.id === id) ? w : [...w, { id, task, startedAt: Date.now() }])),
       onWorkingDone: (id) => setWorking((w) => w.filter((x) => x.id !== id)),
     }
     openSessionStream(sessionId.current, handlers, controller.signal)
@@ -265,13 +265,7 @@ export default function App() {
         </button>
         <h1 className="text-sm font-semibold tracking-tight">Smarty</h1>
         <span className="hidden text-xs text-slate-500 sm:inline">personal assistant</span>
-        <TaskPill
-          tasks={working}
-          open={tasksOpen}
-          onToggle={() => setTasksOpen((open) => !open)}
-          onClose={() => setTasksOpen(false)}
-          onCancel={cancelRunningTask}
-        />
+        <TaskPill count={working.length} onOpen={() => setTasksOpen(true)} />
         <button
           onClick={newChat}
           className="rounded-lg border border-white/10 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-white/5"
@@ -355,6 +349,10 @@ export default function App() {
           loading={projectLoading}
           onClose={() => setActiveProject(null)}
         />
+      )}
+
+      {tasksOpen && (
+        <TaskRunner tasks={working} onClose={() => setTasksOpen(false)} onCancel={cancelRunningTask} />
       )}
     </div>
   )
@@ -750,72 +748,94 @@ function ThumbIcon({ up }: { up?: boolean }) {
   )
 }
 
-function TaskPill({
+// Header trigger: a pill showing how many tasks are running; opens the full-screen runner.
+function TaskPill({ count, onOpen }: { count: number; onOpen: () => void }) {
+  if (count === 0) return <div className="ml-auto" />
+  return (
+    <button
+      onClick={onOpen}
+      className="ml-auto inline-flex items-center gap-2 rounded-full border border-amber-300/20 bg-amber-400/10 px-3 py-1.5 text-xs font-medium text-amber-100 shadow-sm shadow-amber-950/20 hover:bg-amber-400/15"
+      aria-label={`${count} running ${count === 1 ? 'task' : 'tasks'}`}
+    >
+      <Spinner />
+      <span>{count} running</span>
+    </button>
+  )
+}
+
+// Full-screen task runner — what Smarty has working in the background right now, with room to breathe.
+function TaskRunner({
   tasks,
-  open,
-  onToggle,
   onClose,
   onCancel,
 }: {
-  tasks: { id: string; task: string }[]
-  open: boolean
-  onToggle: () => void
+  tasks: { id: string; task: string; startedAt: number }[]
   onClose: () => void
   onCancel: (id: string) => void
 }) {
-  if (tasks.length === 0) return <div className="ml-auto" />
+  // Tick once a second so the elapsed timers stay live.
+  const [, setNow] = useState(Date.now())
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [])
 
   return (
-    <div className="relative ml-auto">
-      <button
-        onClick={onToggle}
-        className="inline-flex items-center gap-2 rounded-full border border-amber-300/20 bg-amber-400/10 px-3 py-1.5 text-xs font-medium text-amber-100 shadow-sm shadow-amber-950/20 hover:bg-amber-400/15"
-        aria-expanded={open}
-        aria-label={`${tasks.length} running ${tasks.length === 1 ? 'task' : 'tasks'}`}
-      >
-        <Spinner />
-        <span>{tasks.length} running</span>
-      </button>
+    <div className="fixed inset-0 z-50 flex flex-col bg-slate-950">
+      <header className="flex items-center gap-3 border-b border-white/5 bg-slate-900/60 px-4 py-2.5 backdrop-blur">
+        <button onClick={onClose} title="Back to chat" className="grid h-8 w-8 place-items-center rounded-lg text-slate-300 hover:bg-white/5">
+          <BackIcon />
+        </button>
+        <div className="min-w-0">
+          <h1 className="text-sm font-semibold tracking-tight text-slate-100">Working on it</h1>
+          <p className="truncate text-xs text-slate-500">
+            {tasks.length} {tasks.length === 1 ? 'task' : 'tasks'} running — keep chatting, results come back in the conversation.
+          </p>
+        </div>
+      </header>
 
-      {open && (
-        <>
-          <button className="fixed inset-0 z-10 cursor-default" aria-label="Close tasks" onClick={onClose} />
-          <div className="absolute right-0 top-10 z-20 w-80 max-w-[calc(100vw-2rem)] overflow-hidden rounded-2xl border border-white/10 bg-slate-950 shadow-2xl shadow-black/40">
-            <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
-              <div>
-                <div className="text-sm font-semibold text-slate-100">Running tasks</div>
-                <div className="text-xs text-slate-500">Cancel anything you no longer need.</div>
-              </div>
-              <button onClick={onClose} className="grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-white/5 hover:text-slate-200">
-                <XIcon />
-              </button>
-            </div>
-            <div className="max-h-80 overflow-y-auto p-2">
-              {tasks.map((task) => (
-                <div key={task.id} className="rounded-xl px-3 py-2.5 hover:bg-white/[0.04]">
-                  <div className="flex gap-3">
-                    <div className="pt-1">
-                      <Spinner />
+      <main className="flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-3xl space-y-3 px-4 py-6">
+          {tasks.length === 0 ? (
+            <div className="pt-20 text-center text-sm text-slate-500">Nothing running right now.</div>
+          ) : (
+            tasks.map((task) => (
+              <div key={task.id} className="rounded-2xl border border-white/5 bg-white/[0.03] p-5">
+                <div className="flex items-start gap-4">
+                  <BigSpinner />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-wide text-amber-300/80">
+                      <span>Task #{task.id}</span>
+                      <span className="text-slate-600">·</span>
+                      <span className="tabular-nums text-slate-500">{elapsed(task.startedAt)}</span>
                     </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">Task #{task.id}</div>
-                      <div className="mt-0.5 line-clamp-3 text-sm leading-snug text-slate-200">{task.task}</div>
-                    </div>
+                    <div className="mt-1.5 text-[15px] leading-relaxed text-slate-100">{task.task}</div>
+                    <button
+                      onClick={() => onCancel(task.id)}
+                      className="mt-4 rounded-lg border border-rose-300/20 px-3 py-1.5 text-xs text-rose-200 hover:bg-rose-400/10"
+                    >
+                      Cancel task
+                    </button>
                   </div>
-                  <button
-                    onClick={() => onCancel(task.id)}
-                    className="mt-2 rounded-lg border border-rose-300/20 px-2.5 py-1.5 text-xs text-rose-200 hover:bg-rose-400/10"
-                  >
-                    Cancel
-                  </button>
                 </div>
-              ))}
-            </div>
-          </div>
-        </>
-      )}
+              </div>
+            ))
+          )}
+        </div>
+      </main>
     </div>
   )
+}
+
+function elapsed(startedAt: number): string {
+  const s = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  return `${m}m ${s % 60}s`
+}
+
+function BigSpinner() {
+  return <span className="mt-0.5 h-6 w-6 shrink-0 animate-spin rounded-full border-2 border-amber-200/25 border-t-amber-200" />
 }
 
 function Spinner() {
