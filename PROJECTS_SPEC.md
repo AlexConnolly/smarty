@@ -49,9 +49,13 @@ No separate context store. "Tell me about the trip" = the facts where `project =
 
 The offloader takes an optional project slug:
 
-- **blank** → a general job, no project context.
+- **blank** → a general job, no project context. *This is the default — most tasks are one-offs.*
 - **slug** → the worker runs *inside* that project: it gets the project's context injected, and anything
   it remembers is tagged to the project (see §5).
+
+**`delegate` validates; it never creates.** An unknown slug is rejected with a pushback — *"no project
+'x' — use `list_projects` to find the right one, or `create_project` if this is genuinely a new ongoing
+thing."* So a project can never be spawned as a side-effect of delegating.
 
 ---
 
@@ -96,13 +100,22 @@ July") become project facts. Over time the project holds a running picture — w
 
 ---
 
-## 7. Lifecycle
+## 7. Lifecycle — and keeping it to a *handful*
 
-- **Create** — explicit (`create_project(title, description)` → returns a slug), or the assistant
-  **proposes and you confirm** when a multi-step endeavour clearly emerges ("want me to make this a
-  project so I can keep track?"). Never created silently.
-- **`list_projects`** — see what's on the go.
-- **Complete / archive** — `status` flips; archived projects stay queryable but drop out of routing.
+Projects must stay few and deliberate. Four guards stack to prevent sprawl:
+
+1. **Default is no project.** Most tasks delegate with a blank project. A project is the exception.
+2. **`delegate` can't create** (§3) — an unknown slug is pushed back, never auto-created.
+3. **Creation is its own deliberate, confirmed step** — `create_project(title, description)` → returns a
+   slug. The assistant **proposes and you confirm** ("this looks like an ongoing thing — want me to track
+   it as a project?") rather than minting one silently. Reserved for genuinely long-running, multi-session
+   endeavours, never one-off tasks.
+4. **Reference by meaning, not invented slugs** — routing (§4) matches a message to *existing* projects,
+   so the model reaches for the real one instead of coining a near-duplicate; the delegate pushback also
+   nudges "check `list_projects` first."
+
+Other verbs: **`list_projects`** (what's on the go) and **complete / archive** (`status` flips; archived
+projects stay queryable but drop out of routing).
 
 ---
 
