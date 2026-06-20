@@ -45,6 +45,8 @@ public sealed class SmartyAgent
         var run = new AgentRun();
         LastRun = run;
 
+        int toolFailures = 0; // cumulative failed tool calls this run — drives the failure budget
+
         for (int iteration = 0; iteration < _input.MaxIterations; iteration++)
         {
             // Pull in any out-of-band messages a caller queued while we were working, so a long task
@@ -143,7 +145,7 @@ public sealed class SmartyAgent
             if (streamedContent)
                 yield return new AgentEvent.ContentCleared();
 
-            bool anyToolError = false;
+            bool anySuccess = false, anyRetryable = false, anyTerminal = false;
             foreach (var call in toolCalls)
             {
                 yield return new AgentEvent.ToolStarted(call.Name, call.Arguments.ToString());
@@ -154,15 +156,35 @@ public sealed class SmartyAgent
                 var toolMessage = Message.ToolResult(call.Id, call.Name, output.Content);
                 conversation.Add(toolMessage);
                 run.Messages.Add(toolMessage);
-                anyToolError |= output.IsError;
+
+                if (output.IsError)
+                {
+                    toolFailures++;
+                    if (output.CanRetry) anyRetryable = true; else anyTerminal = true;
+                }
+                else anySuccess = true;
 
                 yield return new AgentEvent.ToolCompleted(call.Name, output.Content);
             }
 
-            // Kick the model when a tool failed, so it recovers instead of surrendering.
-            if (anyToolError && _input.NudgeOnToolError)
+            // Steer the model on failure — but only when this turn produced NOTHING useful. If anything
+            // succeeded, say nothing: the model already has data and shouldn't be pushed to "keep trying"
+            // (that's what made a news worker chase more sources after it already had the headlines). When
+            // there's no success: out of budget → conclude with what you have; only dead ends → don't repeat
+            // them, go a different way; otherwise (transient) → fix and retry.
+            if (_input.NudgeOnToolError && !anySuccess && (anyTerminal || anyRetryable))
             {
-                var nudge = Message.System(_input.ToolErrorNudge);
+                string nudgeText =
+                    toolFailures >= _input.MaxToolFailures
+                        ? "You've hit several failures and still have no usable result. STOP calling tools now — " +
+                          "answer the user with whatever you DID manage to find, or tell them plainly you couldn't " +
+                          "get it. Do not invent anything."
+                        : anyTerminal && !anyRetryable
+                            ? "That source is a DEAD END (a hard block / not retrievable) — retrying the same call " +
+                              "will never work, so don't call it again. Try a genuinely different source or " +
+                              "approach; if none is likely to work, answer with what you have or say you couldn't."
+                            : _input.ToolErrorNudge;
+                var nudge = Message.System(nudgeText);
                 conversation.Add(nudge);
                 run.Messages.Add(nudge);
             }

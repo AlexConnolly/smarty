@@ -30,12 +30,18 @@ public sealed class AgentInput
     /// instead of giving up and merely describing the failure.</summary>
     public bool NudgeOnToolError { get; set; } = true;
 
-    /// <summary>The nudge appended after a failed tool call when <see cref="NudgeOnToolError"/> is on.</summary>
+    /// <summary>The nudge appended after a TRANSIENT failed tool call (one worth retrying) when
+    /// <see cref="NudgeOnToolError"/> is on. Dead-end failures and exhausted budgets get different,
+    /// stronger steers from the loop instead.</summary>
     public string ToolErrorNudge { get; set; } =
         "That tool call FAILED (see the error in the tool result above). Do not give up, apologise, " +
         "or just explain the problem to the user. Work out what went wrong, then call the tool again " +
-        "with a corrected command/arguments that are valid for this environment. Keep trying different " +
-        "approaches until the tool succeeds and you can actually answer the question.";
+        "with a corrected command/arguments that are valid for this environment.";
+
+    /// <summary>How many failed tool calls a run tolerates before the loop tells the model to stop trying
+    /// new calls and conclude with whatever it has (or admit it couldn't). Guards against thrashing against
+    /// dead ends; resilience below this stays high.</summary>
+    public int MaxToolFailures { get; set; } = 4;
 
     /// <summary>Hard cap on tokens the model may generate per turn (backstop against runaway output).</summary>
     public int MaxOutputTokensPerTurn { get; set; } = 16384;

@@ -246,30 +246,33 @@ public static class WebResearch
                     || (response.Headers.Server?.ToString() ?? "").Contains("cloudflare", StringComparison.OrdinalIgnoreCase)
                     || response.Headers.Contains("cf-mitigated");
                 if (blocked)
-                    return ToolOutput.Error(
+                    // A bot wall — retrying this URL can NEVER work without a real browser. Dead end.
+                    return ToolOutput.DeadEnd(
                         $"{uri} blocks automated access (HTTP {status} — a bot/Cloudflare challenge that needs a " +
                         "real browser). Don't retry this URL; pick a DIFFERENT result from web_search and read that.");
-                return ToolOutput.Error($"Could not fetch {uri}: HTTP {status} {response.ReasonPhrase}.");
+                // Same status will recur on retry of the same URL — treat it as a dead end for this URL.
+                return ToolOutput.DeadEnd($"Could not fetch {uri}: HTTP {status} {response.ReasonPhrase}. Try a different source.");
             }
             string mediaType = response.Content.Headers.ContentType?.MediaType ?? "";
             if (mediaType.Length > 0 && !mediaType.Contains("html", StringComparison.OrdinalIgnoreCase) &&
                 !mediaType.Contains("text", StringComparison.OrdinalIgnoreCase) &&
                 !mediaType.Contains("xml", StringComparison.OrdinalIgnoreCase))
-                return ToolOutput.Error($"Fetched {uri}, but it returned '{mediaType}' rather than readable text/HTML.");
+                return ToolOutput.DeadEnd($"Fetched {uri}, but it returned '{mediaType}' rather than readable text/HTML. Try a different source.");
             html = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
+            // Network/timeout — could be transient, so this one's worth another go.
             return ToolOutput.Error($"Could not fetch {uri}: {ex.Message}");
         }
 
         string text = WebSearcherTool.ToPlainText(html);
         if (text.Length == 0)
-            return ToolOutput.Error($"Fetched {uri}, but no readable text could be extracted.");
+            return ToolOutput.DeadEnd($"Fetched {uri}, but no readable text could be extracted. Try a different source.");
         // Some walls answer 200 with a challenge/"verify you're human" interstitial instead of the page.
         if (text.Length < 2000 && BlockRegex.IsMatch(text))
-            return ToolOutput.Error(
+            return ToolOutput.DeadEnd(
                 $"{uri} served a bot-check page instead of content (needs a real browser). Don't retry it; " +
                 "pick a DIFFERENT result from web_search and read that.");
 
