@@ -87,7 +87,8 @@ public sealed class Orchestrator
         "THIS reply. If your reasoning concludes you should call a tool, EMIT the call; do not just describe " +
         "it and then reply as though it happened (e.g. don't say \"I've noted that\" without calling set_memory).\n" +
         "- delegate(task): start a new background task — anything needing an action or live/real data. Also " +
-        "say one short line that you're on it.\n" +
+        "say a SHORT, plain acknowledgement — \"Sure, I'll check that\" / \"On it\" / \"Leave it with me\". " +
+        "Don't restate the task, list what you'll do, or pad it; the result comes back later.\n" +
         "- message_task(id, msg): user refines or adds to something ALREADY running — steer that task; do " +
         "NOT also delegate (that duplicates the work).\n" +
         "- cancel_task(id): user backs off (\"never mind\", \"stop\", \"forget it\").\n" +
@@ -274,7 +275,7 @@ public sealed class Orchestrator
         // Guarantee the conversational ack even if the model jumped straight to delegating with no words.
         if (delegatedSomething && spoken.Length == 0)
         {
-            const string ack = "Sure — let me look into that for you.";
+            const string ack = "Sure, I'll check that.";
             spoken.Append(ack);
             session.Append("content", Json(new { id = msgId, text = ack }));
         }
