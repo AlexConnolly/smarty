@@ -164,6 +164,8 @@ public sealed class Orchestrator
 
         var spoken = new StringBuilder();
         bool delegatedSomething = false;
+        bool anyToolCalled = false; // any tool called across this whole user-turn (incl. earlier iterations)
+        bool nudgedNoTool = false;  // we re-prompt at most once if the model named a tool but didn't call it
 
         for (int iter = 0; iter < MaxTurnIterations; iter++)
         {
@@ -225,8 +227,28 @@ public sealed class Orchestrator
             convo.Add(Message.Assistant(turnText.ToString(), final.Reasoning, calls.Count > 0 ? calls : null));
 
             if (calls.Count == 0)
+            {
+                // Safety net for "narrated the call instead of making it": if the model named a tool (in its
+                // reasoning or reply) but called nothing all turn, it likely meant to act and forgot. Nudge it
+                // once to actually call it. This is deterministic and tool-agnostic — it checks the real tool
+                // list — and won't fire on plain chat (no tool named) or on a post-tool confirmation (a tool
+                // was already called this turn).
+                var named = anyToolCalled || nudgedNoTool
+                    ? null
+                    : ReferencesUncalledTool(turnText.ToString(), final.Reasoning, tools);
+                if (named is not null)
+                {
+                    nudgedNoTool = true;
+                    convo.Add(Message.System(
+                        $"You referred to the {named} tool but didn't actually call it, so nothing happened. " +
+                        $"A tool call is the only way to do it — if you meant to, call {named} now. If you were " +
+                        "only chatting and no action was needed, just reply normally."));
+                    continue;
+                }
                 break;
+            }
 
+            anyToolCalled = true;
             bool needAnotherTurn = false;
             foreach (var call in calls)
             {
@@ -560,6 +582,22 @@ public sealed class Orchestrator
         {
             session.TurnLock.Release();
         }
+    }
+
+    // If the model's reasoning/reply names one of its tools by name but it called nothing, return that tool
+    // name (so we can nudge it to actually call it). Matches the literal tool identifiers (e.g. set_memory,
+    // find_project) on word boundaries — distinctive enough that plain chat won't trip it.
+    private static string? ReferencesUncalledTool(string content, string? reasoning, IReadOnlyList<AgentTool> tools)
+    {
+        var hay = (content + " " + reasoning).ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(hay)) return null;
+        foreach (var t in tools)
+        {
+            var name = t.Name.ToLowerInvariant();
+            if (System.Text.RegularExpressions.Regex.IsMatch(hay, $@"\b{System.Text.RegularExpressions.Regex.Escape(name)}\b"))
+                return t.Name;
+        }
+        return null;
     }
 
     // Flatten a worker's message transcript into display steps: thinking blocks, tool calls (with their
