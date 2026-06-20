@@ -282,29 +282,15 @@ app.Run();
 string HostContext()
 {
     var now = DateTime.Now;
-    string nowLocal = now.ToString("F", CultureInfo.CurrentCulture);
-    string timeZone = TimeZoneInfo.Local.StandardName;
+    string shell = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "PowerShell" : "/bin/sh";
     return
-        "\n\n=== CURRENT DATE AND TIME (AUTHORITATIVE) ===\n" +
-        $"It is now {nowLocal} ({timeZone}). The current year is {now.Year}. This is the REAL, " +
-        $"verified system clock. Your training data ends before {now.Year}, so {now.Year} may FEEL like " +
-        "the future to you — it is not. It is the present. Never say or reason that this date is " +
-        "impossible, fictional, hypothetical, a typo, or in the future. Treat it as simple fact and " +
-        "use it whenever the date or time is relevant.\n" +
-        "=== ENVIRONMENT ===\n" +
-        $"Host: {RuntimeInformation.OSDescription}. The run_shell_command tool runs " +
-        $"{(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows PowerShell" : "/bin/sh")}; use " +
-        "commands valid for it. It is a FULL shell WITH internet access — you can fetch live data " +
-        "(news, prices, weather, web pages, APIs) with a web request (e.g. Invoke-RestMethod on Windows). " +
-        "Never tell the user you lack internet access or live data; go and fetch it with the tool. If a " +
-        "command fails, do not give up or merely explain the error — diagnose it, adjust, and try again " +
-        "until you have a real answer.\n" +
-        "=== TRUTHFULNESS (CRITICAL) ===\n" +
-        "NEVER invent, fabricate, guess, or rely on memory for factual data such as news headlines, prices, " +
-        "search results, dates, or web content. Report ONLY information that actually appeared in a tool " +
-        "result this turn. Do not claim you fetched, parsed, or used a source unless you genuinely did. If " +
-        "your tools fail or return nothing usable after honest attempts, say so plainly — e.g. 'I couldn't " +
-        "retrieve that' — and do not present made-up data as real. Always respond in English.";
+        $"\n\nIt is {now:dddd, d MMMM yyyy, HH:mm} ({TimeZoneInfo.Local.StandardName}), year {now.Year} — the " +
+        "real present from the system clock, not the future; never call this date impossible or fictional.\n" +
+        $"Your shell ({shell}) is a FULL shell WITH internet — fetch live data yourself (e.g. Invoke-RestMethod); " +
+        "never say you lack access. If a command fails, diagnose and retry until you get a real answer.\n" +
+        "Report ONLY what a tool actually returned this turn — never fabricate news, prices, results or dates, " +
+        "or claim a source you didn't use. If the tools can't get it after honest tries, say so plainly " +
+        "(\"I couldn't retrieve that\"). Always reply in English.";
 }
 
 // System prompt for a worker (the "hands"): a capable, relentless task-doer with real tools.
