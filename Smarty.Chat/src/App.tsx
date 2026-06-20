@@ -428,6 +428,9 @@ function ProjectOverview({
   loading: boolean
   onClose: () => void
 }) {
+  const [showAllRuns, setShowAllRuns] = useState(false)
+  const runs = project?.runs ?? []
+  const visibleRuns = showAllRuns ? runs : runs.slice(0, 3)
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-slate-950">
       <header className="flex items-center gap-3 border-b border-white/5 bg-slate-900/60 px-4 py-2.5 backdrop-blur">
@@ -466,6 +469,31 @@ function ProjectOverview({
 
               <section>
                 <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  Recent activity
+                </h2>
+                {runs.length === 0 ? (
+                  <p className="text-sm text-slate-500">No background work has run for this project yet.</p>
+                ) : (
+                  <>
+                    <div className="space-y-2">
+                      {visibleRuns.map((r) => (
+                        <RunCard key={r.id} run={r} />
+                      ))}
+                    </div>
+                    {runs.length > 3 && (
+                      <button
+                        onClick={() => setShowAllRuns((v) => !v)}
+                        className="mt-2 text-xs font-medium text-indigo-300 hover:text-indigo-200"
+                      >
+                        {showAllRuns ? 'Show less' : `View all ${runs.length} runs`}
+                      </button>
+                    )}
+                  </>
+                )}
+              </section>
+
+              <section>
+                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
                   What I know ({project.memories.length})
                 </h2>
                 {project.memories.length === 0 ? (
@@ -479,21 +507,6 @@ function ProjectOverview({
                         </div>
                         {m.context && <div className="mt-0.5 text-xs text-slate-500">{m.context}</div>}
                       </div>
-                    ))}
-                  </div>
-                )}
-              </section>
-
-              <section>
-                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  What I did ({project.runs.length})
-                </h2>
-                {project.runs.length === 0 ? (
-                  <p className="text-sm text-slate-500">No background work has run for this project yet.</p>
-                ) : (
-                  <div className="space-y-2">
-                    {project.runs.map((r) => (
-                      <RunCard key={r.id} run={r} />
                     ))}
                   </div>
                 )}
@@ -515,13 +528,18 @@ function RunCard({ run }: { run: ProjectRun }) {
       <button onClick={() => setOpen((o) => !o)} className="flex w-full items-start gap-3 px-3.5 py-3 text-left hover:bg-white/[0.02]">
         <StatusDot status={run.status} />
         <div className="min-w-0 flex-1">
-          <div className="text-sm leading-snug text-slate-200">{run.task}</div>
+          <div className="text-sm font-medium leading-snug text-slate-200">{run.task}</div>
+          {run.result && !open && (
+            <div className="mt-0.5 line-clamp-2 text-xs leading-snug text-slate-400">{run.result}</div>
+          )}
           <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500">
             <span className="uppercase tracking-wide">{run.status}</span>
             <span>·</span>
             <span>{when.toLocaleString()}</span>
             <span>·</span>
             <span>{run.steps.length} steps</span>
+            <span>·</span>
+            <span className="text-indigo-300/80">{open ? 'hide detail' : 'see what it did'}</span>
           </div>
         </div>
         <span className={`mt-1 shrink-0 text-slate-500 transition-transform ${open ? 'rotate-90' : ''}`}>
