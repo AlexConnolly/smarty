@@ -641,7 +641,7 @@ function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: str
             // — keep the block labelled "Thinking…" (with a spinner) until that reasoning block closes.
             const thinking = message.streaming && message.content.length === 0
             return (
-              <details className="py-0.5 text-xs text-slate-500 marker:text-slate-600" open={thinking}>
+              <details className="py-0.5 text-xs text-slate-500 marker:text-slate-600">
                 <summary className="inline-flex cursor-pointer select-none items-center gap-1.5 text-slate-400">
                   {thinking && (
                     <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-slate-600 border-t-slate-300" />
@@ -656,7 +656,9 @@ function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: str
           <div className="rounded-2xl rounded-tl-md border border-white/5 bg-white/[0.04] px-4 py-2.5 text-sm leading-relaxed text-slate-100">
             <Markdown text={message.content} />
           </div>
-        ) : message.streaming ? (
+        ) : message.streaming && !message.reasoning ? (
+          // Only show the dots when there's no reasoning block yet — once it's "Thinking…", that line is
+          // the indicator, so we don't double up.
           <div className="py-1">
             <TypingDots />
           </div>
