@@ -46,7 +46,7 @@ public sealed class Orchestrator
         // in HandleToolCall by name).
         _orchestratorTools = OrchestratorTools
             .Append(MemoryTools.SearchTool(memory))
-            .Append(MemoryTools.SetTool(memory))
+            .Append(MemoryTools.SetChatTool(memory))
             .Append(ProjectTools.CreateTool(projects))
             .Append(ProjectTools.ListTool(projects))
             .ToArray();
@@ -88,8 +88,9 @@ public sealed class Orchestrator
         "- list_tasks() / task_status(id): what's running / how it's going (use the ids you're shown).\n" +
         "- search_memory(query): recall what you know about the USER — keywords, not sentences. Only when " +
         "their request actually needs personal context (where they live, preferences, people). Don't fish.\n" +
-        "- set_memory(type, key, value, context): remember a durable fact they share; a new value for an " +
-        "existing key updates it. Not passing one-off details.\n" +
+        "- set_memory(type, key, value, context): remember a durable fact about the USER; a new value for an " +
+        "existing key updates it. Not one-off details. A PROJECT detail isn't saved here — delegate it into " +
+        "that project and the worker records it with the project's context.\n" +
         "- find_project(statement): when a message refers to ongoing work without naming it (\"the flights\", " +
         "\"book the table\"), resolve WHICH project it's about before acting. If it finds none, ask the user; " +
         "never assume.\n" +
@@ -146,7 +147,8 @@ public sealed class Orchestrator
         // front of the model, so it doesn't have to decide to search for them.
         var message = convo.LastOrDefault(m => m.Role == Role.User)?.Content ?? "";
         var profile = await ProfileNote(message, ct).ConfigureAwait(false);
-        var dynamicContext = (DateContext() + profile + RunningTasksNote(session)).TrimStart();
+        var focus = await ProjectFocusNote(session, message, ct).ConfigureAwait(false);
+        var dynamicContext = (DateContext() + profile + focus + RunningTasksNote(session)).TrimStart();
         if (dynamicContext.Length > 0)
             convo.Insert(Math.Max(0, convo.Count - 1), Message.System(dynamicContext));
 
@@ -274,7 +276,11 @@ public sealed class Orchestrator
             }
 
             case "find_project":
-                return Data(await ResolveProjectAsync(call.Arguments.GetStringOrNull("statement") ?? "", ct).ConfigureAwait(false));
+            {
+                var (text, slug) = await ResolveProjectAsync(call.Arguments.GetStringOrNull("statement") ?? "", ct).ConfigureAwait(false);
+                if (slug is not null) session.CurrentProject = slug; // focus the conversation on the resolved project
+                return Data(text);
+            }
 
             case "create_project":
                 return Data(_projects.Create(
@@ -330,11 +336,22 @@ public sealed class Orchestrator
             }
 
             case "set_memory":
+            {
+                var proj = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
+                if (!string.IsNullOrEmpty(proj))
+                    // The orchestrator does no work itself — and a project fact should be written with the
+                    // project's context loaded so it reconciles with what's already known. So we DON'T save
+                    // it here: push it into a task inside the project, where the worker sees the project's
+                    // other facts and records it coherently.
+                    return Data($"I don't save project details up here — delegate it to project \"{proj}\" " +
+                                $"(delegate with project: \"{proj}\") and the worker will record it with the " +
+                                "project's full context. Only facts about the user are saved directly via set_memory.");
                 return Data(_memory.Set(
                     call.Arguments.GetStringOrNull("type") ?? "",
                     call.Arguments.GetStringOrNull("key") ?? "",
                     call.Arguments.GetStringOrNull("value") ?? "",
                     call.Arguments.GetStringOrNull("context")));
+            }
 
             default:
                 return Data($"Unknown tool '{call.Name}'.");
@@ -344,15 +361,17 @@ public sealed class Orchestrator
     // Resolve a free-text statement ("what time are the flights next week") to the project it belongs to,
     // by searching the projects' titles, descriptions and the facts recorded inside them. The hard rule:
     // if it doesn't resolve confidently, we say so and tell the model to ASK — never to invent a project.
-    private async Task<string> ResolveProjectAsync(string statement, CancellationToken ct)
+    // Returns the message for the model AND the resolved slug (non-null only on a confident match, so the
+    // caller can focus the conversation on it). Ambiguous / no-match returns a null slug → the model asks.
+    private async Task<(string Text, string? Slug)> ResolveProjectAsync(string statement, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(statement))
-            return "Give me the user's statement and I'll work out which project it's about.";
+            return ("Give me the user's statement and I'll work out which project it's about.", null);
 
         var active = _projects.ActiveProjects();
         if (active.Count == 0)
-            return "There are no projects yet. If this is the start of a genuinely ongoing thing, ASK the user " +
-                   "before creating a project — don't assume.";
+            return ("There are no projects yet. If this is the start of a genuinely ongoing thing, ASK the user " +
+                    "before creating a project — don't assume.", null);
 
         var ranked = await _memory.RankProjects(statement, active, ct).ConfigureAwait(false);
         var top = ranked.Count > 0 ? ranked[0] : default;
@@ -360,19 +379,19 @@ public sealed class Orchestrator
         // A clear winner: strong score and no near-rival.
         if (ranked.Count > 0 && top.Score >= ResolveStrong &&
             (ranked.Count < 2 || ranked[1].Score < ResolveStrong))
-            return $"That's the project \"{top.Title}\" (slug: {top.Slug}) — matched on \"{top.Matched}\". " +
-                   "Use that slug.";
+            return ($"That's the project \"{top.Title}\" (slug: {top.Slug}) — matched on \"{top.Matched}\". " +
+                    "Use that slug.", top.Slug);
 
         // Nothing close enough — don't guess, don't create.
         if (ranked.Count == 0 || top.Score < ResolveWeak)
-            return "No existing project matches that. Do NOT create one yourself — ask the user whether this " +
-                   "belongs to something they're already planning, or whether to start a new project for it.";
+            return ("No existing project matches that. Do NOT create one yourself — ask the user whether this " +
+                    "belongs to something they're already planning, or whether to start a new project for it.", null);
 
         // In the ambiguous band (or two strong rivals): surface candidates and let the user decide.
         var cands = ranked.Where(r => r.Score >= ResolveWeak).Take(3);
-        return "Couldn't pin that to one project. It might be:\n" +
-               string.Join("\n", cands.Select(c => $"- {c.Slug}: {c.Title} (matched \"{c.Matched}\")")) +
-               "\nAsk the user which one it is — or whether it's something new.";
+        return ("Couldn't pin that to one project. It might be:\n" +
+                string.Join("\n", cands.Select(c => $"- {c.Slug}: {c.Title} (matched \"{c.Matched}\")")) +
+                "\nAsk the user which one it is — or whether it's something new.", null);
     }
 
     // Calibrated against nomic-embed-text, whose cosines have a compressed range: unrelated statements
@@ -555,6 +574,34 @@ public sealed class Orchestrator
             sb.Append($"- {f.Key}: {f.Value}");
             if (!string.IsNullOrWhiteSpace(f.Context)) sb.Append($" ({f.Context})");
             sb.Append('\n');
+        }
+        return sb.ToString();
+    }
+
+    // The READ side of project focus: once find_project has resolved a reference, surface that project's
+    // relevant facts in chat so the orchestrator can answer about it without delegating — and remind it that
+    // recording a new detail goes THROUGH the project (a task), not set_memory up here. Writes are routed;
+    // reads are surfaced.
+    private async Task<string> ProjectFocusNote(Session session, string message, CancellationToken ct)
+    {
+        var slug = session.CurrentProject;
+        if (string.IsNullOrEmpty(slug)) return "";
+        var p = _projects.Get(slug);
+        if (p is null) { session.CurrentProject = null; return ""; } // project gone — drop the stale focus
+
+        var sb = new StringBuilder($"\n\nYou're currently focused on the project \"{p.Title}\" (slug: {slug}). ");
+        sb.Append("To record a new detail about it, delegate that into this project — don't set_memory it up " +
+                  "here. If the user clearly moves on to something else, drop the focus.\n");
+        var facts = await _memory.RelevantTo(message, k: 5, project: slug, ct: ct).ConfigureAwait(false);
+        if (facts.Count > 0)
+        {
+            sb.Append("Relevant project details so far:\n");
+            foreach (var f in facts)
+            {
+                sb.Append($"- {f.Key}: {f.Value}");
+                if (!string.IsNullOrWhiteSpace(f.Context)) sb.Append($" ({f.Context})");
+                sb.Append('\n');
+            }
         }
         return sb.ToString();
     }

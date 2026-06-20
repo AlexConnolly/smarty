@@ -188,6 +188,17 @@ still sit ~0.42–0.51 on topical adjacency, while a genuine reference scores ~0
 Uncertainty biases to **ask**, never assume. The fact, not the title, is what makes "the flights"
 resolve — confirming the drift problem this solves.
 
-**Still open:** `find_project` resolves *which* project, and `delegate(project)` routes the *worker*.
-But chat-level `set_memory` still writes globally — so telling the orchestrator a project detail in
-plain chat doesn't yet tag it to the resolved project. That write-routing is the remaining seam.
+### Write-routing: project facts go through a task, not the orchestrator
+
+The orchestrator does no work itself — and a project fact should be written with the project's context
+loaded, so it reconciles with what's already known there. So chat-level `set_memory` **won't write
+project facts at all.** The tool *advertises* a `project` slot (so the model reaches for it), but the
+top level **rejects** a project-scoped write and redirects: *delegate it into the project, and the
+worker records it with the project's full context.* Workers already auto-tag their writes to their
+project, so this falls out naturally — and it trains the right reflex (route project work, don't do it
+up here). Pretend-you-can, reject, redirect.
+
+Reads are different: reading isn't work. Once `find_project` resolves a reference it sets a **current
+focus** on the session; while focused, that project's relevant facts are surfaced into chat context
+(via `ProjectFocusNote`) so the orchestrator can answer about it directly. Writes routed, reads
+surfaced. The focus drops when the project's gone or the user clearly moves on.

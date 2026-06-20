@@ -54,6 +54,11 @@ public sealed class Session
     /// <summary>When the user last spoke — so proactive nudges stay quiet while a conversation is active.</summary>
     public DateTimeOffset LastUserMessageAt { get; set; } = DateTimeOffset.UtcNow;
 
+    /// <summary>The project the conversation is currently focused on (slug), set when find_project resolves
+    /// a reference. Surfaces that project's context in chat and routes project-detail writes to it — until
+    /// the talk clearly moves on. Null = no project in focus (the default).</summary>
+    public string? CurrentProject { get; set; }
+
     public DateTimeOffset LastActivity { get; private set; } = DateTimeOffset.UtcNow;
 
     public int NextMessageId()
