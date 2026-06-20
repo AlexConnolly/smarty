@@ -78,8 +78,13 @@ string memoryPath = builder.Configuration["Memory:Path"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "data", "memory.json");
 var memory = new MemoryStore(memoryPath, json, embed);
 
+// Projects — long-running endeavours the chat routes context/jobs by (see PROJECTS_SPEC.md).
+string projectsPath = builder.Configuration["Projects:Path"]
+    ?? Path.Combine(builder.Environment.ContentRootPath, "data", "projects.json");
+var projects = new ProjectStore(projectsPath, json);
+
 var sessions = new SessionStore();
-var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory);
+var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory, projects);
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok", model = defaultModel }));
 

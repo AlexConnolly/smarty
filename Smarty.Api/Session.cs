@@ -11,6 +11,7 @@ public sealed class TaskInfo
 {
     public required string Id { get; init; }
     public required string Description { get; init; }
+    public string? Project { get; init; }            // slug of the project this task runs within, if any
     public string Status { get; set; } = "running"; // running | done | cancelled | failed
     public string? LatestThought { get; set; } // the worker's recent reasoning, for status peeks
     public string? Result { get; set; } // the final answer once finished

@@ -15,6 +15,7 @@ public sealed class MemoryFact
     public DateTimeOffset Asserted { get; set; }    // when it became true / was last reaffirmed
     public string Status { get; set; } = "active";  // active | superseded | retired
     public string? SupersededBy { get; set; }
+    public string? Project { get; set; }            // null = global "who you are"; slug = project-scoped
     public float[]? Embedding { get; set; }         // semantic vector for relevance retrieval (lazy-filled)
 }
 
@@ -46,18 +47,21 @@ public sealed class MemoryStore
 
     /// <summary>Remember a durable fact. Same (type,key) with a new value supersedes the old; same value
     /// reaffirms; otherwise it's inserted. Returns a short confirmation for the model to relay.</summary>
-    public string Set(string type, string key, string value, string? context)
+    public string Set(string type, string key, string value, string? context, string? project = null)
     {
         type = type.Trim().ToLowerInvariant();
         key = key.Trim().ToLowerInvariant();
         value = value.Trim();
+        project = string.IsNullOrWhiteSpace(project) ? null : project.Trim().ToLowerInvariant();
         if (type.Length == 0 || key.Length == 0 || value.Length == 0)
             return "Couldn't save that — type, key and value are all required.";
 
         lock (_lock)
         {
+            // Supersession is scoped to the project — a project's "destination" is independent of the
+            // global profile (and of other projects').
             var existing = _facts.FirstOrDefault(f =>
-                f.Status == "active" && f.Type == type && f.Key == key);
+                f.Status == "active" && f.Type == type && f.Key == key && f.Project == project);
 
             if (existing is not null && string.Equals(existing.Value, value, StringComparison.OrdinalIgnoreCase))
             {
@@ -76,6 +80,7 @@ public sealed class MemoryStore
                 Context = string.IsNullOrWhiteSpace(context) ? null : context.Trim(),
                 Asserted = DateTimeOffset.UtcNow,
                 Status = "active",
+                Project = project,
             };
             _facts.Add(fact);
 
@@ -92,9 +97,11 @@ public sealed class MemoryStore
         }
     }
 
-    /// <summary>Keyword search across type/key/value/context of active facts. Pass keywords, not sentences.</summary>
-    public string Search(string query)
+    /// <summary>Keyword search across type/key/value/context of active facts in a scope (null = global
+    /// user facts; a slug = that project's facts). Pass keywords, not sentences.</summary>
+    public string Search(string query, string? project = null)
     {
+        project = string.IsNullOrWhiteSpace(project) ? null : project.Trim().ToLowerInvariant();
         var terms = query.ToLowerInvariant()
             .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(t => t.Length >= 2)
@@ -104,7 +111,7 @@ public sealed class MemoryStore
 
         lock (_lock)
         {
-            var hits = _facts.Where(f => f.Status == "active")
+            var hits = _facts.Where(f => f.Status == "active" && f.Project == project)
                 .Select(f => (f, score: Score(f, terms)))
                 .Where(x => x.score > 0)
                 .OrderByDescending(x => x.score)
@@ -125,20 +132,22 @@ public sealed class MemoryStore
         }
     }
 
-    /// <summary>Everything currently known.</summary>
-    public IReadOnlyList<MemoryFact> Active()
+    /// <summary>Active facts in a scope (null = global user facts; a slug = that project's facts).</summary>
+    public IReadOnlyList<MemoryFact> Active(string? project = null)
     {
-        lock (_lock) return _facts.Where(f => f.Status == "active").ToList();
+        project = string.IsNullOrWhiteSpace(project) ? null : project.Trim().ToLowerInvariant();
+        lock (_lock) return _facts.Where(f => f.Status == "active" && f.Project == project).ToList();
     }
 
     /// <summary>The active facts most relevant to a message — for auto-surfacing context per turn (the
     /// system retrieves; the model doesn't have to decide to search). Keyword-scored for now; this is the
     /// seam where embeddings/vectors slot in to make "relevant" semantic.</summary>
-    public async Task<IReadOnlyList<MemoryFact>> RelevantTo(string message, int k, CancellationToken ct = default)
+    public async Task<IReadOnlyList<MemoryFact>> RelevantTo(string message, int k, string? project = null, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(message)) return Array.Empty<MemoryFact>();
+        project = string.IsNullOrWhiteSpace(project) ? null : project.Trim().ToLowerInvariant();
         List<MemoryFact> active;
-        lock (_lock) active = _facts.Where(f => f.Status == "active").ToList();
+        lock (_lock) active = _facts.Where(f => f.Status == "active" && f.Project == project).ToList();
         if (active.Count == 0) return Array.Empty<MemoryFact>();
 
         // Semantic path: embed the query + any facts missing a vector (nomic prefixes), rank by cosine.
@@ -238,27 +247,33 @@ public sealed class MemoryStore
     }
 }
 
-/// <summary>The two standard memory-access tools, given to the orchestrator and the workers.</summary>
+/// <summary>The two standard memory-access tools. When <paramref name="project"/> is set (a worker
+/// running inside a project), reads and writes are scoped/auto-tagged to that project and the wording
+/// reframes from "the user" to "this project".</summary>
 public static class MemoryTools
 {
-    public static AgentTool SearchTool(MemoryStore m) => new(
+    public static AgentTool SearchTool(MemoryStore m, string? project = null) => new(
         "search_memory",
-        "Search your long-term memory of the user. Search by KEYWORDS (e.g. \"home London\" or \"diet\"), " +
-        "not full sentences.",
+        project is null
+            ? "Search your long-term memory of the user. Search by KEYWORDS (e.g. \"home London\"), not sentences."
+            : "Search what you've recorded about THIS project. Search by KEYWORDS, not sentences.",
         new[] { ToolParameter.String("query", "Keywords to look up.", required: true) },
-        (args, _) => Task.FromResult(ToolOutput.Ok(m.Search(args.GetString("query")))));
+        (args, _) => Task.FromResult(ToolOutput.Ok(m.Search(args.GetString("query"), project))));
 
-    public static AgentTool SetTool(MemoryStore m) => new(
+    public static AgentTool SetTool(MemoryStore m, string? project = null) => new(
         "set_memory",
-        "Remember a durable fact about the user. `key` is the attribute/slot (e.g. home, favourite-city, " +
-        "diet, wife); a new value for an existing key replaces the old one.",
+        project is null
+            ? "Remember a durable fact about the user. `key` is the attribute/slot (e.g. home, diet, wife); a " +
+              "new value for an existing key replaces the old one."
+            : "Record a detail about THIS PROJECT (a decision, date, finding) — not a fact about the user. " +
+              "`key` is the slot (e.g. destination, dates, budget); a new value for an existing key updates it.",
         new[]
         {
             ToolParameter.String("type", "Category — e.g. location, food, person, work.", required: true),
-            ToolParameter.String("key", "The attribute/slot — e.g. home, favourite-city, diet, wife.", required: true),
-            ToolParameter.String("value", "The value — e.g. London, vegetarian, Sarah.", required: true),
+            ToolParameter.String("key", "The attribute/slot — e.g. home, diet, destination, dates.", required: true),
+            ToolParameter.String("value", "The value — e.g. London, vegetarian, Lisbon.", required: true),
             ToolParameter.String("context", "Optional short note/explanation.", required: false),
         },
         (args, _) => Task.FromResult(ToolOutput.Ok(
-            m.Set(args.GetString("type"), args.GetString("key"), args.GetString("value"), args.GetStringOrNull("context")))));
+            m.Set(args.GetString("type"), args.GetString("key"), args.GetString("value"), args.GetStringOrNull("context"), project))));
 }

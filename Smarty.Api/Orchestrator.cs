@@ -20,6 +20,7 @@ public sealed class Orchestrator
     private readonly JsonSerializerOptions _json;
     private readonly TrainingLog _log;
     private readonly MemoryStore _memory;
+    private readonly ProjectStore _projects;
 
     // Bound the per-turn tool loop: a turn may call a data tool (list/status), read the result, then
     // voice it — but it must not spin.
@@ -31,7 +32,7 @@ public sealed class Orchestrator
     private static string Snip(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : "…" + s[^max..]).Replace("\n", " ⏎ ");
 
-    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory)
+    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects)
     {
         _provider = new OllamaModelProvider(ollamaBaseUrl);
         _model = model;
@@ -40,10 +41,14 @@ public sealed class Orchestrator
         _json = json;
         _log = log;
         _memory = memory;
-        // The orchestrator's tools = the task tools + the two memory-access tools (executed in HandleToolCall).
+        _projects = projects;
+        // The orchestrator's tools = task tools + global memory-access + project create/list (all executed
+        // in HandleToolCall by name).
         _orchestratorTools = OrchestratorTools
             .Append(MemoryTools.SearchTool(memory))
             .Append(MemoryTools.SetTool(memory))
+            .Append(ProjectTools.CreateTool(projects))
+            .Append(ProjectTools.ListTool(projects))
             .ToArray();
     }
 
@@ -61,7 +66,7 @@ public sealed class Orchestrator
             tool_call_id = m.ToolCallId,
         }).ToList();
 
-    private static object ProjectTools(IReadOnlyList<AgentTool> tools) =>
+    private static object ToolSchemas(IReadOnlyList<AgentTool> tools) =>
         tools.Select(t => new
         {
             name = t.Name,
@@ -85,6 +90,10 @@ public sealed class Orchestrator
         "their request actually needs personal context (where they live, preferences, people). Don't fish.\n" +
         "- set_memory(type, key, value, context): remember a durable fact they share; a new value for an " +
         "existing key updates it. Not passing one-off details.\n" +
+        "- create_project(title, description) / list_projects(): for genuinely long-running endeavours (a " +
+        "holiday being planned, a house move). Propose a project and confirm before creating; don't make " +
+        "one for a one-off. To work on a project, delegate the task with its project slug — that gives the " +
+        "worker the project's context. Most tasks need no project.\n" +
         "\n" +
         "Just answer (no tools) for chat, jokes, opinions, or things you already know. If a message has both " +
         "an easy part and a work part, answer the easy part AND delegate the work part in the same reply. " +
@@ -190,7 +199,7 @@ public sealed class Orchestrator
                 think,
                 system = request.SystemPrompt,
                 messages = ProjectMessages(sentMessages),
-                tools = ProjectTools(tools),
+                tools = ToolSchemas(tools),
                 output = new
                 {
                     content = turnText.ToString(),
@@ -251,9 +260,31 @@ public sealed class Orchestrator
                     dataReturning = true;
                     return "No task description was provided — ask the user what they'd like done.";
                 }
+                // delegate validates a project; it never creates one.
+                var project = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
+                if (!string.IsNullOrEmpty(project) && !_projects.Exists(project))
+                {
+                    dataReturning = true;
+                    return $"There's no project \"{project}\". Use list_tasks/list_projects to find the right one, " +
+                           "or create_project if this is genuinely a new ongoing thing (confirm with the user first).";
+                }
                 wasDelegate = true;
-                var task = StartTask(session, desc!.Trim());
-                return $"Task #{task.Id} started in the background; its result will come back to you to relay.";
+                var task = StartTask(session, desc!.Trim(), string.IsNullOrEmpty(project) ? null : project);
+                return $"Task #{task.Id} started in the background{(task.Project is null ? "" : $" (project: {task.Project})")}; its result will come back to you to relay.";
+            }
+
+            case "create_project":
+            {
+                dataReturning = true;
+                return _projects.Create(
+                    call.Arguments.GetStringOrNull("title") ?? "",
+                    call.Arguments.GetStringOrNull("description") ?? "");
+            }
+
+            case "list_projects":
+            {
+                dataReturning = true;
+                return _projects.List();
             }
 
             case "list_tasks":
@@ -323,9 +354,9 @@ public sealed class Orchestrator
     }
 
     /// <summary>Register a delegated task, announce it, and spawn its worker + status monitor.</summary>
-    private TaskInfo StartTask(Session session, string description)
+    private TaskInfo StartTask(Session session, string description, string? project = null)
     {
-        var task = new TaskInfo { Id = session.NextTaskId(), Description = description };
+        var task = new TaskInfo { Id = session.NextTaskId(), Description = description, Project = project };
         session.Tasks[task.Id] = task;
         session.Append("working", Json(new { id = task.Id, task = description }));
         _ = Task.Run(() => RunWorkerAsync(session, task));
@@ -342,17 +373,19 @@ public sealed class Orchestrator
         try
         {
             var provider = new OllamaModelProvider(_ollamaBaseUrl);
+            // If this task runs inside a project, inject that project's context and reframe memory toward
+            // tracking the project (not the user); writes are auto-tagged to the project's slug.
             var input = new AgentInput
             {
-                SystemPrompt = _workerSystem(),
+                SystemPrompt = _workerSystem() + ProjectContext(task.Project),
                 Model = ModelSpec.Ollama(_model, _ollamaBaseUrl),
                 Tools =
                 {
                     ShellTool.Create(),
                     WebResearch.SearchTool(),
                     WebResearch.PageAnswerTool(provider, _model),
-                    MemoryTools.SearchTool(_memory),
-                    MemoryTools.SetTool(_memory),
+                    MemoryTools.SearchTool(_memory, task.Project),
+                    MemoryTools.SetTool(_memory, task.Project),
                 },
                 DrainInbox = () => DrainInbox(task),
                 // Honesty over speed: with reasoning on, the worker inspects tool output, notices junk
@@ -400,7 +433,7 @@ public sealed class Orchestrator
                     model = _model,
                     think = true,
                     system = input.SystemPrompt,
-                    tools = ProjectTools(input.Tools),
+                    tools = ToolSchemas(input.Tools),
                     task = task.Description,
                     transcript = ProjectMessages(run.Messages),
                     result,
@@ -484,7 +517,7 @@ public sealed class Orchestrator
     // not the whole store. The system does the retrieval; embeddings will make "relevant" semantic later.
     private async Task<string> ProfileNote(string message, CancellationToken ct)
     {
-        var facts = await _memory.RelevantTo(message, k: 6, ct).ConfigureAwait(false);
+        var facts = await _memory.RelevantTo(message, k: 6, ct: ct).ConfigureAwait(false);
         Trace($"[mem] relevant-to({Snip(message, 50)}) -> {(facts.Count == 0 ? "(none)" : string.Join(", ", facts.Select(f => f.Key + "=" + f.Value)))}");
         if (facts.Count == 0) return "";
         var sb = new StringBuilder("\n\nRelevant to this, here's what you know about the user (apply it; never advise against it):\n");
@@ -493,6 +526,32 @@ public sealed class Orchestrator
             sb.Append($"- {f.Key}: {f.Value}");
             if (!string.IsNullOrWhiteSpace(f.Context)) sb.Append($" ({f.Context})");
             sb.Append('\n');
+        }
+        return sb.ToString();
+    }
+
+    // When a worker runs inside a project, give it the project's framing + accumulated facts, and reframe
+    // memory toward tracking the project rather than the user.
+    private string ProjectContext(string? slug)
+    {
+        if (string.IsNullOrEmpty(slug)) return "";
+        var p = _projects.Get(slug);
+        if (p is null) return "";
+
+        var sb = new StringBuilder($"\n\nYou are working inside the project \"{p.Title}\"");
+        if (!string.IsNullOrWhiteSpace(p.Description)) sb.Append($": {p.Description}");
+        sb.Append(".\nUse memory here to track details about THIS PROJECT (decisions, dates, findings) — not facts about the user.\n");
+
+        var facts = _memory.Active(slug);
+        if (facts.Count > 0)
+        {
+            sb.Append("Known about this project so far:\n");
+            foreach (var f in facts.OrderBy(f => f.Type, StringComparer.Ordinal))
+            {
+                sb.Append($"- {f.Key}: {f.Value}");
+                if (!string.IsNullOrWhiteSpace(f.Context)) sb.Append($" ({f.Context})");
+                sb.Append('\n');
+            }
         }
         return sb.ToString();
     }
@@ -546,8 +605,13 @@ public sealed class Orchestrator
     {
         new("delegate",
             "Hand a task to a capable background worker that has real tools (shell, internet, files). Provide " +
-            "a clear, self-contained description of the work.",
-            new[] { ToolParameter.String("task", "A clear, self-contained description of the work to do.", required: true) },
+            "a clear, self-contained description of the work. Optionally tag it to a project (by slug) so the " +
+            "worker has that project's context — leave blank for one-off tasks.",
+            new[]
+            {
+                ToolParameter.String("task", "A clear, self-contained description of the work to do.", required: true),
+                ToolParameter.String("project", "Optional project slug to run the task within.", required: false),
+            },
             NoOp),
         new("list_tasks",
             "List the background tasks that have been started and their current status.",
