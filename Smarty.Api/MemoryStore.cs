@@ -309,10 +309,9 @@ public static class MemoryTools
         new[] { ToolParameter.String("query", "Keywords to look up.", required: true) },
         (args, _) => Task.FromResult(ToolOutput.Ok(m.Search(args.GetString("query"), project))));
 
-    /// <summary>The chat-level set_memory. It advertises a `project` slot so the model reaches for it when a
-    /// fact belongs to a project — but the orchestrator deliberately won't write project facts itself (it
-    /// does no work). The handler rejects those and redirects to delegating into the project, where the
-    /// write happens with the project's context loaded. Plain (user) facts are saved here directly.</summary>
+    /// <summary>The chat-level set_memory. It advertises a `project` slot for an explicit scope, but the
+    /// handler also defaults the scope to the project currently in focus — so details stated while
+    /// discussing a project are saved against it, and everything else is a fact about the user.</summary>
     public static AgentTool SetChatTool(MemoryStore m) => new(
         "set_memory",
         "Remember a durable fact. For a fact about the USER, give type/key/value (key is the slot — home, " +

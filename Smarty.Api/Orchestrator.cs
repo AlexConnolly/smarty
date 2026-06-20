@@ -95,9 +95,9 @@ public sealed class Orchestrator
         "- list_tasks() / task_status(id): what's running / how it's going (use the ids you're shown).\n" +
         "- search_memory(query): recall what you know about the USER — keywords, not sentences. Only when " +
         "their request actually needs personal context (where they live, preferences, people). Don't fish.\n" +
-        "- set_memory(type, key, value, context): remember a durable fact about the USER; a new value for an " +
-        "existing key updates it. Not one-off details. A PROJECT detail isn't saved here — delegate it into " +
-        "that project and the worker records it with the project's context.\n" +
+        "- set_memory(type, key, value, context): remember a durable fact — a decision, a booking, a detail. " +
+        "While you're focused on a project it's saved AGAINST that project; otherwise it's a fact about the " +
+        "USER. A new value for an existing key updates it. Not one-off trivia.\n" +
         "- find_project(statement): when a message refers to ongoing work without naming it (\"the flights\", " +
         "\"book the table\"), resolve WHICH project it's about before acting. If it finds none, ask the user; " +
         "never assume.\n" +
@@ -334,7 +334,11 @@ public sealed class Orchestrator
                 var (msg, newSlug) = _projects.Create(
                     call.Arguments.GetStringOrNull("title") ?? "",
                     call.Arguments.GetStringOrNull("description") ?? "");
-                if (newSlug is not null) _ = RegenerateReadmeAsync(newSlug); // initial README in the background
+                if (newSlug is not null)
+                {
+                    session.CurrentProject = newSlug;        // focus it, so details stated next land on the project
+                    _ = RegenerateReadmeAsync(newSlug);      // initial README in the background
+                }
                 return Data(msg);
             }
 
@@ -388,20 +392,19 @@ public sealed class Orchestrator
 
             case "set_memory":
             {
+                // Scope: an explicit project arg wins; otherwise the project in focus (so details stated while
+                // discussing a project land ON that project, not in the global profile); otherwise global.
                 var proj = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
-                if (!string.IsNullOrEmpty(proj))
-                    // The orchestrator does no work itself — and a project fact should be written with the
-                    // project's context loaded so it reconciles with what's already known. So we DON'T save
-                    // it here: push it into a task inside the project, where the worker sees the project's
-                    // other facts and records it coherently.
-                    return Data($"I don't save project details up here — delegate it to project \"{proj}\" " +
-                                $"(delegate with project: \"{proj}\") and the worker will record it with the " +
-                                "project's full context. Only facts about the user are saved directly via set_memory.");
-                return Data(_memory.Set(
+                if (string.IsNullOrEmpty(proj)) proj = session.CurrentProject;
+                if (!string.IsNullOrEmpty(proj) && !_projects.Exists(proj)) proj = null;
+                var result = _memory.Set(
                     call.Arguments.GetStringOrNull("type") ?? "",
                     call.Arguments.GetStringOrNull("key") ?? "",
                     call.Arguments.GetStringOrNull("value") ?? "",
-                    call.Arguments.GetStringOrNull("context")));
+                    call.Arguments.GetStringOrNull("context"),
+                    proj);
+                if (!string.IsNullOrEmpty(proj)) _ = RegenerateReadmeAsync(proj); // project touched → refresh README
+                return Data(result);
             }
 
             default:
@@ -615,11 +618,16 @@ public sealed class Orchestrator
     }
 
     private const string ReadmeSystem =
-        "You keep a living README for a personal project — a short, friendly markdown summary the user reads " +
-        "to catch up at a glance. Plain, warm, concise language. NO internal jargon: no slugs, ids, tool " +
-        "names, statuses, or mechanics. Use a few short sections with ## headings — what this project is, " +
-        "where it's at now, what's been decided/settled, and what's next or still open. If little is known " +
-        "yet, keep it to a sentence or two and note it's just getting started. Output ONLY the markdown.";
+        "You maintain a project's README — a factual, information-dense catch-up, NOT a pep talk. Write only " +
+        "concrete specifics that are actually known: decisions made, dates, names, places, addresses, numbers, " +
+        "options found, and what each piece of work actually turned up. Use short ## sections and bullet " +
+        "points of real facts. Hard rules: NO filler, NO restating the obvious, NO motivational or emotional " +
+        "padding, NO emoji, NO inventing details that aren't given. Every settled fact you're given is a real " +
+        "decision — report it; never claim something is unknown/unrecorded when it's listed. If something " +
+        "genuinely isn't given, just leave it out — don't pad. Prefer specifics (\"Booked Bella's Italian — " +
+        "14th, 7pm, 10 covers\") over sentiment (\"a lovely evening to make her feel special\"). Only when " +
+        "there are NO settled facts at all, say in one line that it's just getting started. No internal jargon " +
+        "(slugs, ids, tool names). Output ONLY the markdown.";
 
     // Regenerate a project's living README from its current facts + run history — a plain-language catch-up
     // the overview shows instead of raw key/value jargon. Runs in the background whenever the project is
@@ -637,8 +645,8 @@ public sealed class Orchestrator
             var state = new StringBuilder();
             state.Append($"Project: {p.Title}\n");
             if (!string.IsNullOrWhiteSpace(p.Description)) state.Append($"About: {p.Description}\n");
-            state.Append("\nKnown details:\n");
-            if (facts.Count == 0) state.Append("- (nothing recorded yet)\n");
+            state.Append("\nSettled facts — these are DECIDED/booked, report them as such (do not say they're unknown):\n");
+            if (facts.Count == 0) state.Append("- (nothing decided yet)\n");
             else
                 foreach (var f in facts.OrderBy(f => f.Type, StringComparer.Ordinal))
                     state.Append($"- {f.Key}: {f.Value}{(string.IsNullOrWhiteSpace(f.Context) ? "" : $" ({f.Context})")}\n");
@@ -646,7 +654,7 @@ public sealed class Orchestrator
             if (runs.Count == 0) state.Append("- (no background work yet)\n");
             else
                 foreach (var r in runs.Take(8))
-                    state.Append($"- {r.Task} → {Head(r.Result ?? "", 300)}\n");
+                    state.Append($"- {r.Task}\n  found: {Head(r.Result ?? "", 800)}\n");
 
             var request = new ModelRequest
             {
@@ -783,8 +791,8 @@ public sealed class Orchestrator
         if (p is null) { session.CurrentProject = null; return ""; } // project gone — drop the stale focus
 
         var sb = new StringBuilder($"\n\nYou're currently focused on the project \"{p.Title}\" (slug: {slug}). ");
-        sb.Append("To record a new detail about it, delegate that into this project — don't set_memory it up " +
-                  "here. If the user clearly moves on to something else, drop the focus.\n");
+        sb.Append("Durable details you record with set_memory now are saved against THIS project. If the user " +
+                  "clearly moves on to something else, drop the focus.\n");
         var facts = await _memory.RelevantTo(message, k: 5, project: slug, ct: ct).ConfigureAwait(false);
         if (facts.Count > 0)
         {
