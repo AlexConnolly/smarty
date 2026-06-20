@@ -20,6 +20,73 @@ export async function transcribe(wav: Blob): Promise<string> {
   return (data.text ?? '').trim()
 }
 
+// ---- Projects ----
+
+export interface ProjectSummary {
+  slug: string
+  title: string
+  description: string
+  runs: number
+  facts: number
+}
+
+export interface ProjectMemory {
+  type: string
+  key: string
+  value: string
+  context?: string
+  asserted: string
+}
+
+export interface RunStep {
+  kind: 'thinking' | 'tool' | 'answer'
+  text?: string
+  tool?: string
+  args?: string
+  result?: string
+}
+
+export interface ProjectRun {
+  id: string
+  task: string
+  status: string
+  startedAt: string
+  endedAt: string
+  steps: RunStep[]
+  result?: string
+}
+
+export interface ProjectDetail {
+  slug: string
+  title: string
+  description: string
+  status: string
+  memories: ProjectMemory[]
+  runs: ProjectRun[]
+}
+
+/** The active projects, for the slide-out bar. */
+export async function fetchProjects(): Promise<ProjectSummary[]> {
+  try {
+    const res = await fetch('/api/projects')
+    if (!res.ok) return []
+    return (await res.json()) as ProjectSummary[]
+  } catch {
+    return []
+  }
+}
+
+/** One project's overview — memories + what its workers did. */
+export async function fetchProject(slug: string): Promise<ProjectDetail | null> {
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(slug)}`)
+    if (!res.ok) return null
+    return (await res.json()) as ProjectDetail
+  } catch {
+    return null
+  }
+}
+
 export interface SessionHandlers {
   onMsgStart?: (id: number, role: string) => void
   onContent?: (id: number, text: string) => void

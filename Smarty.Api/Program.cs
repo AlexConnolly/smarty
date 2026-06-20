@@ -83,10 +83,48 @@ string projectsPath = builder.Configuration["Projects:Path"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "data", "projects.json");
 var projects = new ProjectStore(projectsPath, json);
 
+// What each project's background workers actually did — thinking + tool calls + result — kept per project
+// so the project overview can show it back (read-only).
+string runsPath = builder.Configuration["Projects:RunsPath"]
+    ?? Path.Combine(builder.Environment.ContentRootPath, "data", "runs.json");
+var projectRuns = new ProjectRunStore(runsPath, json);
+
 var sessions = new SessionStore();
-var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory, projects);
+var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory, projects, projectRuns);
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok", model = defaultModel }));
+
+// The projects on the go — for the slide-out bar. Only active projects, with how much is recorded against
+// each. Projects are the only thing surfaced here: work with no project isn't shown anywhere.
+app.MapGet("/api/projects", () => Results.Ok(
+    projects.ActiveProjects().Select(p => new
+    {
+        slug = p.Slug,
+        title = p.Title,
+        description = p.Description,
+        runs = projectRuns.CountFor(p.Slug),
+        facts = memory.Active(p.Slug).Count,
+    })));
+
+// One project's overview: everything remembered about it, and everything its background workers did
+// (thinking + tool calls + results), newest first. Read-only.
+app.MapGet("/api/projects/{slug}", (string slug) =>
+{
+    var p = projects.Get(slug);
+    if (p is null) return Results.NotFound(new { error = "no such project" });
+    return Results.Ok(new
+    {
+        slug = p.Slug,
+        title = p.Title,
+        description = p.Description,
+        status = p.Status,
+        memories = memory.Active(p.Slug)
+            .OrderByDescending(f => f.Asserted)
+            .Select(f => new { type = f.Type, key = f.Key, value = f.Value, context = f.Context, asserted = f.Asserted }),
+        runs = projectRuns.ForProject(p.Slug)
+            .Select(r => new { id = r.Id, task = r.Task, status = r.Status, startedAt = r.StartedAt, endedAt = r.EndedAt, steps = r.Steps, result = r.Result }),
+    });
+});
 
 // Open passthrough of the available Ollama models, so the UI can offer a picker.
 app.MapGet("/api/models", async () =>

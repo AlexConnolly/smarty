@@ -21,6 +21,7 @@ public sealed class Orchestrator
     private readonly TrainingLog _log;
     private readonly MemoryStore _memory;
     private readonly ProjectStore _projects;
+    private readonly ProjectRunStore _runs;
 
     // Bound the per-turn tool loop: a turn may call a data tool (list/status), read the result, then
     // voice it — but it must not spin.
@@ -32,7 +33,7 @@ public sealed class Orchestrator
     private static string Snip(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : "…" + s[^max..]).Replace("\n", " ⏎ ");
 
-    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects)
+    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects, ProjectRunStore runs)
     {
         _provider = new OllamaModelProvider(ollamaBaseUrl);
         _model = model;
@@ -42,6 +43,7 @@ public sealed class Orchestrator
         _log = log;
         _memory = memory;
         _projects = projects;
+        _runs = runs;
         // The orchestrator's tools = task tools + global memory-access + project create/list (all executed
         // in HandleToolCall by name).
         _orchestratorTools = OrchestratorTools
@@ -417,6 +419,7 @@ public sealed class Orchestrator
     {
         string result = "(no result)";
         bool cancelled = false;
+        IReadOnlyList<Message>? transcript = null; // captured for the project run log, even if cancelled
         Trace($"[worker #{task.Id}] start: {Snip(task.Description, 120)}");
         try
         {
@@ -472,6 +475,8 @@ public sealed class Orchestrator
 
             // Capture the full worker transcript (task → tool calls → results → answer) for the dataset.
             if (worker.LastRun is { } run)
+            {
+                transcript = run.Messages;
                 _log.Interaction(new
                 {
                     ts = DateTimeOffset.UtcNow,
@@ -486,6 +491,7 @@ public sealed class Orchestrator
                     transcript = ProjectMessages(run.Messages),
                     result,
                 });
+            }
         }
         catch (OperationCanceledException)
         {
@@ -503,6 +509,21 @@ public sealed class Orchestrator
 
         session.Append("working_done", Json(new { id = task.Id, status = task.Status }));
         Trace($"[worker #{task.Id}] RESULT >>> {Snip(result, 500)}");
+
+        // Record what the sub-agent did, scoped to its project (work with no project isn't logged here —
+        // it isn't shown anywhere). Read back by the project overview.
+        if (!string.IsNullOrEmpty(task.Project) && transcript is not null)
+            _runs.Add(new ProjectRun
+            {
+                Id = Guid.NewGuid().ToString("N")[..8],
+                Project = task.Project!,
+                Task = task.Description,
+                Status = task.Status,
+                StartedAt = task.StartedAt,
+                EndedAt = DateTimeOffset.UtcNow,
+                Steps = BuildSteps(transcript),
+                Result = result,
+            });
 
         // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
         if (cancelled) return;
@@ -534,6 +555,39 @@ public sealed class Orchestrator
         {
             session.TurnLock.Release();
         }
+    }
+
+    // Flatten a worker's message transcript into display steps: thinking blocks, tool calls (with their
+    // arguments and matched results), and the final answer — the read-only "what it did" timeline.
+    private static List<RunStep> BuildSteps(IReadOnlyList<Message> messages)
+    {
+        var steps = new List<RunStep>();
+        var toolById = new Dictionary<string, RunStep>(StringComparer.Ordinal);
+        foreach (var m in messages)
+        {
+            if (m.Role == Role.Assistant)
+            {
+                if (!string.IsNullOrWhiteSpace(m.Reasoning))
+                    steps.Add(new RunStep { Kind = "thinking", Text = m.Reasoning!.Trim() });
+                if (m.ToolCalls is { Count: > 0 })
+                    foreach (var c in m.ToolCalls)
+                    {
+                        var s = new RunStep { Kind = "tool", Tool = c.Name, Args = c.Arguments.ToString() };
+                        steps.Add(s);
+                        if (!string.IsNullOrEmpty(c.Id)) toolById[c.Id] = s;
+                    }
+                if (!string.IsNullOrWhiteSpace(m.Content))
+                    steps.Add(new RunStep { Kind = "answer", Text = m.Content!.Trim() });
+            }
+            else if (m.Role == Role.Tool)
+            {
+                if (m.ToolCallId is { } id && toolById.TryGetValue(id, out var s))
+                    s.Result = m.Content;
+                else
+                    steps.Add(new RunStep { Kind = "tool", Tool = m.ToolName, Result = m.Content });
+            }
+        }
+        return steps;
     }
 
     // Hand the worker any follow-ups the user routed to it while it was running, as steering notes.
