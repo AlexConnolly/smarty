@@ -140,8 +140,10 @@ public static class ProjectTools
 {
     public static AgentTool CreateTool(ProjectStore store) => new(
         "create_project",
-        "Start tracking a NEW long-running endeavour as a project (e.g. planning a holiday, a house move). " +
-        "Only for genuinely multi-session things — not one-off tasks. Confirm with the user first.",
+        "Start a project for anything that involves planning or organising something with several parts — an " +
+        "event or party, a trip or holiday, a house move, any multi-step undertaking you'll return to. Use it " +
+        "whenever a request is more than a quick question or a couple of back-and-forths (e.g. \"help me plan " +
+        "an evening for 20 people\"). Propose it and confirm with the user first; don't duplicate an existing one.",
         new[]
         {
             ToolParameter.String("title", "Short title, e.g. \"Holiday with my sister\".", required: true),

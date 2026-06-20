@@ -96,10 +96,13 @@ public sealed class Orchestrator
         "- find_project(statement): when a message refers to ongoing work without naming it (\"the flights\", " +
         "\"book the table\"), resolve WHICH project it's about before acting. If it finds none, ask the user; " +
         "never assume.\n" +
-        "- create_project(title, description) / list_projects(): for genuinely long-running endeavours (a " +
-        "holiday being planned, a house move). Before creating, resolve with find_project; only create once " +
-        "the user confirms — never auto-create or duplicate. To work on a project, delegate with its slug " +
-        "(that gives the worker the project's context). Most tasks need no project.\n" +
+        "- create_project(title, description) / list_projects(): a project is for anything with several " +
+        "moving parts you'll come back to — planning or organising an EVENT or party, a trip or holiday, a " +
+        "house move, any multi-step undertaking. The moment a request is more than a single question or a " +
+        "couple of quick back-and-forths — especially \"help me plan/organise/sort out X\" — treat it as a " +
+        "project, NOT a one-off task: propose one, and once the user's happy create it (resolve with " +
+        "find_project first; never auto-create or duplicate), then delegate the work with its slug so the " +
+        "worker has the context. Only genuine one-offs (a single fact, a quick lookup) need no project.\n" +
         "\n" +
         "Just answer (no tools) for chat, jokes, opinions, or things you already know. If a message has both " +
         "an easy part and a work part, answer the easy part AND delegate the work part in the same reply. " +
