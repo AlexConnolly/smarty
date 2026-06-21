@@ -52,9 +52,15 @@ public sealed class Orchestrator
             .Append(ProjectTools.CreateTool(projects))
             .Append(ProjectTools.ListTool(projects))
             .ToArray();
+        // A pinned project chat is already inside one project — no resolving, creating or listing projects.
+        _pinnedTools = OrchestratorTools.Where(t => t.Name != "find_project")
+            .Append(MemoryTools.SearchTool(memory))
+            .Append(MemoryTools.SetChatTool(memory))
+            .ToArray();
     }
 
     private readonly AgentTool[] _orchestratorTools;
+    private readonly AgentTool[] _pinnedTools;
 
     // Project agent messages/tools into clean, training-shaped JSON (system + messages + tools → output).
     private static object ProjectMessages(IEnumerable<Message> messages) =>
@@ -129,9 +135,10 @@ public sealed class Orchestrator
 
             // The user-facing turn is where the real decisions live (which tools, answer-and-delegate,
             // refine-vs-new, cancel). Let the model think here so it gets them right; re-voice
-            // turns stay think:false for speed.
+            // turns stay think:false for speed. A pinned project chat uses the narrower, project-only toolset.
+            var tools = session.PinnedProject is null ? _orchestratorTools : _pinnedTools;
             string content = await RunOrchestratorTurnAsync(
-                session, session.History, _orchestratorTools, think: true, ct).ConfigureAwait(false);
+                session, session.History, tools, think: true, ct).ConfigureAwait(false);
             Trace("[turn] orchestrator user-turn done (ack streamed)");
 
             session.History.Add(Message.Assistant(string.IsNullOrWhiteSpace(content) ? "(on it)" : content));
@@ -159,8 +166,20 @@ public sealed class Orchestrator
         // Surfacing the profile here also means personal facts (allergies, where they live) are ALWAYS in
         // front of the model, so it doesn't have to decide to search for them.
         var message = convo.LastOrDefault(m => m.Role == Role.User)?.Content ?? "";
-        var profile = await ProfileNote(message, ct).ConfigureAwait(false);
-        var focus = await ProjectFocusNote(session, message, ct).ConfigureAwait(false);
+        // A pinned project chat is scoped entirely to its project: surface only the project's context (not the
+        // global user profile), and tell the model to stay on it. The general chat surfaces the user profile
+        // plus any soft project focus.
+        string profile, focus;
+        if (session.PinnedProject is not null)
+        {
+            profile = "";
+            focus = await PinnedProjectNote(session, message, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            profile = await ProfileNote(message, ct).ConfigureAwait(false);
+            focus = await ProjectFocusNote(session, message, ct).ConfigureAwait(false);
+        }
         var dynamicContext = (DateContext() + profile + focus + RunningTasksNote(session)).TrimStart();
         if (dynamicContext.Length > 0)
             convo.Insert(Math.Max(0, convo.Count - 1), Message.System(dynamicContext));
@@ -314,8 +333,10 @@ public sealed class Orchestrator
                 var desc = call.Arguments.GetStringOrNull("task");
                 if (string.IsNullOrWhiteSpace(desc))
                     return Data("No task description was provided — ask the user what they'd like done.");
-                // delegate validates a project; it never creates one.
+                // delegate validates a project; it never creates one. In a pinned project chat, default the
+                // work to that project so the model doesn't have to name it.
                 var project = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
+                if (string.IsNullOrEmpty(project)) project = session.PinnedProject;
                 if (!string.IsNullOrEmpty(project) && !_projects.Exists(project))
                     return Data($"There's no project \"{project}\". Use find_project to resolve which one this is, " +
                                 "or create_project if it's genuinely new (confirm with the user first).");
@@ -851,6 +872,35 @@ public sealed class Orchestrator
         if (facts.Count > 0)
         {
             sb.Append("Relevant project details so far:\n");
+            foreach (var f in facts)
+            {
+                sb.Append($"- {f.Key}: {f.Value}");
+                if (!string.IsNullOrWhiteSpace(f.Context)) sb.Append($" ({f.Context})");
+                sb.Append('\n');
+            }
+        }
+        return sb.ToString();
+    }
+
+    // The dedicated project chat: this whole conversation is about ONE project. Surface its details and hold
+    // the model to it — only this project's topic, and a polite deflection for anything unrelated.
+    private async Task<string> PinnedProjectNote(Session session, string message, CancellationToken ct)
+    {
+        var slug = session.PinnedProject;
+        if (string.IsNullOrEmpty(slug)) return "";
+        var p = _projects.Get(slug);
+        if (p is null) { session.PinnedProject = null; session.CurrentProject = null; return ""; }
+
+        var sb = new StringBuilder($"\n\nThis is the DEDICATED chat for the project \"{p.Title}\"");
+        if (!string.IsNullOrWhiteSpace(p.Description)) sb.Append($": {p.Description}");
+        sb.Append(".\nTalk ONLY about this project — its planning, details, and getting things done for it. " +
+                  "Record details and delegate work to THIS project. If the user asks about anything not " +
+                  "related to it, briefly say this is the project's space and they can use the main chat for " +
+                  "other things — don't act on unrelated requests here.\n");
+        var facts = await _memory.RelevantTo(message, k: 6, project: slug, ct: ct).ConfigureAwait(false);
+        if (facts.Count > 0)
+        {
+            sb.Append("What's known about it:\n");
             foreach (var f in facts)
             {
                 sb.Append($"- {f.Key}: {f.Value}");

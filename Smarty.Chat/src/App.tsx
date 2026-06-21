@@ -6,6 +6,7 @@ import {
   fetchProject,
   fetchProjects,
   openSessionStream,
+  pinSessionToProject,
   sendFeedback,
   sendMessage,
   transcribe,
@@ -381,7 +382,7 @@ export default function App() {
       <ProjectsDrawer open={drawerOpen} projects={projects} onClose={() => setDrawerOpen(false)} onPick={openProject} />
 
       {(projectLoading || activeProject) && (
-        <ProjectOverview project={activeProject} loading={projectLoading} onClose={() => setActiveProject(null)} />
+        <ProjectOverview project={activeProject} loading={projectLoading} onClose={() => setActiveProject(null)} mainSessionId={sessionId.current} />
       )}
 
       {tasksOpen && <TaskRunner tasks={working} onClose={() => setTasksOpen(false)} onCancel={cancelRunningTask} />}
@@ -408,11 +409,13 @@ function HomeView({
   const nothing = working.length === 0 && projects.length === 0
   return (
     <div className="mx-auto max-w-reading px-4 py-10 sm:py-14">
-      <h1 className="text-[26px] font-semibold tracking-tight text-ink sm:text-[32px]">{greeting}</h1>
-      <p className="mt-1 text-[15px] text-ink-soft">{nothing ? 'What can I help you with?' : "Here's what's going on."}</p>
+      <h1 className="animate-fade-in-up text-[26px] font-semibold tracking-tight text-ink sm:text-[32px]">{greeting}</h1>
+      <p className="animate-fade-in-up text-[15px] text-ink-soft" style={{ animationDelay: '40ms' }}>
+        {nothing ? 'What can I help you with?' : "Here's what's going on."}
+      </p>
 
       {working.length > 0 && (
-        <section className="mt-8">
+        <section className="mt-8 animate-fade-in-up" style={{ animationDelay: '80ms' }}>
           <SectionLabel>Running now</SectionLabel>
           <div className="mt-2.5 space-y-2">
             {working.map((t) => (
@@ -433,7 +436,7 @@ function HomeView({
       )}
 
       {projects.length > 0 && (
-        <section className="mt-8">
+        <section className="mt-8 animate-fade-in-up" style={{ animationDelay: '120ms' }}>
           <SectionLabel>Projects</SectionLabel>
           <div className="mt-2.5 space-y-2">
             {projects.map((p) => (
@@ -536,64 +539,187 @@ function ProjectsDrawer({
   )
 }
 
-// ---- Project overview ----
-function ProjectOverview({ project, loading, onClose }: { project: ProjectDetail | null; loading: boolean; onClose: () => void }) {
+// ---- Project page: overview + a dedicated, scoped chat about this project ----
+function ProjectOverview({
+  project,
+  loading,
+  onClose,
+  mainSessionId,
+}: {
+  project: ProjectDetail | null
+  loading: boolean
+  onClose: () => void
+  mainSessionId: string
+}) {
+  const [tab, setTab] = useState<'overview' | 'chat'>('overview')
   const [showAllRuns, setShowAllRuns] = useState(false)
+  const [messages, setMessages] = useState<UiMessage[]>([])
+  const [input, setInput] = useState('')
   const runs = project?.runs ?? []
   const visibleRuns = showAllRuns ? runs : runs.slice(0, 3)
+  const slug = project?.slug
+  const projSession = slug ? `${mainSessionId}__p__${slug}` : null
+
+  const taRef = useRef<HTMLTextAreaElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const atBottomRef = useRef(true)
+
+  function upsert(id: number, fn: (m: UiMessage) => UiMessage, role?: 'user' | 'assistant') {
+    setMessages((prev) => {
+      const idx = prev.findIndex((m) => m.id === id)
+      if (idx >= 0) {
+        const next = prev.slice()
+        next[idx] = fn(next[idx])
+        return next
+      }
+      return [...prev, fn({ id, role: role ?? 'assistant', content: '', reasoning: '', streaming: true })]
+    })
+  }
+
+  // Pin the (project-specific) session and stream its scoped conversation.
+  useEffect(() => {
+    if (!projSession || !slug) return
+    pinSessionToProject(projSession, slug)
+    const controller = new AbortController()
+    openSessionStream(
+      projSession,
+      {
+        onMsgStart: (id, role) => upsert(id, (m) => ({ ...m, role: role as 'user' | 'assistant', streaming: true }), role as 'user' | 'assistant'),
+        onContent: (id, text) => upsert(id, (m) => ({ ...m, content: m.content + text, thinkMs: m.thinkMs ?? (m.thinkStart ? Date.now() - m.thinkStart : undefined) })),
+        onReasoning: (id, text) => upsert(id, (m) => ({ ...m, reasoning: m.reasoning + text, thinkStart: m.thinkStart ?? Date.now() })),
+        onMsgEnd: (id, text) =>
+          upsert(id, (m) => ({ ...m, streaming: false, content: text && text.length > 0 ? text : m.content, thinkMs: m.thinkMs ?? (m.thinkStart ? Date.now() - m.thinkStart : undefined) })),
+      },
+      controller.signal,
+    )
+    return () => controller.abort()
+  }, [projSession, slug])
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (el && tab === 'chat' && atBottomRef.current) el.scrollTop = el.scrollHeight
+  }, [messages, tab])
+
+  useEffect(() => {
+    const el = taRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(Math.max(el.scrollHeight, 24), 160) + 'px'
+  }, [input, tab])
+
+  function send() {
+    const body = input.trim()
+    if (!body || !projSession) return
+    setInput('')
+    setTab('chat')
+    atBottomRef.current = true
+    sendMessage(projSession, body)
+  }
+
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-bg">
+    <div className="fixed inset-0 z-50 flex flex-col bg-bg animate-fade-in">
       <header className="flex items-center gap-2 border-b border-line bg-bg/80 px-4 py-2.5 backdrop-blur sm:px-6">
-        <button onClick={onClose} title="Back" className="-ml-1 grid h-9 w-9 place-items-center rounded-md text-ink-soft hover:bg-surface-mid hover:text-ink">
+        <button onClick={onClose} title="Back" className="-ml-1 grid h-9 w-9 shrink-0 place-items-center rounded-md text-ink-soft hover:bg-surface-mid hover:text-ink">
           <BackIcon />
         </button>
-        <h1 className="min-w-0 truncate text-sm font-medium tracking-tight text-ink-soft">{project?.title ?? (loading ? 'Loading…' : 'Project')}</h1>
+        <h1 className="min-w-0 flex-1 truncate text-sm font-medium tracking-tight text-ink-soft">{project?.title ?? (loading ? 'Loading…' : 'Project')}</h1>
+        {project && (
+          <div className="flex shrink-0 rounded-md bg-surface-low p-0.5 text-xs font-medium">
+            <button onClick={() => setTab('overview')} className={`rounded px-2.5 py-1 transition ${tab === 'overview' ? 'bg-surface text-ink shadow-card' : 'text-ink-mute hover:text-ink'}`}>
+              Overview
+            </button>
+            <button onClick={() => setTab('chat')} className={`rounded px-2.5 py-1 transition ${tab === 'chat' ? 'bg-surface text-ink shadow-card' : 'text-ink-mute hover:text-ink'}`}>
+              Chat
+            </button>
+          </div>
+        )}
       </header>
 
-      <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-reading space-y-9 px-4 py-8 sm:py-10">
-          {loading || !project ? (
-            <div className="pt-20 text-center text-sm text-ink-mute">Loading project…</div>
-          ) : (
-            <>
-              <div>
-                <h1 className="text-[26px] font-semibold tracking-tight text-ink sm:text-[28px]">{project.title}</h1>
-                {project.description && <p className="mt-1 text-sm text-ink-mute">{project.description}</p>}
-                {project.summary && <p className="mt-4 text-[16px] leading-relaxed text-ink-soft">{project.summary}</p>}
-              </div>
+      <main ref={scrollRef} className="flex-1 overflow-y-auto">
+        {loading || !project ? (
+          <div className="pt-20 text-center text-sm text-ink-mute">Loading project…</div>
+        ) : tab === 'overview' ? (
+          <div className="mx-auto max-w-reading space-y-9 px-4 py-8 sm:py-10">
+            <div>
+              <h1 className="text-[26px] font-semibold tracking-tight text-ink sm:text-[28px]">{project.title}</h1>
+              {project.description && <p className="mt-1 text-sm text-ink-mute">{project.description}</p>}
+              {project.summary && <p className="mt-4 text-[16px] leading-relaxed text-ink-soft">{project.summary}</p>}
+            </div>
 
-              {project.memories.length === 0 && runs.length === 0 && (
-                <p className="text-sm text-ink-mute">Nothing tracked yet — details will show up as things get sorted out.</p>
-              )}
+            {project.memories.length === 0 && runs.length === 0 && (
+              <p className="text-sm text-ink-mute">Nothing tracked yet — details will show up as things get sorted out.</p>
+            )}
 
-              {project.memories.length > 0 && (
-                <section className="space-y-2.5">
-                  <SectionLabel>Core details</SectionLabel>
-                  {orderedFacts(project.memories).map((m, i) => (
-                    <FactCard key={i} fact={m} />
+            {project.memories.length > 0 && (
+              <section className="space-y-2.5">
+                <SectionLabel>Core details</SectionLabel>
+                {orderedFacts(project.memories).map((m, i) => (
+                  <FactCard key={i} fact={m} />
+                ))}
+              </section>
+            )}
+
+            {runs.length > 0 && (
+              <section>
+                <SectionLabel>Latest activity</SectionLabel>
+                <div className="mt-2.5 space-y-2">
+                  {visibleRuns.map((r) => (
+                    <RunCard key={r.id} run={r} />
                   ))}
-                </section>
-              )}
-
-              {runs.length > 0 && (
-                <section>
-                  <SectionLabel>Latest activity</SectionLabel>
-                  <div className="mt-2.5 space-y-2">
-                    {visibleRuns.map((r) => (
-                      <RunCard key={r.id} run={r} />
-                    ))}
-                  </div>
-                  {runs.length > 3 && (
-                    <button onClick={() => setShowAllRuns((v) => !v)} className="mt-2 text-xs font-medium text-accent hover:brightness-90">
-                      {showAllRuns ? 'Show less' : `View all ${runs.length}`}
-                    </button>
-                  )}
-                </section>
-              )}
-            </>
-          )}
-        </div>
+                </div>
+                {runs.length > 3 && (
+                  <button onClick={() => setShowAllRuns((v) => !v)} className="mt-2 text-xs font-medium text-accent hover:brightness-90">
+                    {showAllRuns ? 'Show less' : `View all ${runs.length}`}
+                  </button>
+                )}
+              </section>
+            )}
+          </div>
+        ) : (
+          <div className="mx-auto max-w-reading px-4 py-6">
+            {messages.length === 0 ? (
+              <div className="pt-16 text-center text-sm text-ink-mute">Ask me anything about {project.title} — I'll keep to this project.</div>
+            ) : (
+              <div className="space-y-6">
+                {messages.map((m) => (
+                  <MessageRow key={m.id} message={m} sessionId={projSession ?? ''} />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </main>
+
+      {project && (
+        <footer className="border-t border-line bg-bg/80 px-4 py-3 backdrop-blur">
+          <div className="mx-auto flex max-w-reading items-end gap-2">
+            <div className="flex flex-1 items-end rounded-xl border border-line bg-surface px-3 py-2 shadow-card transition focus-within:border-accent">
+              <textarea
+                ref={taRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    send()
+                  }
+                }}
+                rows={1}
+                placeholder={`Message about ${project.title}…`}
+                className="max-h-40 flex-1 resize-none bg-transparent py-1 text-[15px] leading-relaxed text-ink outline-none placeholder:text-ink-mute"
+              />
+            </div>
+            <button
+              onClick={send}
+              disabled={!input.trim()}
+              title="Send"
+              className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent text-on-accent shadow-ambient transition enabled:hover:brightness-110 disabled:opacity-30"
+            >
+              <ArrowUp />
+            </button>
+          </div>
+        </footer>
+      )}
     </div>
   )
 }
@@ -788,7 +914,7 @@ function TaskRunner({ tasks, onClose, onCancel }: { tasks: Working[]; onClose: (
   }, [])
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-bg">
+    <div className="fixed inset-0 z-50 flex flex-col bg-bg animate-fade-in">
       <header className="flex items-center gap-2 border-b border-line bg-bg/80 px-4 py-2.5 backdrop-blur sm:px-6">
         <button onClick={onClose} title="Back" className="-ml-1 grid h-9 w-9 place-items-center rounded-md text-ink-soft hover:bg-surface-mid hover:text-ink">
           <BackIcon />
@@ -841,7 +967,7 @@ function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: str
   if (message.role === 'user') {
     if (message.audio) return <VoiceBubble message={message} />
     return (
-      <div className="flex justify-end">
+      <div className="flex justify-end animate-fade-in-up">
         <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-surface-low px-4 py-2.5 text-[15px] leading-relaxed text-ink">
           {message.content}
         </div>
@@ -850,7 +976,7 @@ function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: str
   }
 
   return (
-    <div className="flex gap-3">
+    <div className="flex gap-3 animate-fade-in-up">
       <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-full bg-accent text-xs font-semibold text-on-accent">S</span>
       <div className="min-w-0 flex-1 space-y-1.5 pt-0.5">
         {message.reasoning &&

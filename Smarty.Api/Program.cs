@@ -185,6 +185,18 @@ app.MapPost("/api/session/{id}/message", (string id, SessionMessage body) =>
     return Results.Ok();
 });
 
+// Pin a session to a project: it becomes that project's dedicated chat — the orchestrator stays scoped
+// to the project (topic, tools, memory). Called once when the project's chat is opened. Pass null to unpin.
+app.MapPost("/api/session/{id}/project", (string id, ProjectPin body) =>
+{
+    var slug = string.IsNullOrWhiteSpace(body?.Slug) ? null : body!.Slug!.Trim().ToLowerInvariant();
+    if (slug is not null && !projects.Exists(slug)) return Results.NotFound(new { error = "no such project" });
+    var session = sessions.GetOrCreate(id);
+    session.PinnedProject = slug;
+    session.CurrentProject = slug;
+    return Results.Ok();
+});
+
 // Thumbs up/down on an assistant message — the label that turns a logged interaction into a good/bad
 // training example. Joins back to the interaction log by (session, msg_id).
 app.MapPost("/api/session/{id}/feedback", (string id, FeedbackMessage body) =>
@@ -456,5 +468,6 @@ internal sealed record ChatRequest(
 internal sealed record ChatMessage(string Role, string Content);
 
 internal sealed record SessionMessage(string Content);
+internal sealed record ProjectPin(string? Slug);
 
 internal sealed record FeedbackMessage(int MessageId, string Rating, string? Note);

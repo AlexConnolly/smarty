@@ -118,6 +118,19 @@ export async function sendFeedback(
   }
 }
 
+/** Pin a session to a project so it becomes that project's dedicated, scoped chat. */
+export async function pinSessionToProject(sessionId: string, slug: string): Promise<void> {
+  try {
+    await fetch(`/api/session/${sessionId}/project`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slug }),
+    })
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Post a user message to the session. The reply (and any later results) arrive on the stream. */
 export async function sendMessage(sessionId: string, content: string): Promise<void> {
   await fetch(`/api/session/${sessionId}/message`, {

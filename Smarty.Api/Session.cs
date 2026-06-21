@@ -59,6 +59,12 @@ public sealed class Session
     /// the talk clearly moves on. Null = no project in focus (the default).</summary>
     public string? CurrentProject { get; set; }
 
+    /// <summary>When set, this whole session is the DEDICATED chat for one project (its own conversation,
+    /// opened from the project page). The orchestrator stays scoped to it — project-only topic, tools, and
+    /// memory — and won't wander. Distinct from <see cref="CurrentProject"/>, which is a soft, shifting
+    /// focus on the general chat.</summary>
+    public string? PinnedProject { get; set; }
+
     public DateTimeOffset LastActivity { get; private set; } = DateTimeOffset.UtcNow;
 
     public int NextMessageId()
