@@ -13,6 +13,7 @@ public sealed class Project
     public string Description { get; set; } = "";
     public string Status { get; set; } = "active";   // active | done | archived
     public DateTimeOffset Created { get; set; }
+    public string? Summary { get; set; }              // short live narrative of where it stands (regenerated on touch)
 }
 
 /// <summary>
@@ -71,6 +72,19 @@ public sealed class ProjectStore
     {
         slug = slug.Trim().ToLowerInvariant();
         lock (_lock) return _projects.FirstOrDefault(p => p.Slug == slug);
+    }
+
+    /// <summary>Update a project's short live summary (regenerated in the background on each touch).</summary>
+    public void SetSummary(string slug, string summary)
+    {
+        slug = slug.Trim().ToLowerInvariant();
+        lock (_lock)
+        {
+            var p = _projects.FirstOrDefault(x => x.Slug == slug);
+            if (p is null) return;
+            p.Summary = summary;
+            Save();
+        }
     }
 
     public bool Exists(string slug) => Get(slug) is not null;

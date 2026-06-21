@@ -89,13 +89,8 @@ string runsPath = builder.Configuration["Projects:RunsPath"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "data", "runs.json");
 var projectRuns = new ProjectRunStore(runsPath, json);
 
-// Each project's living README — a plain-language summary regenerated whenever the project is touched.
-string readmesDir = builder.Configuration["Projects:ReadmesDir"]
-    ?? Path.Combine(builder.Environment.ContentRootPath, "data", "readmes");
-var projectReadmes = new ProjectReadmeStore(readmesDir);
-
 var sessions = new SessionStore();
-var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory, projects, projectRuns, projectReadmes);
+var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory, projects, projectRuns);
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok", model = defaultModel }));
 
@@ -123,7 +118,7 @@ app.MapGet("/api/projects/{slug}", (string slug) =>
         title = p.Title,
         description = p.Description,
         status = p.Status,
-        readme = projectReadmes.Get(p.Slug),
+        summary = p.Summary,
         memories = memory.Active(p.Slug)
             .OrderByDescending(f => f.Asserted)
             .Select(f => new { type = f.Type, key = f.Key, value = f.Value, context = f.Context, asserted = f.Asserted }),

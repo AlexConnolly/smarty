@@ -273,10 +273,13 @@ export default function App() {
           onClick={openDrawer}
           title="Projects"
           aria-label="Open projects"
-          className="group grid h-7 w-7 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-sm font-bold text-white shadow-lg shadow-indigo-500/20 transition hover:brightness-110"
+          className="-ml-1 grid h-9 w-9 shrink-0 place-items-center rounded-lg text-slate-300 hover:bg-white/5"
         >
-          S
+          <BurgerIcon />
         </button>
+        <span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-sm font-bold text-white shadow-lg shadow-indigo-500/20">
+          S
+        </span>
         <h1 className="text-sm font-semibold tracking-tight">Smarty</h1>
         <span className="hidden text-xs text-slate-500 sm:inline">personal assistant</span>
         <TaskPill count={working.length} onOpen={() => setTasksOpen(true)} />
@@ -453,12 +456,9 @@ function ProjectOverview({
         >
           <BackIcon />
         </button>
-        <div className="min-w-0">
-          <h1 className="truncate text-sm font-semibold tracking-tight text-slate-100">
-            {project?.title ?? (loading ? 'Loading…' : 'Project')}
-          </h1>
-          {project?.description && <p className="truncate text-xs text-slate-500">{project.description}</p>}
-        </div>
+        <h1 className="min-w-0 truncate text-sm font-medium tracking-tight text-slate-300">
+          {project?.title ?? (loading ? 'Loading…' : 'Project')}
+        </h1>
       </header>
 
       <main className="flex-1 overflow-y-auto">
@@ -467,57 +467,42 @@ function ProjectOverview({
             <div className="pt-20 text-center text-sm text-slate-500">Loading project…</div>
           ) : (
             <>
-              <section>
-                {project.readme ? (
-                  <div className="rounded-2xl border border-white/5 bg-white/[0.03] px-5 py-4">
-                    <Markdown text={project.readme} />
-                  </div>
-                ) : (
-                  <div className="rounded-2xl border border-dashed border-white/10 px-5 py-4 text-sm text-slate-500">
-                    A summary will appear here once there's something to catch up on.
-                  </div>
-                )}
-              </section>
+              <header>
+                <h1 className="text-xl font-semibold tracking-tight text-slate-100">{project.title}</h1>
+                {project.description && <p className="mt-0.5 text-sm text-slate-500">{project.description}</p>}
+                {project.summary && <p className="mt-3 text-[15px] leading-relaxed text-slate-300">{project.summary}</p>}
+              </header>
 
-              <section>
-                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  Recent activity
-                </h2>
-                {runs.length === 0 ? (
-                  <p className="text-sm text-slate-500">No background work has run for this project yet.</p>
-                ) : (
-                  <>
-                    <div className="space-y-2">
-                      {visibleRuns.map((r) => (
-                        <RunCard key={r.id} run={r} />
-                      ))}
-                    </div>
-                    {runs.length > 3 && (
-                      <button
-                        onClick={() => setShowAllRuns((v) => !v)}
-                        className="mt-2 text-xs font-medium text-indigo-300 hover:text-indigo-200"
-                      >
-                        {showAllRuns ? 'Show less' : `View all ${runs.length} runs`}
-                      </button>
-                    )}
-                  </>
-                )}
-              </section>
+              {project.memories.length === 0 && runs.length === 0 && (
+                <p className="text-sm text-slate-500">Nothing tracked yet — details will show up as things get sorted out.</p>
+              )}
 
-              <section>
-                <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  What I know ({project.memories.length})
-                </h2>
-                {project.memories.length === 0 ? (
-                  <p className="text-sm text-slate-500">Nothing recorded for this project yet.</p>
-                ) : (
-                  <div className="grid gap-2 sm:grid-cols-2">
-                    {project.memories.map((m, i) => (
-                      <FactCard key={i} fact={m} />
+              {project.memories.length > 0 && (
+                <section className="grid gap-2 sm:grid-cols-2">
+                  {orderedFacts(project.memories).map((m, i) => (
+                    <FactCard key={i} fact={m} />
+                  ))}
+                </section>
+              )}
+
+              {runs.length > 0 && (
+                <section>
+                  <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Latest activity</h2>
+                  <div className="space-y-2">
+                    {visibleRuns.map((r) => (
+                      <RunCard key={r.id} run={r} />
                     ))}
                   </div>
-                )}
-              </section>
+                  {runs.length > 3 && (
+                    <button
+                      onClick={() => setShowAllRuns((v) => !v)}
+                      className="mt-2 text-xs font-medium text-indigo-300 hover:text-indigo-200"
+                    >
+                      {showAllRuns ? 'Show less' : `View all ${runs.length} runs`}
+                    </button>
+                  )}
+                </section>
+              )}
             </>
           )}
         </div>
@@ -623,6 +608,12 @@ function classifyFact(fact: ProjectMemory): FactKind {
   return 'plain'
 }
 
+// A defined order so the overview reads like a story: where → when → who → cost → links → the rest.
+const FACT_RANK: Record<FactKind, number> = { location: 0, date: 1, person: 2, phone: 3, email: 4, money: 5, url: 6, plain: 7 }
+function orderedFacts(facts: ProjectMemory[]): ProjectMemory[] {
+  return [...facts].sort((a, b) => FACT_RANK[classifyFact(a)] - FACT_RANK[classifyFact(b)])
+}
+
 function FactCard({ fact }: { fact: ProjectMemory }) {
   const kind = classifyFact(fact)
   const label = fact.key.replace(/[_-]+/g, ' ')
@@ -721,6 +712,15 @@ function FactShell({ label, icon, className = '', children }: { label: string; i
   )
 }
 
+function BurgerIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+      <line x1="3" y1="6" x2="21" y2="6" />
+      <line x1="3" y1="12" x2="21" y2="12" />
+      <line x1="3" y1="18" x2="21" y2="18" />
+    </svg>
+  )
+}
 function PinIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

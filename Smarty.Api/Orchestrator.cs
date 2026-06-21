@@ -22,7 +22,6 @@ public sealed class Orchestrator
     private readonly MemoryStore _memory;
     private readonly ProjectStore _projects;
     private readonly ProjectRunStore _runs;
-    private readonly ProjectReadmeStore _readmes;
 
     // Bound the per-turn tool loop: a turn may call a data tool (list/status), read the result, then
     // voice it — but it must not spin.
@@ -34,7 +33,7 @@ public sealed class Orchestrator
     private static string Snip(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : "…" + s[^max..]).Replace("\n", " ⏎ ");
 
-    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects, ProjectRunStore runs, ProjectReadmeStore readmes)
+    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects, ProjectRunStore runs)
     {
         _provider = new OllamaModelProvider(ollamaBaseUrl);
         _model = model;
@@ -45,7 +44,6 @@ public sealed class Orchestrator
         _memory = memory;
         _projects = projects;
         _runs = runs;
-        _readmes = readmes;
         // The orchestrator's tools = task tools + global memory-access + project create/list (all executed
         // in HandleToolCall by name).
         _orchestratorTools = OrchestratorTools
@@ -350,21 +348,11 @@ public sealed class Orchestrator
                 if (!string.IsNullOrWhiteSpace(p.Description)) sb.Append($" — {p.Description}");
                 sb.Append(".\n\n");
 
-                // Live facts FIRST — these are always current. The narrative summary is regenerated in the
-                // background so it can lag a few seconds behind a just-made change; the facts can't, so they're
-                // the source of truth to report from.
+                // The live facts ARE the state — always current. Report from these.
                 if (facts.Count > 0)
-                {
-                    sb.Append("On record now (current):\n");
                     foreach (var f in facts.OrderBy(f => f.Type, StringComparer.Ordinal))
                         sb.Append($"- {f.Key}: {f.Value}{(string.IsNullOrWhiteSpace(f.Context) ? "" : $" ({f.Context})")}\n");
-                    sb.Append('\n');
-                }
-
-                var readme = _readmes.Get(slug);
-                if (!string.IsNullOrWhiteSpace(readme))
-                    sb.Append("Summary:\n").Append(readme!.Trim());
-                else if (facts.Count == 0)
+                else
                     sb.Append("Nothing recorded yet — it's only just been set up.");
 
                 var runs = _runs.CountFor(slug);
@@ -379,8 +367,8 @@ public sealed class Orchestrator
                     call.Arguments.GetStringOrNull("description") ?? "");
                 if (newSlug is not null)
                 {
-                    session.CurrentProject = newSlug;        // focus it, so details stated next land on the project
-                    _ = RegenerateReadmeAsync(newSlug);      // initial README in the background
+                    session.CurrentProject = newSlug; // focus it, so details stated next land on the project
+                    _ = RegenerateSummaryAsync(newSlug);
                 }
                 return Data(msg);
             }
@@ -629,9 +617,8 @@ public sealed class Orchestrator
                 Result = result,
             };
             _runs.Add(run);
-            // The project was just touched — refresh its living README, and give the run a short label, both
-            // in the background (neither blocks the user-facing reply).
-            _ = RegenerateReadmeAsync(task.Project!);
+            // Refresh the project's summary + give the run a short label, both in the background.
+            _ = RegenerateSummaryAsync(task.Project!);
             _ = GenerateRunTitleAsync(run.Id, task.Description, result);
         }
 
@@ -678,74 +665,51 @@ public sealed class Orchestrator
         }
     }
 
-    private const string ReadmeSystem =
-        "Write a SHORT status note for a project — like a quick note to yourself, not a report. Format: one " +
-        "brief line on the STATUS (where it stands overall, e.g. \"Booked — a few bits left\"), then a few " +
-        "tight bullets with the concrete facts (decisions, bookings, dates, names, numbers, findings). The " +
-        "opening line is a status, NOT a recap — do not cram every fact into it and then repeat them in the " +
-        "bullets. Hard rules: NO section headings (no \"## \"), NO bold field-labels (no \"**Venue:**\"), NO " +
-        "fluff, padding, emoji, or motivational lines, NO invented details. Keep it minimal — if little is " +
-        "known, just one line. Report every fact you're given as settled; never call something unknown when " +
-        "it's listed. No internal jargon (slugs, ids, tool names). Output ONLY the markdown.";
+    private static string Head(string s, int max) =>
+        string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max].TrimEnd() + "…");
 
-    // Regenerate a project's living README from its current facts + run history — a plain-language catch-up
-    // the overview shows instead of raw key/value jargon. Runs in the background whenever the project is
-    // touched (a run finishes, or it's created). Best-effort: never throws into the caller.
-    private async Task RegenerateReadmeAsync(string slug, CancellationToken ct = default)
+    // Refresh a project's SHORT narrative summary — one or two sentences on where it stands, like telling a
+    // friend. Stored on the project (not a separate doc), regenerated in the background whenever it's touched.
+    // The rich facts carry the detail; this carries the story. Best-effort.
+    private async Task RegenerateSummaryAsync(string slug)
     {
         try
         {
             var p = _projects.Get(slug);
             if (p is null) return;
-
             var facts = _memory.Active(slug);
-            var runs = _runs.ForProject(slug);
 
-            var state = new StringBuilder();
-            state.Append($"Project: {p.Title}\n");
-            if (!string.IsNullOrWhiteSpace(p.Description)) state.Append($"About: {p.Description}\n");
-            state.Append("\nSettled facts — these are DECIDED/booked, report them as such (do not say they're unknown):\n");
-            if (facts.Count == 0) state.Append("- (nothing decided yet)\n");
+            var state = new StringBuilder($"Project: {p.Title}");
+            if (!string.IsNullOrWhiteSpace(p.Description)) state.Append($" ({p.Description})");
+            state.Append('\n');
+            if (facts.Count == 0) state.Append("Nothing recorded yet.\n");
             else
                 foreach (var f in facts.OrderBy(f => f.Type, StringComparer.Ordinal))
-                    state.Append($"- {f.Key}: {f.Value}{(string.IsNullOrWhiteSpace(f.Context) ? "" : $" ({f.Context})")}\n");
-            state.Append("\nWork done so far (newest first):\n");
-            if (runs.Count == 0) state.Append("- (no background work yet)\n");
-            else
-                foreach (var r in runs.Take(8))
-                    state.Append($"- {r.Task}\n  found: {Head(r.Result ?? "", 800)}\n");
+                    state.Append($"- {f.Key}: {f.Value}\n");
 
             var request = new ModelRequest
             {
                 Model = _model,
-                SystemPrompt = ReadmeSystem,
-                Messages = new List<Message>
-                {
-                    Message.User("Here is the project's current state:\n\n" + state.ToString().TrimEnd() +
-                                 "\n\nWrite the project's README now."),
-                },
+                SystemPrompt =
+                    "In ONE or two sentences, say where this project stands, in a natural tone. Use ONLY the " +
+                    "facts given — do NOT invent numbers, names, tasks, or anything not listed (don't guess " +
+                    "what's 'left to do'). Plain prose: no bullets, headings, lists, emoji or fluff. Example " +
+                    "tone: \"Booked at Bella's for the 14th, 10 covers — venue and menu are sorted.\" If barely " +
+                    "started, one short line. Output only the sentence(s).",
+                Messages = new List<Message> { Message.User(state.ToString().TrimEnd()) },
                 Tools = Array.Empty<AgentTool>(),
-                MaxOutputTokens = 1024,
-                TurnTimeout = TimeSpan.FromSeconds(60),
-                Think = false, // a summary — speed over deliberation
+                MaxOutputTokens = 120,
+                TurnTimeout = TimeSpan.FromSeconds(30),
+                Think = false,
             };
-
-            var md = new StringBuilder();
-            await foreach (var ev in _provider.StreamAsync(request, ct).ConfigureAwait(false))
-                if (ev is ModelStreamEvent.Content c) md.Append(c.Text);
-
-            var text = md.ToString().Trim();
-            if (text.Length > 0)
-            {
-                _readmes.Set(slug, text);
-                Trace($"[readme] {slug} refreshed ({text.Length} chars)");
-            }
+            var sb = new StringBuilder();
+            await foreach (var ev in _provider.StreamAsync(request, CancellationToken.None).ConfigureAwait(false))
+                if (ev is ModelStreamEvent.Content c) sb.Append(c.Text);
+            var text = sb.ToString().Trim();
+            if (text.Length > 0) { _projects.SetSummary(slug, text); Trace($"[summary] {slug} ({text.Length} chars)"); }
         }
-        catch (Exception ex) { Trace($"[readme] {slug} failed: {ex.Message}"); }
+        catch (Exception ex) { Trace($"[summary] {slug} failed: {ex.Message}"); }
     }
-
-    private static string Head(string s, int max) =>
-        string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max].TrimEnd() + "…");
 
     // A short human label for a run ("Booked the venue", "Found 3 pubs"), generated in the background so the
     // project overview can list adjustments as tidy titles instead of the verbose delegated-task text.
