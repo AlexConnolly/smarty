@@ -39,6 +39,7 @@ interface UiMessage {
 type Working = { id: string; task: string; startedAt: number }
 
 const SESSION_KEY = 'smarty-session-id'
+const VIEW_KEY = 'smarty-view'
 const REC_BARS = 56
 const EXAMPLES = ['Plan a weekend in Lisbon', "What's the latest tech news?", 'Remember I live in London']
 
@@ -65,8 +66,17 @@ function greetingText(): string {
   return h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening'
 }
 
+function initialView(): 'home' | 'chat' {
+  try {
+    return localStorage.getItem(VIEW_KEY) === 'chat' ? 'chat' : 'home'
+  } catch {
+    return 'home'
+  }
+}
+
 export default function App() {
-  const [view, setView] = useState<'home' | 'chat'>('home')
+  // Remember whether you were on the home or in the conversation, so a refresh lands you back where you were.
+  const [view, setView] = useState<'home' | 'chat'>(initialView)
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [working, setWorking] = useState<Working[]>([])
   const [tasksOpen, setTasksOpen] = useState(false)
@@ -161,6 +171,14 @@ export default function App() {
     if (working.length === 0) setTasksOpen(false)
   }, [working.length])
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(VIEW_KEY, view)
+    } catch {
+      /* ignore */
+    }
+  }, [view])
+
   function goHome() {
     setView('home')
     refreshProjects()
@@ -212,6 +230,11 @@ export default function App() {
     }
     setMessages([])
     setWorking([])
+    try {
+      localStorage.setItem(VIEW_KEY, 'home') // a fresh chat starts you back at the home
+    } catch {
+      /* ignore */
+    }
     window.location.reload()
   }
 
