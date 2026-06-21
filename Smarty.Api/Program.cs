@@ -128,7 +128,7 @@ app.MapGet("/api/projects/{slug}", (string slug) =>
             .OrderByDescending(f => f.Asserted)
             .Select(f => new { type = f.Type, key = f.Key, value = f.Value, context = f.Context, asserted = f.Asserted }),
         runs = projectRuns.ForProject(p.Slug)
-            .Select(r => new { id = r.Id, task = r.Task, status = r.Status, startedAt = r.StartedAt, endedAt = r.EndedAt, steps = r.Steps, result = r.Result }),
+            .Select(r => new { id = r.Id, task = r.Task, title = r.Title, status = r.Status, startedAt = r.StartedAt, endedAt = r.EndedAt, steps = r.Steps, result = r.Result }),
     });
 });
 

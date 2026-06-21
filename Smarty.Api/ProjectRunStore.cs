@@ -21,6 +21,7 @@ public sealed class ProjectRun
     public string Id { get; set; } = "";
     public string Project { get; set; } = "";      // slug
     public string Task { get; set; } = "";
+    public string? Title { get; set; }              // short human label for the run (filled in the background)
     public string Status { get; set; } = "";        // done | cancelled | failed
     public DateTimeOffset StartedAt { get; set; }
     public DateTimeOffset EndedAt { get; set; }
@@ -48,6 +49,18 @@ public sealed class ProjectRunStore
         lock (_lock)
         {
             _runs.Add(run);
+            Save();
+        }
+    }
+
+    /// <summary>Set a run's short title (generated in the background after it's logged).</summary>
+    public void SetTitle(string id, string title)
+    {
+        lock (_lock)
+        {
+            var run = _runs.FirstOrDefault(r => r.Id == id);
+            if (run is null) return;
+            run.Title = title;
             Save();
         }
     }

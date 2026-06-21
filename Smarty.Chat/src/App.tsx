@@ -530,35 +530,22 @@ function ProjectOverview({
   )
 }
 
-// One worker run — collapsed to its task + result, expandable to the full thinking/tool timeline.
+// One worker run — a compact link row (short title + when), expandable to the full thinking/tool timeline.
 function RunCard({ run }: { run: ProjectRun }) {
   const [open, setOpen] = useState(false)
-  const when = new Date(run.startedAt)
+  const title = run.title || run.task
   return (
-    <div className="overflow-hidden rounded-xl border border-white/5 bg-white/[0.03]">
-      <button onClick={() => setOpen((o) => !o)} className="flex w-full items-start gap-3 px-3.5 py-3 text-left hover:bg-white/[0.02]">
+    <div className="overflow-hidden rounded-lg border border-white/5 bg-white/[0.02]">
+      <button onClick={() => setOpen((o) => !o)} className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-white/[0.04]">
         <StatusDot status={run.status} />
-        <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium leading-snug text-slate-200">{run.task}</div>
-          {run.result && !open && (
-            <div className="mt-0.5 line-clamp-2 text-xs leading-snug text-slate-400">{run.result}</div>
-          )}
-          <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500">
-            <span className="uppercase tracking-wide">{run.status}</span>
-            <span>·</span>
-            <span>{when.toLocaleString()}</span>
-            <span>·</span>
-            <span>{run.steps.length} steps</span>
-            <span>·</span>
-            <span className="text-indigo-300/80">{open ? 'hide detail' : 'see what it did'}</span>
-          </div>
-        </div>
-        <span className={`mt-1 shrink-0 text-slate-500 transition-transform ${open ? 'rotate-90' : ''}`}>
+        <span className="min-w-0 flex-1 truncate text-sm text-slate-200">{title}</span>
+        <span className="shrink-0 text-[11px] tabular-nums text-slate-500">{relTime(run.startedAt)}</span>
+        <span className={`shrink-0 text-slate-600 transition-transform ${open ? 'rotate-90' : ''}`}>
           <ChevronIcon />
         </span>
       </button>
       {open && (
-        <div className="space-y-2 border-t border-white/5 px-3.5 py-3">
+        <div className="space-y-2 border-t border-white/5 px-3 py-3">
           {run.steps.map((s, i) => (
             <StepRow key={i} step={s} />
           ))}
@@ -572,6 +559,16 @@ function RunCard({ run }: { run: ProjectRun }) {
       )}
     </div>
   )
+}
+
+function relTime(iso: string): string {
+  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000))
+  if (s < 60) return 'just now'
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  return `${Math.floor(h / 24)}d ago`
 }
 
 function StepRow({ step }: { step: RunStep }) {

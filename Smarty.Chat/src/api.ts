@@ -49,6 +49,7 @@ export interface RunStep {
 export interface ProjectRun {
   id: string
   task: string
+  title?: string | null
   status: string
   startedAt: string
   endedAt: string

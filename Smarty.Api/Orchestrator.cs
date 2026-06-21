@@ -617,7 +617,7 @@ public sealed class Orchestrator
         // it isn't shown anywhere). Read back by the project overview.
         if (!string.IsNullOrEmpty(task.Project) && transcript is not null)
         {
-            _runs.Add(new ProjectRun
+            var run = new ProjectRun
             {
                 Id = Guid.NewGuid().ToString("N")[..8],
                 Project = task.Project!,
@@ -627,9 +627,12 @@ public sealed class Orchestrator
                 EndedAt = DateTimeOffset.UtcNow,
                 Steps = BuildSteps(transcript),
                 Result = result,
-            });
-            // The project was just touched — refresh its living README in the background.
+            };
+            _runs.Add(run);
+            // The project was just touched — refresh its living README, and give the run a short label, both
+            // in the background (neither blocks the user-facing reply).
             _ = RegenerateReadmeAsync(task.Project!);
+            _ = GenerateRunTitleAsync(run.Id, task.Description, result);
         }
 
         // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
@@ -676,16 +679,14 @@ public sealed class Orchestrator
     }
 
     private const string ReadmeSystem =
-        "You maintain a project's README — a factual, information-dense catch-up, NOT a pep talk. Write only " +
-        "concrete specifics that are actually known: decisions made, dates, names, places, addresses, numbers, " +
-        "options found, and what each piece of work actually turned up. Use short ## sections and bullet " +
-        "points of real facts. Hard rules: NO filler, NO restating the obvious, NO motivational or emotional " +
-        "padding, NO emoji, NO inventing details that aren't given. Every settled fact you're given is a real " +
-        "decision — report it; never claim something is unknown/unrecorded when it's listed. If something " +
-        "genuinely isn't given, just leave it out — don't pad. Prefer specifics (\"Booked Bella's Italian — " +
-        "14th, 7pm, 10 covers\") over sentiment (\"a lovely evening to make her feel special\"). Only when " +
-        "there are NO settled facts at all, say in one line that it's just getting started. No internal jargon " +
-        "(slugs, ids, tool names). Output ONLY the markdown.";
+        "Write a SHORT status note for a project — like a quick note to yourself, not a report. Format: one " +
+        "brief line on the STATUS (where it stands overall, e.g. \"Booked — a few bits left\"), then a few " +
+        "tight bullets with the concrete facts (decisions, bookings, dates, names, numbers, findings). The " +
+        "opening line is a status, NOT a recap — do not cram every fact into it and then repeat them in the " +
+        "bullets. Hard rules: NO section headings (no \"## \"), NO bold field-labels (no \"**Venue:**\"), NO " +
+        "fluff, padding, emoji, or motivational lines, NO invented details. Keep it minimal — if little is " +
+        "known, just one line. Report every fact you're given as settled; never call something unknown when " +
+        "it's listed. No internal jargon (slugs, ids, tool names). Output ONLY the markdown.";
 
     // Regenerate a project's living README from its current facts + run history — a plain-language catch-up
     // the overview shows instead of raw key/value jargon. Runs in the background whenever the project is
@@ -745,6 +746,36 @@ public sealed class Orchestrator
 
     private static string Head(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max].TrimEnd() + "…");
+
+    // A short human label for a run ("Booked the venue", "Found 3 pubs"), generated in the background so the
+    // project overview can list adjustments as tidy titles instead of the verbose delegated-task text.
+    private async Task GenerateRunTitleAsync(string runId, string task, string? result)
+    {
+        try
+        {
+            var request = new ModelRequest
+            {
+                Model = _model,
+                SystemPrompt = "Reply with a 3-to-6 word title summarising what was done, in past tense " +
+                               "(e.g. \"Booked the venue\", \"Found 3 pubs\"). No quotes, no punctuation, no " +
+                               "preamble — just the title.",
+                Messages = new List<Message>
+                {
+                    Message.User($"Task: {task}\nResult: {Head(result ?? "", 400)}\n\nTitle:"),
+                },
+                Tools = Array.Empty<AgentTool>(),
+                MaxOutputTokens = 24,
+                TurnTimeout = TimeSpan.FromSeconds(30),
+                Think = false,
+            };
+            var sb = new StringBuilder();
+            await foreach (var ev in _provider.StreamAsync(request, CancellationToken.None).ConfigureAwait(false))
+                if (ev is ModelStreamEvent.Content c) sb.Append(c.Text);
+            var title = sb.ToString().Trim().Trim('"', '.', '\'').Trim();
+            if (title.Length is > 0 and <= 80) _runs.SetTitle(runId, title);
+        }
+        catch (Exception ex) { Trace($"[runtitle] {runId} failed: {ex.Message}"); }
+    }
 
     // If the model's reasoning/reply names one of its tools by name but it called nothing, return that tool
     // name (so we can nudge it to actually call it). Matches the literal tool identifiers (e.g. set_memory,
