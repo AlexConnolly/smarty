@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
@@ -10,6 +10,7 @@ import {
   sendMessage,
   transcribe,
   type ProjectDetail,
+  type ProjectMemory,
   type ProjectRun,
   type ProjectSummary,
   type RunStep,
@@ -510,14 +511,9 @@ function ProjectOverview({
                 {project.memories.length === 0 ? (
                   <p className="text-sm text-slate-500">Nothing recorded for this project yet.</p>
                 ) : (
-                  <div className="space-y-1.5">
+                  <div className="grid gap-2 sm:grid-cols-2">
                     {project.memories.map((m, i) => (
-                      <div key={i} className="rounded-xl border border-white/5 bg-white/[0.03] px-3.5 py-2.5">
-                        <div className="text-sm text-slate-200">
-                          <span className="text-slate-400">{m.key}:</span> {m.value}
-                        </div>
-                        {m.context && <div className="mt-0.5 text-xs text-slate-500">{m.context}</div>}
-                      </div>
+                      <FactCard key={i} fact={m} />
                     ))}
                   </div>
                 )}
@@ -604,6 +600,171 @@ function StepRow({ step }: { step: RunStep }) {
       <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-300" />
       <div className="min-w-0 flex-1 whitespace-pre-wrap text-xs leading-relaxed text-slate-300">{step.text}</div>
     </div>
+  )
+}
+
+// ---- rich project facts: render each fact by what it actually is ----
+type FactKind = 'location' | 'email' | 'phone' | 'url' | 'date' | 'money' | 'person' | 'plain'
+
+function classifyFact(fact: ProjectMemory): FactKind {
+  const v = (fact.value || '').trim()
+  const hint = `${fact.type} ${fact.key}`.toLowerCase()
+  if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) return 'email'
+  if (/^https?:\/\//i.test(v)) return 'url'
+  if (/^\+\d[\d\s().-]{6,}\d$/.test(v)) return 'phone' // leading + is a strong phone signal
+  if (/phone|mobile|\btel\b|contact number/.test(hint) && v.replace(/\D/g, '').length >= 7) return 'phone'
+  if (/[£$€]\s?\d|\d+\s?(gbp|usd|eur|pounds?|dollars?|euros?)\b/i.test(v)) return 'money'
+  if (/\b(location|address|venue|place|destination|home|hotel|restaurant|city|country)\b/.test(hint) && v.length > 2)
+    return 'location'
+  if (/\b(date|time|when|deadline|day|schedule)\b/.test(hint) || /\b\d{1,2}(st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(v))
+    return 'date'
+  if (/\b(person|people|contact|wife|husband|friend|sister|brother|partner|guest|colleague|client)\b/.test(hint))
+    return 'person'
+  return 'plain'
+}
+
+function FactCard({ fact }: { fact: ProjectMemory }) {
+  const kind = classifyFact(fact)
+  const label = fact.key.replace(/[_-]+/g, ' ')
+  const ctx = fact.context ? <div className="mt-0.5 text-xs text-slate-500">{fact.context}</div> : null
+
+  if (kind === 'location') {
+    const q = encodeURIComponent(fact.value)
+    return (
+      <FactShell label={label} icon={<PinIcon />} className="overflow-hidden sm:col-span-2">
+        <div className="text-sm text-slate-200">{fact.value}</div>
+        {ctx}
+        <div className="mt-2 overflow-hidden rounded-lg border border-white/10">
+          <iframe
+            title={fact.value}
+            loading="lazy"
+            className="h-36 w-full"
+            style={{ border: 0 }}
+            src={`https://www.google.com/maps?q=${q}&output=embed`}
+          />
+        </div>
+        <a
+          href={`https://www.google.com/maps/search/?api=1&query=${q}`}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-1.5 inline-block text-xs text-indigo-300 hover:text-indigo-200"
+        >
+          Open in Maps ↗
+        </a>
+      </FactShell>
+    )
+  }
+  if (kind === 'email')
+    return (
+      <FactShell label={label} icon={<MailIcon />}>
+        <a href={`mailto:${fact.value}`} className="break-all text-sm text-indigo-300 hover:text-indigo-200">{fact.value}</a>
+        {ctx}
+      </FactShell>
+    )
+  if (kind === 'phone')
+    return (
+      <FactShell label={label} icon={<PhoneIcon />}>
+        <a href={`tel:${fact.value.replace(/[^\d+]/g, '')}`} className="text-sm text-indigo-300 hover:text-indigo-200">{fact.value}</a>
+        {ctx}
+      </FactShell>
+    )
+  if (kind === 'url')
+    return (
+      <FactShell label={label} icon={<LinkIcon />}>
+        <a href={fact.value} target="_blank" rel="noreferrer" className="break-all text-sm text-indigo-300 hover:text-indigo-200">{fact.value}</a>
+        {ctx}
+      </FactShell>
+    )
+  if (kind === 'date')
+    return (
+      <FactShell label={label} icon={<CalendarIcon />}>
+        <div className="text-sm text-slate-200">{fact.value}</div>
+        {ctx}
+      </FactShell>
+    )
+  if (kind === 'money')
+    return (
+      <FactShell label={label} icon={<PoundIcon />}>
+        <div className="text-sm font-medium text-emerald-200">{fact.value}</div>
+        {ctx}
+      </FactShell>
+    )
+  if (kind === 'person') {
+    const initial = (fact.value || '?').trim().charAt(0).toUpperCase()
+    return (
+      <FactShell
+        label={label}
+        icon={<span className="grid h-5 w-5 place-items-center rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 text-[10px] font-bold text-white">{initial}</span>}
+      >
+        <div className="text-sm text-slate-200">{fact.value}</div>
+        {ctx}
+      </FactShell>
+    )
+  }
+  return (
+    <FactShell label={label}>
+      <div className="text-sm text-slate-200">{fact.value}</div>
+      {ctx}
+    </FactShell>
+  )
+}
+
+function FactShell({ label, icon, className = '', children }: { label: string; icon?: ReactNode; className?: string; children: ReactNode }) {
+  return (
+    <div className={`rounded-xl border border-white/5 bg-white/[0.03] px-3.5 py-2.5 ${className}`}>
+      <div className="mb-1 flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-slate-500">
+        {icon && <span className="text-slate-400">{icon}</span>}
+        {label}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+function PinIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0Z" />
+      <circle cx="12" cy="10" r="3" />
+    </svg>
+  )
+}
+function MailIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="2" y="4" width="20" height="16" rx="2" />
+      <path d="m22 7-10 6L2 7" />
+    </svg>
+  )
+}
+function PhoneIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92Z" />
+    </svg>
+  )
+}
+function LinkIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </svg>
+  )
+}
+function CalendarIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="18" rx="2" />
+      <path d="M16 2v4M8 2v4M3 10h18" />
+    </svg>
+  )
+}
+function PoundIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18 7c0-2.2-1.8-4-4-4S10 4.8 10 7v3m-3 0h7M7 21h11c-2 0-3.5-1.5-3.5-3.5V13" />
+    </svg>
   )
 }
 
