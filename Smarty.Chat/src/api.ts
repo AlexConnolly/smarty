@@ -89,13 +89,22 @@ export async function fetchProject(slug: string): Promise<ProjectDetail | null> 
   }
 }
 
+/** A worker has paused mid-task to ask the user something, with a few precomputed answers to pick from. */
+export interface WorkerQuestion {
+  taskId: string
+  question: string
+  options: string[]
+  project?: string | null
+}
+
 export interface SessionHandlers {
   onMsgStart?: (id: number, role: string) => void
   onContent?: (id: number, text: string) => void
   onReasoning?: (id: number, text: string) => void
   onMsgEnd?: (id: number, text?: string) => void
   onWorking?: (id: string, task: string) => void
-  onWorkingDone?: (id: string) => void
+  onWorkingDone?: (id: string, status?: string) => void
+  onQuestion?: (q: WorkerQuestion) => void
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -143,6 +152,16 @@ export async function sendMessage(sessionId: string, content: string): Promise<v
 export async function cancelTask(sessionId: string, taskId: string): Promise<void> {
   const res = await fetch(`/api/session/${sessionId}/task/${encodeURIComponent(taskId)}`, {
     method: 'DELETE',
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+}
+
+/** Answer a worker that paused to ask a question — it resumes from where it left off. */
+export async function answerTask(sessionId: string, taskId: string, content: string): Promise<void> {
+  const res = await fetch(`/api/session/${sessionId}/task/${encodeURIComponent(taskId)}/answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
 }
@@ -212,7 +231,7 @@ function parseFrame(frame: string): Frame | null {
 }
 
 function dispatch(ev: Frame, h: SessionHandlers): void {
-  const d = ev.data as { id: number; role: string; text: string; task: string }
+  const d = ev.data as { id: number; role: string; text: string; task: string; status?: string }
   // Task events carry a string task id, separate from the numeric message id.
   const taskId = String((ev.data as { id?: unknown }).id ?? '')
   switch (ev.event) {
@@ -232,7 +251,22 @@ function dispatch(ev: Frame, h: SessionHandlers): void {
       h.onWorking?.(taskId, d.task)
       break
     case 'working_done':
-      h.onWorkingDone?.(taskId)
+      h.onWorkingDone?.(taskId, d.status)
       break
+    case 'question': {
+      const q = ev.data as {
+        id: string
+        question: string
+        options?: string[]
+        project?: string | null
+      }
+      h.onQuestion?.({
+        taskId: String(q.id),
+        question: q.question,
+        options: q.options ?? [],
+        project: q.project ?? null,
+      })
+      break
+    }
   }
 }

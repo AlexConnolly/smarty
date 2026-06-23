@@ -233,6 +233,31 @@ app.MapDelete("/api/session/{id}/task/{taskId}", (string id, string taskId) =>
     return Results.Ok(new { id = task.Id, status = task.Status });
 });
 
+// Answer a task that paused to ask a question. The worker resumes from where it left off (seeded with its
+// own prior transcript), so it continues with full context. The answer, reply, and any further result all
+// arrive on the session stream.
+app.MapPost("/api/session/{id}/task/{taskId}/answer", (string id, string taskId, SessionMessage body) =>
+{
+    string text = (body?.Content ?? "").Trim();
+    if (text.Length == 0) return Results.BadRequest(new { error = "empty answer" });
+
+    var session = sessions.Get(id);
+    if (session is null) return Results.NotFound(new { error = "session not found" });
+
+    taskId = taskId.TrimStart('#').Trim();
+    if (!session.Tasks.TryGetValue(taskId, out var task))
+        return Results.NotFound(new { error = $"task #{taskId} not found" });
+    if (task.Status != "waiting")
+        return Results.Conflict(new { error = $"task #{task.Id} isn't waiting for an answer (status: {task.Status})" });
+
+    _ = Task.Run(async () =>
+    {
+        try { await orchestrator.AnswerTaskAsync(session, task, text); }
+        catch (Exception ex) { Console.Error.WriteLine($"[answer-task] {ex}"); }
+    });
+    return Results.Ok();
+});
+
 // The session's persistent event stream (SSE). The client keeps this open continuously and replays
 // from `from` on reconnect, so async pushes are never missed. This stream never ends on its own.
 app.MapGet("/api/session/{id}", async (string id, int? from, HttpContext ctx) =>
@@ -376,7 +401,12 @@ string WorkerSystemPrompt() =>
     "- run_shell_command: system info, files, local commands, APIs the web can't reach.\n" +
     "- set_memory / search_memory: store or recall durable facts. To RECORD details you've been GIVEN, just " +
     "save them — don't web-search or 'confirm' what the user already stated.\n" +
-    "Give a clear, complete answer to the task." +
+    "Give a clear, complete answer to the task.\n" +
+    "If you genuinely CAN'T proceed without something only the user can decide (a missing choice, a real " +
+    "ambiguity, a go/no-go) — don't guess and don't give up. Stop and clearly state what you need them to " +
+    "decide, and suggest the few answers you think most likely. Ask ONLY when truly blocked — never to " +
+    "confirm something you can just do. When they answer, you'll continue with everything you've found still " +
+    "in context." +
     HostContext();
 
 (AgentInput input, string prompt) BuildAgent(ChatRequest request)

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Smarty.Agents;
 
 namespace Smarty.Api;
@@ -90,11 +91,16 @@ public sealed class Orchestrator
         "noted, saved, started, changed, checked, booked, cancelled — unless you actually called its tool in " +
         "THIS reply. If your reasoning concludes you should call a tool, EMIT the call; do not just describe " +
         "it and then reply as though it happened (e.g. don't say \"I've noted that\" without calling set_memory).\n" +
-        "- delegate(task): start a new background task — anything needing an action or live/real data. Also " +
-        "say a SHORT, plain acknowledgement — \"Sure, I'll check that\" / \"On it\" / \"Leave it with me\". " +
-        "Don't restate the task, list what you'll do, or pad it; the result comes back later.\n" +
-        "- message_task(id, msg): user refines or adds to something ALREADY running — steer that task; do " +
-        "NOT also delegate (that duplicates the work).\n" +
+        "- delegate(task): start a new background task — anything needing an action or live/real data. In the " +
+        "SAME reply, say one short line naming WHAT you're doing for them — \"Looking up the flight times now\", " +
+        "\"Noting that down\", \"Checking the weather for the weekend\". A single clause that reflects the actual " +
+        "task; don't use a generic filler like \"I'll check that\", don't list steps or pad. Result comes back later.\n" +
+        "  Delegate ONLY genuinely new work. Before delegating, check the tasks already running (listed for you): " +
+        "if one already covers this, do NOT start an overlapping task that repeats it. When the user asks for an " +
+        "EXTRA thing on top of work already running (\"also do X\"), delegate JUST that extra thing — never " +
+        "re-describe the whole job again. The new task's description must contain only the new part.\n" +
+        "- message_task(id, msg): user refines or adds to something ALREADY running, OR answers a task that's " +
+        "WAITING on a question from you — pass it to that task; do NOT also delegate (that duplicates the work).\n" +
         "- cancel_task(id): user backs off (\"never mind\", \"stop\", \"forget it\").\n" +
         "- list_tasks() / task_status(id): what's running / how it's going (use the ids you're shown).\n" +
         "- search_memory(query): recall what you know about the USER — keywords, not sentences. Only when " +
@@ -137,11 +143,10 @@ public sealed class Orchestrator
             // refine-vs-new, cancel). Let the model think here so it gets them right; re-voice
             // turns stay think:false for speed. A pinned project chat uses the narrower, project-only toolset.
             var tools = session.PinnedProject is null ? _orchestratorTools : _pinnedTools;
-            string content = await RunOrchestratorTurnAsync(
+            // The turn persists its own exchange (spoken text + tool calls + results) to session.History.
+            await RunOrchestratorTurnAsync(
                 session, session.History, tools, think: true, ct).ConfigureAwait(false);
             Trace("[turn] orchestrator user-turn done (ack streamed)");
-
-            session.History.Add(Message.Assistant(string.IsNullOrWhiteSpace(content) ? "(on it)" : content));
         }
         finally
         {
@@ -152,8 +157,9 @@ public sealed class Orchestrator
     /// <summary>
     /// Run one orchestrator "turn" as the user sees it (a single assistant message id), looping the model
     /// only when it calls a tool that returns data it then needs to voice (list/status/cancel/message).
-    /// Tool calls and results stay local to this turn; only the final spoken text is persisted by callers.
-    /// Returns the spoken text.
+    /// When run on the live session history, the turn persists its OWN exchange (spoken text + tool calls +
+    /// their results) so the model can see what it already did next turn. Run on a temp convo (the worker
+    /// re-voice), it persists nothing and the caller handles history. Returns the spoken text.
     /// </summary>
     private async Task<string> RunOrchestratorTurnAsync(
         Session session, IReadOnlyList<Message> baseMessages, IReadOnlyList<AgentTool> tools, bool think, CancellationToken ct)
@@ -189,8 +195,16 @@ public sealed class Orchestrator
 
         var spoken = new StringBuilder();
         bool delegatedSomething = false;
+        string? delegatedTask = null; // the description of work just kicked off (for a contextual ack)
         bool anyToolCalled = false; // any tool called across this whole user-turn (incl. earlier iterations)
         bool nudgedNoTool = false;  // we re-prompt at most once if the model named a tool but didn't call it
+        bool spokenFromModel = false; // did the spoken text come from the model inline (vs. a generated ack)?
+
+        // When this turn runs on the live history, we persist the WHOLE exchange below (tool calls + their
+        // results, not just the spoken line) — so next turn the model can see what it already did and won't,
+        // say, re-delegate work that's already running. A temp convo (re-voice) keeps the old behaviour.
+        bool persistTurn = ReferenceEquals(baseMessages, session.History);
+        int persistFrom = convo.Count;
 
         for (int iter = 0; iter < MaxTurnIterations; iter++)
         {
@@ -216,6 +230,7 @@ public sealed class Orchestrator
                     case ModelStreamEvent.Content c:
                         turnText.Append(c.Text);
                         spoken.Append(c.Text);
+                        spokenFromModel = true;
                         session.Append("content", Json(new { id = msgId, text = c.Text }));
                         break;
                     case ModelStreamEvent.Reasoning r:
@@ -286,6 +301,7 @@ public sealed class Orchestrator
             {
                 var r = await HandleToolCall(session, call, ct).ConfigureAwait(false);
                 delegatedSomething |= r.WasDelegate;
+                if (r.DelegatedTask is not null) delegatedTask = r.DelegatedTask;
                 needAnotherTurn |= r.DataReturning;
                 convo.Add(Message.ToolResult(call.Id, call.Name, r.Text));
             }
@@ -294,10 +310,14 @@ public sealed class Orchestrator
                 break; // the spoken text (ack / answer) stands; no tool data to relay
         }
 
-        // Guarantee the conversational ack even if the model jumped straight to delegating with no words.
+        // The model often delegates with everything in its reasoning and NO spoken line, leaving the user
+        // staring at a blank (or a generic filler). Rather than a fixed "On it.", generate one short,
+        // CONTEXTUAL ack from the task it just kicked off, so the user is told what's actually happening.
         if (delegatedSomething && spoken.Length == 0)
         {
-            const string ack = "Sure, I'll check that.";
+            string ack = delegatedTask is not null
+                ? await GenerateDelegateAckAsync(message, delegatedTask, ct).ConfigureAwait(false)
+                : "On it.";
             spoken.Append(ack);
             session.Append("content", Json(new { id = msgId, text = ack }));
         }
@@ -310,6 +330,33 @@ public sealed class Orchestrator
             session.Append("content", Json(new { id = msgId, text = fallback }));
         }
 
+        // Persist this turn's REAL exchange to history — the assistant's tool calls and their results, not
+        // just the spoken line. Without the call + result in history, the model can't see its own past
+        // actions next turn (e.g. that it already delegated the pub research) and re-does them. Reasoning is
+        // dropped to keep history lean; the transient dynamic-context block (before persistFrom) is excluded.
+        if (persistTurn)
+        {
+            for (int i = persistFrom; i < convo.Count; i++)
+            {
+                var m = convo[i];
+                if (m.Role == Role.Assistant)
+                {
+                    bool empty = string.IsNullOrWhiteSpace(m.Content) && (m.ToolCalls is null || m.ToolCalls.Count == 0);
+                    if (empty) continue; // a thinking-only turn with nothing to keep
+                    session.History.Add(Message.Assistant(m.Content, null, m.ToolCalls));
+                }
+                else if (m.Role == Role.Tool)
+                {
+                    session.History.Add(m); // tool result, paired to its call above
+                }
+                // skip Role.System — those are internal nudges/recovery prompts, not real conversation
+            }
+            // An ack/fallback we generated AFTER the loop isn't in any assistant message above — keep it so
+            // the thread reads naturally and the model knows what it told the user.
+            if (!spokenFromModel && spoken.Length > 0)
+                session.History.Add(Message.Assistant(spoken.ToString()));
+        }
+
         // Carry the complete text on msg_end so the client can snap to the authoritative final string —
         // streamed deltas are best-effort for the live "typing" feel; if any were dropped in transit, this
         // self-heals the message without a refresh.
@@ -319,9 +366,44 @@ public sealed class Orchestrator
 
     /// <summary>The outcome of one orchestrator tool call: the text result, whether the model should voice
     /// it next iteration, and whether it kicked off a background task.</summary>
-    private readonly record struct ToolResultInfo(string Text, bool DataReturning, bool WasDelegate);
+    private readonly record struct ToolResultInfo(string Text, bool DataReturning, bool WasDelegate, string? DelegatedTask = null);
 
     private static ToolResultInfo Data(string text) => new(text, DataReturning: true, WasDelegate: false);
+
+    /// <summary>One short, natural, in-language line telling the user what was just kicked off — used when the
+    /// model delegated but said nothing itself. Generated from the task so it's specific, not generic filler.</summary>
+    private async Task<string> GenerateDelegateAckAsync(string userMessage, string task, CancellationToken ct)
+    {
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(userMessage),
+                Message.System(
+                    "You've just quietly started working on this for the user, in the background:\n" + task + "\n\n" +
+                    "Reply with ONE short, natural line telling them you're on it and what you're doing — in the " +
+                    "SAME language as their message above. A single friendly, concrete clause (e.g. \"Looking up " +
+                    "the flight times now.\" / \"Finding a few Covent Garden pubs for you.\"). Don't mention tasks, " +
+                    "workers, delegation or any internal mechanics, don't ask anything, don't pad."),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                SystemPrompt = "You are Smarty, the user's warm, concise personal assistant.",
+                Messages = convo,
+                Think = false, // a quick ack, not a deliberation
+                MaxOutputTokens = 60,
+                TurnTimeout = TimeSpan.FromSeconds(30),
+            };
+            var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
+            var text = response.Content?.Trim();
+            return string.IsNullOrWhiteSpace(text) ? "On it." : text!;
+        }
+        catch
+        {
+            return "On it.";
+        }
+    }
 
     /// <summary>Execute one orchestrator tool call against the session's task registry / stores.</summary>
     private async Task<ToolResultInfo> HandleToolCall(Session session, ToolCall call, CancellationToken ct)
@@ -343,7 +425,7 @@ public sealed class Orchestrator
                 var task = StartTask(session, desc!.Trim(), string.IsNullOrEmpty(project) ? null : project);
                 return new ToolResultInfo(
                     $"Task #{task.Id} started in the background{(task.Project is null ? "" : $" (project: {task.Project})")}; its result will come back to you to relay.",
-                    DataReturning: false, WasDelegate: true);
+                    DataReturning: false, WasDelegate: true, DelegatedTask: desc!.Trim());
             }
 
             case "find_project":
@@ -427,9 +509,18 @@ public sealed class Orchestrator
             case "message_task":
             {
                 if (!TryResolve(session, call, out var t, out var miss)) return Data(miss);
-                if (!t.IsRunning) return Data($"Task #{t.Id} is already {t.Status}; it can't take a message.");
                 var msg = call.Arguments.GetStringOrNull("message");
                 if (string.IsNullOrWhiteSpace(msg)) return Data("No message text was provided.");
+                // A task that's WAITING on a question: this message is the answer — feed it back so the
+                // worker resumes from where it paused (don't just queue it for a running loop).
+                if (t.Status == "waiting")
+                {
+                    _ = Task.Run(() => AnswerTaskAsync(session, t, msg!.Trim()));
+                    return new ToolResultInfo(
+                        $"Answer passed back to task #{t.Id}; it's picking up where it left off.",
+                        DataReturning: false, WasDelegate: false);
+                }
+                if (!t.IsRunning) return Data($"Task #{t.Id} is already {t.Status}; it can't take a message.");
                 t.Inbox.Enqueue(msg!.Trim());
                 return Data($"Message passed along to task #{t.Id}; it'll pick it up shortly.");
             }
@@ -525,14 +616,31 @@ public sealed class Orchestrator
         return task;
     }
 
-    /// <summary>Run a delegated task on a background worker, tracking its progress and any mid-flight
-    /// steering, then re-voice the result (unless it was cancelled, which is acknowledged elsewhere).</summary>
-    private async Task RunWorkerAsync(Session session, TaskInfo task)
+    /// <summary>Run a freshly delegated task: start its worker from the task description.</summary>
+    private Task RunWorkerAsync(Session session, TaskInfo task)
+        => DriveWorker(session, task, task.Description);
+
+    /// <summary>Resume a worker that paused to ask a question: feed the user's answer back in. The worker
+    /// re-runs seeded with its prior transcript, so it continues with full context (a clean, stateless
+    /// resume rather than a live suspended process). Safe to fire-and-forget.</summary>
+    public async Task AnswerTaskAsync(Session session, TaskInfo task, string answer)
+    {
+        EmitMessage(session, "user", answer); // the answer shows in the chat like any user turn
+        task.Pending = null;
+        task.Status = "running";
+        session.Append("working", Json(new { id = task.Id, task = task.Description }));
+        await DriveWorker(session, task, answer).ConfigureAwait(false);
+    }
+
+    /// <summary>Drive a worker for one leg of a (possibly multi-leg, interactive) task: stream its progress,
+    /// then either pause on a question it asked, or finish — recording the run and re-voicing the result.
+    /// The worker is seeded with <see cref="TaskInfo.Conversation"/> (empty on the first leg, the accumulated
+    /// transcript on a resume) so it always has its full prior context.</summary>
+    private async Task DriveWorker(Session session, TaskInfo task, string message)
     {
         string result = "(no result)";
         bool cancelled = false;
-        IReadOnlyList<Message>? transcript = null; // captured for the project run log, even if cancelled
-        Trace($"[worker #{task.Id}] start: {Snip(task.Description, 120)}");
+        Trace($"[worker #{task.Id}] drive: {Snip(message, 120)}");
         try
         {
             var provider = new OllamaModelProvider(_ollamaBaseUrl);
@@ -542,6 +650,9 @@ public sealed class Orchestrator
             {
                 SystemPrompt = _workerSystem() + ProjectContext(task.Project),
                 Model = ModelSpec.Ollama(_model, _ollamaBaseUrl),
+                // Seed with the task's running transcript so a resumed worker keeps everything it found and
+                // the Q&A so far. AnswerStream appends to this list, so afterwards it IS the full transcript.
+                Conversation = task.Conversation,
                 Tools =
                 {
                     ShellTool.Create(),
@@ -560,7 +671,7 @@ public sealed class Orchestrator
             var worker = new SmartyAgent(input);
 
             var thought = new StringBuilder();
-            await foreach (var ev in worker.AnswerStream(task.Description, task.Cts.Token).ConfigureAwait(false))
+            await foreach (var ev in worker.AnswerStream(message, task.Cts.Token).ConfigureAwait(false))
             {
                 switch (ev)
                 {
@@ -585,10 +696,9 @@ public sealed class Orchestrator
                 }
             }
 
-            // Capture the full worker transcript (task → tool calls → results → answer) for the dataset.
+            // Capture the worker transcript (task → tool calls → results → answer) for the dataset.
             if (worker.LastRun is { } run)
             {
-                transcript = run.Messages;
                 _log.Interaction(new
                 {
                     ts = DateTimeOffset.UtcNow,
@@ -616,6 +726,32 @@ public sealed class Orchestrator
         }
 
         if (task.Status == "cancelled") cancelled = true;
+
+        // Did the worker pause to ask the user something rather than finish? We don't guess this from its
+        // prose — we FORCE a structured verdict: a schema-constrained finalization call (below) returns a
+        // real question object or nothing. Only run it when the worker finished cleanly (not cancelled/
+        // failed). If it asked, park the task as "waiting": its transcript is already on task.Conversation,
+        // the question is surfaced to the user, and we neither log a run nor re-voice — the run is paused.
+        var question = (!cancelled && task.Status == "running")
+            ? await FinalizeOutcomeAsync(task, task.Cts.Token).ConfigureAwait(false)
+            : null;
+        if (question is not null)
+        {
+            task.Status = "waiting";
+            task.Pending = question;
+            task.LatestThought = question.Question;
+            session.Append("working_done", Json(new { id = task.Id, status = "waiting" }));
+            session.Append("question", Json(new
+            {
+                id = task.Id,
+                question = question.Question,
+                options = question.Options,
+                project = task.Project,
+            }));
+            Trace($"[worker #{task.Id}] WAITING >>> {Snip(question.Question, 200)}");
+            return;
+        }
+
         task.Result = result;
         if (task.Status == "running") task.Status = "done";
 
@@ -623,9 +759,11 @@ public sealed class Orchestrator
         Trace($"[worker #{task.Id}] RESULT >>> {Snip(result, 500)}");
 
         // Record what the sub-agent did, scoped to its project (work with no project isn't logged here —
-        // it isn't shown anywhere). Read back by the project overview.
-        if (!string.IsNullOrEmpty(task.Project) && transcript is not null)
+        // it isn't shown anywhere). The full accumulated transcript (across any Q&A legs) is on
+        // task.Conversation. Read back by the project overview.
+        if (!string.IsNullOrEmpty(task.Project) && task.Conversation.Count > 0)
         {
+            var transcript = task.Conversation;
             var run = new ProjectRun
             {
                 Id = Guid.NewGuid().ToString("N")[..8],
@@ -944,9 +1082,11 @@ public sealed class Orchestrator
         var running = session.Tasks.Values.Where(t => t.IsRunning)
             .OrderBy(t => int.TryParse(t.Id, out var n) ? n : 0).ToList();
         if (running.Count == 0) return "";
-        var sb = new StringBuilder("\n\nTasks you currently have running in the background (refer to them by id):\n");
+        var sb = new StringBuilder("\n\nTasks ALREADY running in the background (refer to them by id):\n");
         foreach (var t in running)
             sb.Append($"- #{t.Id}: {t.Description}\n");
+        sb.Append("Don't delegate anything that overlaps one of these — it's already being done. If the user " +
+                  "is adding to one, delegate ONLY the genuinely new part (or steer it with message_task).\n");
         return sb.ToString();
     }
 
@@ -968,6 +1108,79 @@ public sealed class Orchestrator
 
     private static string Tail(StringBuilder sb, int max) =>
         sb.Length <= max ? sb.ToString() : sb.ToString(sb.Length - max, max);
+
+    // What we ask the worker to report once it has finished — and the schema we FORCE that report into.
+    private const string FinalizeInstruction =
+        "You have stopped working on the task above. Report your outcome as JSON.\n" +
+        "- If you completed the task or fully answered it, set status = \"done\" (leave question/options empty).\n" +
+        "- ONLY if you are genuinely blocked and cannot proceed without a decision that just the user can make " +
+        "(a real choice or a missing preference — NEVER to confirm something you could simply do), set " +
+        "status = \"question\": put one clear, specific question in \"question\", and the 2–4 most likely short " +
+        "answers in \"options\" (the user can also type their own).\n" +
+        "Decide strictly from the conversation above — don't invent a reason to ask.";
+
+    // A strict JSON Schema for the worker's outcome. Passed to the model as Ollama's `format`, so the reply
+    // is GUARANTEED to parse and to carry a real status — the question is a field, never a guess from prose.
+    private static JsonNode OutcomeSchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["status"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("done", "question") },
+            ["question"] = new JsonObject { ["type"] = "string" },
+            ["options"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+        },
+        ["required"] = new JsonArray("status"),
+    };
+
+    /// <summary>Force the worker's outcome into a structured verdict instead of parsing it out of free text.
+    /// After the worker has finished, one schema-constrained call classifies the run as finished or
+    /// blocked-on-the-user — the model literally cannot return anything but JSON matching
+    /// <see cref="OutcomeSchema"/>. Returns the structured question when blocked, or null when finished (so
+    /// the worker's own answer is relayed verbatim). Best-effort: any failure falls back to "finished".</summary>
+    private async Task<PendingQuestion?> FinalizeOutcomeAsync(TaskInfo task, CancellationToken ct)
+    {
+        try
+        {
+            var convo = new List<Message>(task.Conversation) { Message.System(FinalizeInstruction) };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false, // just classifying a conclusion it already reasoned to — keep it fast
+                ResponseFormat = OutcomeSchema(),
+                MaxOutputTokens = 512,
+                TurnTimeout = TimeSpan.FromSeconds(40),
+            };
+
+            var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return null;
+
+            using var doc = JsonDocument.Parse(response.Content);
+            var root = doc.RootElement;
+            var status = root.TryGetProperty("status", out var s) ? s.GetString() : null;
+            if (!string.Equals(status, "question", StringComparison.OrdinalIgnoreCase)) return null;
+
+            var q = root.TryGetProperty("question", out var qEl) && qEl.ValueKind == JsonValueKind.String
+                ? qEl.GetString()?.Trim()
+                : null;
+            if (string.IsNullOrWhiteSpace(q)) return null; // said "question" but gave none → treat as finished
+
+            var options = new List<string>();
+            if (root.TryGetProperty("options", out var optEl) && optEl.ValueKind == JsonValueKind.Array)
+                foreach (var o in optEl.EnumerateArray())
+                    if (o.ValueKind == JsonValueKind.String && o.GetString()?.Trim() is { Length: > 0 } opt)
+                        options.Add(opt);
+
+            Trace($"[worker #{task.Id}] finalize -> QUESTION: {Snip(q!, 160)}");
+            return new PendingQuestion(q!, options);
+        }
+        catch (Exception ex)
+        {
+            Trace($"[worker #{task.Id}] finalize failed ({ex.Message}) — treating as finished");
+            return null; // never let finalization swallow a real answer; relay verbatim
+        }
+    }
 
     private string Json(object value) => JsonSerializer.Serialize(value, _json);
 

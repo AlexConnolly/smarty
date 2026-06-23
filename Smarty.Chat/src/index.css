@@ -47,6 +47,23 @@ body {
   animation: blink 1s steps(2, start) infinite;
 }
 
+/* A highlight that rolls along the text (instead of the whole thing pulsing) — reads as a soft shine
+   sweeping across, e.g. the live "Thinking…" label. */
+@keyframes shimmer-roll {
+  to {
+    background-position: -200% center;
+  }
+}
+.shimmer {
+  background: linear-gradient(100deg, #9a9ba0 35%, #15171a 50%, #9a9ba0 65%);
+  background-size: 200% auto;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer-roll 1.6s linear infinite;
+}
+
 /* ---- motion: soft, fast, purposeful ---- */
 @keyframes fade-in {
   from {

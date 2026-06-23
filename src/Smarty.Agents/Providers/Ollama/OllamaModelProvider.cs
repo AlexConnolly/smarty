@@ -226,6 +226,11 @@ public sealed class OllamaModelProvider : IModelProvider
             payload["tools"] = tools;
         }
 
+        // Structured outputs: when a schema is supplied, Ollama constrains generation to valid JSON
+        // matching it. Round-trip so the caller's node isn't reparented into our payload.
+        if (request.ResponseFormat is { } format)
+            payload["format"] = JsonNode.Parse(format.ToJsonString());
+
         var options = new JsonObject { ["repeat_last_n"] = 256, ["temperature"] = 0.0 };
         if (request.RepeatPenalty is { } rp && rp > 0)
             options["repeat_penalty"] = rp;

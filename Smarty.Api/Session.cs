@@ -6,13 +6,17 @@ namespace Smarty.Api;
 /// <summary>One buffered Server-Sent Event on a session's stream.</summary>
 public sealed record SessionEvent(string Event, string Data);
 
-/// <summary>A delegated background task the orchestrator can track, peek at, steer, and cancel.</summary>
+/// <summary>A structured question a worker has paused to ask: the question plus a few precomputed answers
+/// (the user can always type their own instead).</summary>
+public sealed record PendingQuestion(string Question, IReadOnlyList<string> Options);
+
+/// <summary>A delegated background task the orchestrator can track, peek at, steer, answer, and cancel.</summary>
 public sealed class TaskInfo
 {
     public required string Id { get; init; }
     public required string Description { get; init; }
     public string? Project { get; init; }            // slug of the project this task runs within, if any
-    public string Status { get; set; } = "running"; // running | done | cancelled | failed
+    public string Status { get; set; } = "running"; // running | waiting | done | cancelled | failed
     public string? LatestThought { get; set; } // the worker's recent reasoning, for status peeks
     public string? Result { get; set; } // the final answer once finished
     public DateTimeOffset StartedAt { get; } = DateTimeOffset.UtcNow;
@@ -21,7 +25,16 @@ public sealed class TaskInfo
     /// <summary>Out-of-band messages handed to the running worker between iterations (steer / interrupt).</summary>
     public ConcurrentQueue<string> Inbox { get; } = new();
 
+    /// <summary>Set while the worker is paused on a question (status == waiting).</summary>
+    public PendingQuestion? Pending { get; set; }
+
+    /// <summary>The worker's accumulated transcript. When the user answers a question, the worker is re-run
+    /// seeded with this, so it continues with its full prior context (findings + the Q&amp;A) — a clean,
+    /// stateless resume rather than a live suspended process.</summary>
+    public List<Message> Conversation { get; set; } = new();
+
     public bool IsRunning => Status == "running";
+    public bool IsActive => Status is "running" or "waiting";
 }
 
 /// <summary>

@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+
 namespace Smarty.Agents;
 
 /// <summary>Why a model turn stopped generating.</summary>
@@ -39,6 +41,11 @@ public sealed class ModelRequest
     /// <summary>Whether the model should produce a chain-of-thought. Off = instant response (used by
     /// the conversational orchestrator, which must reply immediately, not deliberate).</summary>
     public bool Think { get; init; } = true;
+
+    /// <summary>Optional JSON Schema to constrain the model's output (Ollama structured outputs). When set,
+    /// the provider passes it as <c>format</c>, so the response is GUARANTEED to be JSON matching the schema
+    /// — used to force a reliable structured outcome rather than parsing it back out of prose.</summary>
+    public JsonNode? ResponseFormat { get; init; }
 }
 
 /// <summary>What a model provider returns: a single assistant turn.</summary>

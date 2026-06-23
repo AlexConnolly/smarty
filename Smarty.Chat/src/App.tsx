@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 're
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
+  answerTask,
   cancelTask,
   fetchProject,
   fetchProjects,
@@ -16,6 +17,7 @@ import {
   type ProjectSummary,
   type RunStep,
   type SessionHandlers,
+  type WorkerQuestion,
 } from './api'
 import { formatDuration, toWav16k, type RecordedAudio } from './audio'
 
@@ -61,6 +63,27 @@ function getSessionId(): string {
   }
 }
 
+// Reflect the open project in the URL path (/project/<slug>) so it survives a refresh and can be
+// shared/bookmarked. Only the path changes — any query string (e.g. ?s=<session>) is preserved.
+function setProjectPath(slug: string | null) {
+  try {
+    const url = new URL(window.location.href)
+    url.pathname = slug ? `/project/${encodeURIComponent(slug)}` : '/'
+    window.history.pushState({}, '', url)
+  } catch {
+    /* ignore */
+  }
+}
+
+function projectFromPath(): string | null {
+  try {
+    const m = window.location.pathname.match(/^\/project\/([^/]+)\/?$/)
+    return m ? decodeURIComponent(m[1]) : null
+  } catch {
+    return null
+  }
+}
+
 function greetingText(): string {
   const h = new Date().getHours()
   return h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening'
@@ -79,6 +102,8 @@ export default function App() {
   const [view, setView] = useState<'home' | 'chat'>(initialView)
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [working, setWorking] = useState<Working[]>([])
+  // Workers that paused to ask the user something. They sit "in your face" until answered.
+  const [questions, setQuestions] = useState<WorkerQuestion[]>([])
   const [tasksOpen, setTasksOpen] = useState(false)
   const [input, setInput] = useState('')
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -134,12 +159,31 @@ export default function App() {
           content: text && text.length > 0 ? text : m.content,
           thinkMs: m.thinkMs ?? (m.thinkStart ? Date.now() - m.thinkStart : undefined),
         })),
-      onWorking: (id, task) => setWorking((w) => (w.some((x) => x.id === id) ? w : [...w, { id, task, startedAt: Date.now() }])),
+      onWorking: (id, task) => {
+        // Resuming (or starting) clears any pending question for this task.
+        setQuestions((q) => q.filter((x) => x.taskId !== id))
+        setWorking((w) => (w.some((x) => x.id === id) ? w : [...w, { id, task, startedAt: Date.now() }]))
+      },
       onWorkingDone: (id) => setWorking((w) => w.filter((x) => x.id !== id)),
+      onQuestion: (q) => setQuestions((prev) => (prev.some((x) => x.taskId === q.taskId) ? prev : [...prev, q])),
     }
     openSessionStream(sessionId.current, handlers, controller.signal)
     refreshProjects()
     return () => controller.abort()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Deep linking: open whatever project the URL points at on load, and keep in sync with back/forward.
+  useEffect(() => {
+    const initial = projectFromPath()
+    if (initial) openProject(initial, false)
+    const onPop = () => {
+      const slug = projectFromPath()
+      if (slug) openProject(slug, false)
+      else closeProject(false)
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -187,13 +231,23 @@ export default function App() {
     setDrawerOpen(true)
     refreshProjects()
   }
-  async function openProject(slug: string) {
+  // Projects are deep-linked at /project/<slug>, so a refresh (or a shared link) lands you back on the
+  // project page instead of bouncing home. `push` controls whether this opening adds a history entry —
+  // false when we're reacting to the URL itself (initial load / back-forward), true when the user clicked in.
+  async function openProject(slug: string, push = true) {
     setDrawerOpen(false)
+    if (push) setProjectPath(slug)
     setProjectLoading(true)
     setActiveProject(null)
     const detail = await fetchProject(slug)
     setActiveProject(detail)
     setProjectLoading(false)
+    if (!detail) setProjectPath(null) // bad/stale slug — don't leave it in the URL
+  }
+  function closeProject(push = true) {
+    setActiveProject(null)
+    setProjectLoading(false)
+    if (push) setProjectPath(null)
   }
 
   // Sending anything (typed or voice) drops you into the conversation.
@@ -245,6 +299,14 @@ export default function App() {
     } catch {
       /* the stream will restore state if the task is still running */
     }
+  }
+
+  // Answer a worker's question — it resumes from where it paused; the reply comes back in the conversation.
+  function answerQuestion(taskId: string, text: string) {
+    const body = text.trim()
+    if (!body) return
+    setQuestions((q) => q.filter((x) => x.taskId !== taskId))
+    answerTask(sessionId.current, taskId, body).catch(() => {})
   }
 
   // ---- recording ----
@@ -336,16 +398,21 @@ export default function App() {
           <HomeView
             greeting={greeting.current}
             working={working}
+            questions={questions}
             projects={projects}
             onOpenTasks={() => setTasksOpen(true)}
             onOpenProject={openProject}
             onPick={(p) => send(p)}
+            onAnswer={answerQuestion}
           />
         ) : (
           <div className="mx-auto max-w-reading px-4 py-6">
             <div className="space-y-6">
               {messages.map((m) => (
                 <MessageRow key={m.id} message={m} sessionId={sessionId.current} />
+              ))}
+              {questions.map((q) => (
+                <QuestionCard key={q.taskId} q={q} onAnswer={answerQuestion} />
               ))}
             </div>
           </div>
@@ -405,7 +472,7 @@ export default function App() {
       <ProjectsDrawer open={drawerOpen} projects={projects} onClose={() => setDrawerOpen(false)} onPick={openProject} />
 
       {(projectLoading || activeProject) && (
-        <ProjectOverview project={activeProject} loading={projectLoading} onClose={() => setActiveProject(null)} mainSessionId={sessionId.current} />
+        <ProjectOverview project={activeProject} loading={projectLoading} onClose={() => closeProject()} mainSessionId={sessionId.current} />
       )}
 
       {tasksOpen && <TaskRunner tasks={working} onClose={() => setTasksOpen(false)} onCancel={cancelRunningTask} />}
@@ -417,25 +484,40 @@ export default function App() {
 function HomeView({
   greeting,
   working,
+  questions,
   projects,
   onOpenTasks,
   onOpenProject,
   onPick,
+  onAnswer,
 }: {
   greeting: string
   working: Working[]
+  questions: WorkerQuestion[]
   projects: ProjectSummary[]
   onOpenTasks: () => void
   onOpenProject: (slug: string) => void
   onPick: (prompt: string) => void
+  onAnswer: (taskId: string, text: string) => void
 }) {
-  const nothing = working.length === 0 && projects.length === 0
+  const nothing = working.length === 0 && projects.length === 0 && questions.length === 0
   return (
     <div className="mx-auto max-w-reading px-4 py-10 sm:py-14">
       <h1 className="animate-fade-in-up text-[26px] font-semibold tracking-tight text-ink sm:text-[32px]">{greeting}</h1>
       <p className="animate-fade-in-up text-[15px] text-ink-soft" style={{ animationDelay: '40ms' }}>
         {nothing ? 'What can I help you with?' : "Here's what's going on."}
       </p>
+
+      {questions.length > 0 && (
+        <section className="mt-8 animate-fade-in-up" style={{ animationDelay: '60ms' }}>
+          <SectionLabel>Awaiting your answer</SectionLabel>
+          <div className="mt-2.5 space-y-2.5">
+            {questions.map((q) => (
+              <QuestionCard key={q.taskId} q={q} onAnswer={onAnswer} />
+            ))}
+          </div>
+        </section>
+      )}
 
       {working.length > 0 && (
         <section className="mt-8 animate-fade-in-up" style={{ animationDelay: '80ms' }}>
@@ -562,6 +644,64 @@ function ProjectsDrawer({
   )
 }
 
+// ---- contextual project header ----
+// Stable 32-bit hash of a string (FNV-1a) — drives both the fallback gradient's hue and the image "lock"
+// seed, so a given project always gets the same banner.
+function hashNum(s: string): number {
+  let h = 2166136261
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
+}
+
+// Map a project to a GENERIC category keyword for the image search. Deliberately coarse: only a category
+// word leaves the browser, never the project's title or any of its details.
+function bannerKeyword(p: ProjectDetail): string {
+  const t = `${p.title} ${p.description}`.toLowerCase()
+  if (/pub|bar|drink|crawl|beer|cocktail|brewery/.test(t)) return 'pub,bar'
+  if (/wedding|marriage|bride|groom/.test(t)) return 'wedding'
+  if (/party|birthday|celebrat|anniversary|festiv/.test(t)) return 'celebration,party'
+  if (/trip|holiday|travel|flight|vacation|tour|getaway|abroad/.test(t)) return 'travel,landscape'
+  if (/mov(e|ing)|house|home|flat|apartment|relocat/.test(t)) return 'house,home'
+  if (/garden|plant|allotment/.test(t)) return 'garden,plants'
+  if (/christmas|xmas/.test(t)) return 'christmas'
+  if (/food|dinner|restaurant|meal|cook|menu|cater/.test(t)) return 'food,restaurant'
+  if (/work|business|launch|startup|office|client/.test(t)) return 'office,city'
+  if (/concert|gig|music|festival|band/.test(t)) return 'concert,music'
+  return 'abstract,texture'
+}
+
+function ProjectBanner({ project }: { project: ProjectDetail }) {
+  const [imgFailed, setImgFailed] = useState(false)
+  const seed = hashNum(project.slug)
+  const hue = seed % 360
+  const keyword = bannerKeyword(project)
+  // loremflickr: keyword-matched Creative-Commons photos, no API key. `lock` pins one image per project.
+  const src = `https://loremflickr.com/1200/400/${encodeURIComponent(keyword)}?lock=${seed}`
+  const gradient = `linear-gradient(135deg, hsl(${hue} 58% 44%), hsl(${(hue + 38) % 360} 62% 30%))`
+  return (
+    <div className="relative h-40 w-full overflow-hidden rounded-xl shadow-card animate-fade-in sm:h-48" style={{ background: gradient }}>
+      {!imgFailed && (
+        <img
+          src={src}
+          alt=""
+          onError={() => setImgFailed(true)}
+          loading="lazy"
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+      )}
+      {/* legibility scrim under the title */}
+      <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
+      <div className="absolute inset-x-0 bottom-0 p-4 sm:p-5">
+        <h1 className="text-[24px] font-semibold tracking-tight text-white drop-shadow-sm sm:text-[28px]">{project.title}</h1>
+        {project.description && <p className="mt-0.5 line-clamp-1 text-sm text-white/85">{project.description}</p>}
+      </div>
+    </div>
+  )
+}
+
 // ---- Project page: overview + a dedicated, scoped chat about this project ----
 function ProjectOverview({
   project,
@@ -577,6 +717,7 @@ function ProjectOverview({
   const [tab, setTab] = useState<'overview' | 'chat'>('overview')
   const [showAllRuns, setShowAllRuns] = useState(false)
   const [messages, setMessages] = useState<UiMessage[]>([])
+  const [questions, setQuestions] = useState<WorkerQuestion[]>([])
   const [input, setInput] = useState('')
   const runs = project?.runs ?? []
   const visibleRuns = showAllRuns ? runs : runs.slice(0, 3)
@@ -612,11 +753,21 @@ function ProjectOverview({
         onReasoning: (id, text) => upsert(id, (m) => ({ ...m, reasoning: m.reasoning + text, thinkStart: m.thinkStart ?? Date.now() })),
         onMsgEnd: (id, text) =>
           upsert(id, (m) => ({ ...m, streaming: false, content: text && text.length > 0 ? text : m.content, thinkMs: m.thinkMs ?? (m.thinkStart ? Date.now() - m.thinkStart : undefined) })),
+        onWorking: (id) => setQuestions((q) => q.filter((x) => x.taskId !== id)),
+        onQuestion: (q) => setQuestions((prev) => (prev.some((x) => x.taskId === q.taskId) ? prev : [...prev, q])),
       },
       controller.signal,
     )
     return () => controller.abort()
   }, [projSession, slug])
+
+  function answerQuestion(taskId: string, text: string) {
+    const body = text.trim()
+    if (!body || !projSession) return
+    setQuestions((q) => q.filter((x) => x.taskId !== taskId))
+    setTab('chat')
+    answerTask(projSession, taskId, body).catch(() => {})
+  }
 
   useLayoutEffect(() => {
     const el = scrollRef.current
@@ -651,8 +802,9 @@ function ProjectOverview({
             <button onClick={() => setTab('overview')} className={`rounded px-2.5 py-1 transition ${tab === 'overview' ? 'bg-surface text-ink shadow-card' : 'text-ink-mute hover:text-ink'}`}>
               Overview
             </button>
-            <button onClick={() => setTab('chat')} className={`rounded px-2.5 py-1 transition ${tab === 'chat' ? 'bg-surface text-ink shadow-card' : 'text-ink-mute hover:text-ink'}`}>
+            <button onClick={() => setTab('chat')} className={`relative rounded px-2.5 py-1 transition ${tab === 'chat' ? 'bg-surface text-ink shadow-card' : 'text-ink-mute hover:text-ink'}`}>
               Chat
+              {questions.length > 0 && <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-accent blink" />}
             </button>
           </div>
         )}
@@ -664,8 +816,7 @@ function ProjectOverview({
         ) : tab === 'overview' ? (
           <div className="mx-auto max-w-reading space-y-9 px-4 py-8 sm:py-10">
             <div>
-              <h1 className="text-[26px] font-semibold tracking-tight text-ink sm:text-[28px]">{project.title}</h1>
-              {project.description && <p className="mt-1 text-sm text-ink-mute">{project.description}</p>}
+              <ProjectBanner project={project} />
               {project.summary && <p className="mt-4 text-[16px] leading-relaxed text-ink-soft">{project.summary}</p>}
             </div>
 
@@ -675,7 +826,6 @@ function ProjectOverview({
 
             {project.memories.length > 0 && (
               <section className="space-y-2.5">
-                <SectionLabel>Core details</SectionLabel>
                 {orderedFacts(project.memories).map((m, i) => (
                   <FactCard key={i} fact={m} />
                 ))}
@@ -700,12 +850,15 @@ function ProjectOverview({
           </div>
         ) : (
           <div className="mx-auto max-w-reading px-4 py-6">
-            {messages.length === 0 ? (
+            {messages.length === 0 && questions.length === 0 ? (
               <div className="pt-16 text-center text-sm text-ink-mute">Ask me anything about {project.title} — I'll keep to this project.</div>
             ) : (
               <div className="space-y-6">
                 {messages.map((m) => (
                   <MessageRow key={m.id} message={m} sessionId={projSession ?? ''} />
+                ))}
+                {questions.map((q) => (
+                  <QuestionCard key={q.taskId} q={q} onAnswer={answerQuestion} />
                 ))}
               </div>
             )}
@@ -987,6 +1140,18 @@ function elapsed(startedAt: number): string {
 
 // ---- chat messages ----
 function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: string }) {
+  // While the model is still only thinking (no answer text yet) we tick a clock so the timer counts up
+  // live; the moment text starts streaming, thinkMs is frozen and the indicator nudges up to make room.
+  const isAssistant = message.role === 'assistant'
+  const onlyIndicator = isAssistant && message.streaming && message.content.length === 0
+  const thinking = onlyIndicator && !!message.reasoning
+  const [, tick] = useState(0)
+  useEffect(() => {
+    if (!thinking) return
+    const t = setInterval(() => tick((n) => n + 1), 250)
+    return () => clearInterval(t)
+  }, [thinking])
+
   if (message.role === 'user') {
     if (message.audio) return <VoiceBubble message={message} />
     return (
@@ -998,22 +1163,20 @@ function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: str
     )
   }
 
+  const liveSecs = thinking && message.thinkStart ? Math.max(0, Math.round((Date.now() - message.thinkStart) / 1000)) : 0
+  const doneSecs = message.thinkMs ? Math.max(1, Math.round(message.thinkMs / 1000)) : 0
+  const thinkLabel = thinking ? `Thinking… ${liveSecs}s` : doneSecs ? `Thought for ${doneSecs}s` : 'thought'
+
   return (
-    <div className="flex gap-3 animate-fade-in-up">
-      <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-full bg-accent text-xs font-semibold text-on-accent">S</span>
-      <div className="min-w-0 flex-1 space-y-1.5 pt-0.5">
-        {message.reasoning &&
-          (() => {
-            const thinking = message.streaming && message.content.length === 0
-            const secs = message.thinkMs ? Math.max(1, Math.round(message.thinkMs / 1000)) : 0
-            const label = thinking ? 'Thinking…' : secs ? `Thought for ${secs}s` : 'thought'
-            return (
-              <details className="text-xs text-ink-mute marker:text-ink-mute">
-                <summary className={`cursor-pointer select-none text-ink-soft ${thinking ? 'blink' : ''}`}>{label}</summary>
-                <pre className="mt-2 whitespace-pre-wrap font-sans leading-relaxed text-ink-mute">{message.reasoning}</pre>
-              </details>
-            )
-          })()}
+    <div className={`flex gap-3 animate-fade-in-up ${onlyIndicator ? 'items-center' : 'items-start'}`}>
+      <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-accent text-xs font-semibold text-on-accent">S</span>
+      <div className="min-w-0 flex-1 space-y-1.5">
+        {message.reasoning && (
+          <details className="text-xs text-ink-mute marker:text-ink-mute">
+            <summary className={`cursor-pointer select-none ${thinking ? 'shimmer font-medium' : 'text-ink-soft'}`}>{thinkLabel}</summary>
+            <pre className="mt-2 whitespace-pre-wrap font-sans leading-relaxed text-ink-mute">{message.reasoning}</pre>
+          </details>
+        )}
         {message.content ? (
           <div className="text-[15px] leading-relaxed text-ink">
             <Markdown text={message.content} />
@@ -1154,7 +1317,73 @@ function TypingDots() {
   )
 }
 
+// ---- interactive worker question ----
+function QuestionCard({ q, onAnswer }: { q: WorkerQuestion; onAnswer: (taskId: string, text: string) => void }) {
+  const [text, setText] = useState('')
+  function submit(value: string) {
+    const body = value.trim()
+    if (!body) return
+    setText('')
+    onAnswer(q.taskId, body)
+  }
+  return (
+    <div className="overflow-hidden rounded-xl border border-accent/30 bg-accent-soft shadow-card animate-fade-in-up">
+      <div className="px-4 py-3.5">
+        <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-accent">
+          <QuestionIcon />
+          Needs your answer
+        </div>
+        <div className="mt-1.5 text-[15px] leading-relaxed text-ink">{q.question}</div>
+        {q.options.length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {q.options.map((o, i) => (
+              <button
+                key={i}
+                onClick={() => submit(o)}
+                className="rounded-full border border-line bg-surface px-3.5 py-1.5 text-sm text-ink transition hover:border-accent/50 hover:text-accent"
+              >
+                {o}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="mt-3 flex items-center gap-2">
+          <input
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                submit(text)
+              }
+            }}
+            placeholder="Or type your own answer…"
+            className="min-w-0 flex-1 rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink outline-none transition focus:border-accent placeholder:text-ink-mute"
+          />
+          <button
+            onClick={() => submit(text)}
+            disabled={!text.trim()}
+            title="Send answer"
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-on-accent transition enabled:hover:brightness-110 disabled:opacity-30"
+          >
+            <ArrowUp />
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ---- icons ----
+function QuestionIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
+      <line x1="12" y1="17" x2="12.01" y2="17" />
+    </svg>
+  )
+}
 function BurgerIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
