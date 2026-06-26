@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Smarty.Slack</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Reuses the conversational engine (Orchestrator, Session, stores) as-is — Slack only supplies a
+         different system prompt, a project-free toolset, web-only workers, and a Slack output sink. -->
+    <ProjectReference Include="..\src\Smarty.Agents\Smarty.Agents.csproj" />
+    <ProjectReference Include="..\Smarty.Api\Smarty.Api.csproj" />
+  </ItemGroup>
+
+</Project>

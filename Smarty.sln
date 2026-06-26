@@ -17,6 +17,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Smarty.Agents.Tests", "test
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Smarty.Api", "Smarty.Api\Smarty.Api.csproj", "{4F34202E-F92F-4C86-ACDE-564EC3CCE4CF}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Smarty.Slack", "Smarty.Slack\Smarty.Slack.csproj", "{576CA921-273A-4B7B-B355-AA57D91DBC31}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -42,6 +44,10 @@ Global
 		{4F34202E-F92F-4C86-ACDE-564EC3CCE4CF}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{4F34202E-F92F-4C86-ACDE-564EC3CCE4CF}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{4F34202E-F92F-4C86-ACDE-564EC3CCE4CF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{576CA921-273A-4B7B-B355-AA57D91DBC31}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{576CA921-273A-4B7B-B355-AA57D91DBC31}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{576CA921-273A-4B7B-B355-AA57D91DBC31}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{576CA921-273A-4B7B-B355-AA57D91DBC31}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{169E013B-6ED6-4FF7-ACB0-FDCC8DAB80A9} = {230F84CB-8832-4586-8EF9-E563119DB380}

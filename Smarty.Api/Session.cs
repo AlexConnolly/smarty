@@ -6,6 +6,17 @@ namespace Smarty.Api;
 /// <summary>One buffered Server-Sent Event on a session's stream.</summary>
 public sealed record SessionEvent(string Event, string Data);
 
+/// <summary>
+/// An observer of a session's event stream — the seam that lets a non-browser host (e.g. Smarty.Slack)
+/// receive the same logical events the SSE stream carries (msg_start / content / msg_end / working /
+/// working_done / question) and render them its own way, WITHOUT the orchestrator knowing the difference.
+/// The default web app leaves <see cref="Session.Sink"/> null, so its behaviour is completely unchanged.
+/// </summary>
+public interface IEventSink
+{
+    void OnEvent(string @event, string data);
+}
+
 /// <summary>A structured question a worker has paused to ask: the question plus a few precomputed answers
 /// (the user can always type their own instead).</summary>
 public sealed record PendingQuestion(string Question, IReadOnlyList<string> Options);
@@ -80,6 +91,10 @@ public sealed class Session
 
     public DateTimeOffset LastActivity { get; private set; } = DateTimeOffset.UtcNow;
 
+    /// <summary>Optional observer of this session's events. Null in the web app (pure SSE). A non-browser
+    /// host sets this to mirror events to its own channel (Slack, etc.) as they are appended.</summary>
+    public IEventSink? Sink { get; set; }
+
     public int NextMessageId()
     {
         lock (_lock) return _nextMessageId++;
@@ -99,6 +114,10 @@ public sealed class Session
             _events.Add(new SessionEvent(@event, data));
             LastActivity = DateTimeOffset.UtcNow;
         }
+        // Mirror to an attached sink (e.g. Slack). Best-effort: a sink fault must never break the turn or
+        // the SSE buffer above. Null in the web app, so this is a no-op there.
+        try { Sink?.OnEvent(@event, data); }
+        catch (Exception ex) { Console.Error.WriteLine($"[sink] {ex.Message}"); }
         Signal();
     }
 

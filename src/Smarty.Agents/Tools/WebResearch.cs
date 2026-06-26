@@ -16,6 +16,15 @@ namespace Smarty.Agents;
 /// </summary>
 public static class WebResearch
 {
+    /// <summary>An optional time-boxed cache for search results and fetched page text. Defaults to a no-op
+    /// (no caching); a host sets this once at startup (e.g. a <see cref="FileResearchCache"/>) to make
+    /// repeated searches/fetches within the hour reuse the earlier result instead of re-hitting the network.</summary>
+    public static IResearchCache Cache { get; set; } = NullResearchCache.Instance;
+
+    /// <summary>How long a cached search result or page fetch stays fresh.</summary>
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromHours(1);
+
+
     // Present as a real browser. A bare "Mozilla/5.0" plus a custom product token gets 403'd by sites behind
     // Cloudflare/WAFs that block non-browser clients — so we send a full Chrome User-Agent and the headers a
     // browser actually sends, and transparently decompress gzip/brotli responses.
@@ -113,6 +122,11 @@ public static class WebResearch
         if (query.Length == 0)
             return ToolOutput.Error("The query argument was empty.");
 
+        // Reuse an identical recent search rather than re-hitting (and re-tripping the bot-blocks of) the engines.
+        string cacheKey = $"search:{maxResults}:{query.ToLowerInvariant()}";
+        if (Cache.TryGet(cacheKey, out var cachedSearch))
+            return ToolOutput.Ok(cachedSearch);
+
         bool anyBlocked = false;
         var tried = new List<string>();
 
@@ -137,7 +151,9 @@ public static class WebResearch
                 sb.Append($"\n{i + 1}. {hits[i].Title}\n   {hits[i].Url}\n");
                 if (hits[i].Snippet.Length > 0) sb.Append($"   {Truncate(hits[i].Snippet, 240)}\n");
             }
-            return ToolOutput.Ok(sb.ToString().TrimEnd());
+            var resultText = sb.ToString().TrimEnd();
+            Cache.Set(cacheKey, resultText, CacheTtl); // only successful searches are cached; blocks/errors stay retryable
+            return ToolOutput.Ok(resultText);
         }
 
         if (anyBlocked)
@@ -232,49 +248,62 @@ public static class WebResearch
             (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
             return ToolOutput.Error($"'{url}' is not a valid http/https URL.");
 
-        string html;
-        try
+        // The page's extracted text is what's slow and rate-limited to obtain — cache it by URL so a second
+        // question about the same page (common) doesn't refetch. The answer step below still runs per question.
+        string pageKey = "page:" + url;
+        string text;
+        if (Cache.TryGet(pageKey, out var cachedText))
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-            using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
+            text = cachedText;
+        }
+        else
+        {
+            string html;
+            try
             {
-                int status = (int)response.StatusCode;
-                // A bot wall (Cloudflare/WAF JS challenge, rate-limit) we can't pass without a real browser.
-                // Don't fail the task on it — tell the model to read a DIFFERENT search result instead.
-                bool blocked = status is 401 or 403 or 429 or 503
-                    || (response.Headers.Server?.ToString() ?? "").Contains("cloudflare", StringComparison.OrdinalIgnoreCase)
-                    || response.Headers.Contains("cf-mitigated");
-                if (blocked)
-                    // A bot wall — retrying this URL can NEVER work without a real browser. Dead end.
-                    return ToolOutput.DeadEnd(
-                        $"{uri} blocks automated access (HTTP {status} — a bot/Cloudflare challenge that needs a " +
-                        "real browser). Don't retry this URL; pick a DIFFERENT result from web_search and read that.");
-                // Same status will recur on retry of the same URL — treat it as a dead end for this URL.
-                return ToolOutput.DeadEnd($"Could not fetch {uri}: HTTP {status} {response.ReasonPhrase}. Try a different source.");
+                using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+                using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
+                {
+                    int status = (int)response.StatusCode;
+                    // A bot wall (Cloudflare/WAF JS challenge, rate-limit) we can't pass without a real browser.
+                    // Don't fail the task on it — tell the model to read a DIFFERENT search result instead.
+                    bool blocked = status is 401 or 403 or 429 or 503
+                        || (response.Headers.Server?.ToString() ?? "").Contains("cloudflare", StringComparison.OrdinalIgnoreCase)
+                        || response.Headers.Contains("cf-mitigated");
+                    if (blocked)
+                        // A bot wall — retrying this URL can NEVER work without a real browser. Dead end.
+                        return ToolOutput.DeadEnd(
+                            $"{uri} blocks automated access (HTTP {status} — a bot/Cloudflare challenge that needs a " +
+                            "real browser). Don't retry this URL; pick a DIFFERENT result from web_search and read that.");
+                    // Same status will recur on retry of the same URL — treat it as a dead end for this URL.
+                    return ToolOutput.DeadEnd($"Could not fetch {uri}: HTTP {status} {response.ReasonPhrase}. Try a different source.");
+                }
+                string mediaType = response.Content.Headers.ContentType?.MediaType ?? "";
+                if (mediaType.Length > 0 && !mediaType.Contains("html", StringComparison.OrdinalIgnoreCase) &&
+                    !mediaType.Contains("text", StringComparison.OrdinalIgnoreCase) &&
+                    !mediaType.Contains("xml", StringComparison.OrdinalIgnoreCase))
+                    return ToolOutput.DeadEnd($"Fetched {uri}, but it returned '{mediaType}' rather than readable text/HTML. Try a different source.");
+                html = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             }
-            string mediaType = response.Content.Headers.ContentType?.MediaType ?? "";
-            if (mediaType.Length > 0 && !mediaType.Contains("html", StringComparison.OrdinalIgnoreCase) &&
-                !mediaType.Contains("text", StringComparison.OrdinalIgnoreCase) &&
-                !mediaType.Contains("xml", StringComparison.OrdinalIgnoreCase))
-                return ToolOutput.DeadEnd($"Fetched {uri}, but it returned '{mediaType}' rather than readable text/HTML. Try a different source.");
-            html = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
-            // Network/timeout — could be transient, so this one's worth another go.
-            return ToolOutput.Error($"Could not fetch {uri}: {ex.Message}");
-        }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // Network/timeout — could be transient, so this one's worth another go.
+                return ToolOutput.Error($"Could not fetch {uri}: {ex.Message}");
+            }
 
-        string text = WebSearcherTool.ToPlainText(html);
-        if (text.Length == 0)
-            return ToolOutput.DeadEnd($"Fetched {uri}, but no readable text could be extracted. Try a different source.");
-        // Some walls answer 200 with a challenge/"verify you're human" interstitial instead of the page.
-        if (text.Length < 2000 && BlockRegex.IsMatch(text))
-            return ToolOutput.DeadEnd(
-                $"{uri} served a bot-check page instead of content (needs a real browser). Don't retry it; " +
-                "pick a DIFFERENT result from web_search and read that.");
+            text = WebSearcherTool.ToPlainText(html);
+            if (text.Length == 0)
+                return ToolOutput.DeadEnd($"Fetched {uri}, but no readable text could be extracted. Try a different source.");
+            // Some walls answer 200 with a challenge/"verify you're human" interstitial instead of the page.
+            if (text.Length < 2000 && BlockRegex.IsMatch(text))
+                return ToolOutput.DeadEnd(
+                    $"{uri} served a bot-check page instead of content (needs a real browser). Don't retry it; " +
+                    "pick a DIFFERENT result from web_search and read that.");
+
+            Cache.Set(pageKey, text, CacheTtl); // only a clean, readable page is cached
+        }
 
         var chunks = Chunk(text, size: 1200, overlap: 200);
         var top = RankByQuestion(chunks, question, take: 4);

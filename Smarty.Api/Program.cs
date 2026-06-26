@@ -44,6 +44,12 @@ if (Directory.Exists(webRoot))
 string ollamaBaseUrl = builder.Configuration["Ollama:BaseUrl"] ?? OllamaModelProvider.DefaultBaseUrl;
 string defaultModel = builder.Configuration["Ollama:Model"] ?? "qwen3:4b";
 
+// Cache searches + fetched pages for an hour (persisted under data/, survives restarts) so repeated
+// lookups reuse the earlier result instead of re-hitting — and re-tripping the bot-blocks of — the network.
+string researchCachePath = builder.Configuration["Research:CachePath"]
+    ?? Path.Combine(builder.Environment.ContentRootPath, "data", "research-cache.json");
+WebResearch.Cache = new FileResearchCache(researchCachePath);
+
 var json = new JsonSerializerOptions(JsonSerializerDefaults.Web)
 {
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,

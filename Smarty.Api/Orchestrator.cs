@@ -6,6 +6,31 @@ using Smarty.Agents;
 namespace Smarty.Api;
 
 /// <summary>
+/// Optional overrides that re-target the orchestrator at a different surface without forking it. The web
+/// app passes nothing (every field null → current behaviour). Smarty.Slack passes a company-aware prompt,
+/// a project-free toolset, and a web-only worker toolset, so the SAME engine drives a Slack thread.
+/// </summary>
+public sealed class OrchestratorOptions
+{
+    /// <summary>Replaces the default personal-assistant system prompt (which is built around projects).</summary>
+    public string? SystemPrompt { get; init; }
+
+    /// <summary>Replaces the orchestrator's own toolset. Slack uses the project-free task tools
+    /// (<see cref="Orchestrator.TaskTools"/>), so the model never reaches for find_project/create_project.</summary>
+    public IReadOnlyList<AgentTool>? Tools { get; init; }
+
+    /// <summary>Builds the toolset a delegated worker runs with. Slack returns web-research only (no shell,
+    /// no memory) — safe to expose to a whole workspace. Null = the default shell + web + memory set.</summary>
+    public Func<TaskInfo, IReadOnlyList<AgentTool>>? WorkerTools { get; init; }
+
+    /// <summary>Relay a finished worker's result with the model THINKING (default false). On a thinking model
+    /// like qwen3, think:false doesn't stop the chain-of-thought — it just stops it being split out of the
+    /// content, so deliberation leaks into the reply. Slack sets this true so the reasoning goes to the
+    /// (ignored) reasoning channel and the posted message stays clean. The web app keeps false (faster).</summary>
+    public bool RevoiceThink { get; init; }
+}
+
+/// <summary>
 /// The conversational layer — and the router/mediator at the centre of the system. The orchestrator
 /// is the single voice the user talks to; it can't run anything itself. Real work is done by capable
 /// background WORKERS (full <see cref="SmartyAgent"/>s with real tools) that it hands tasks to and then
@@ -34,7 +59,7 @@ public sealed class Orchestrator
     private static string Snip(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : "…" + s[^max..]).Replace("\n", " ⏎ ");
 
-    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects, ProjectRunStore runs)
+    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects, ProjectRunStore runs, OrchestratorOptions? options = null)
     {
         _provider = new OllamaModelProvider(ollamaBaseUrl);
         _model = model;
@@ -45,23 +70,45 @@ public sealed class Orchestrator
         _memory = memory;
         _projects = projects;
         _runs = runs;
-        // The orchestrator's tools = task tools + global memory-access + project create/list (all executed
-        // in HandleToolCall by name).
-        _orchestratorTools = OrchestratorTools
-            .Append(MemoryTools.SearchTool(memory))
-            .Append(MemoryTools.SetChatTool(memory))
-            .Append(ProjectTools.CreateTool(projects))
-            .Append(ProjectTools.ListTool(projects))
-            .ToArray();
-        // A pinned project chat is already inside one project — no resolving, creating or listing projects.
-        _pinnedTools = OrchestratorTools.Where(t => t.Name != "find_project")
-            .Append(MemoryTools.SearchTool(memory))
-            .Append(MemoryTools.SetChatTool(memory))
-            .ToArray();
+        _system = options?.SystemPrompt ?? OrchestratorSystem;
+        _workerToolsFactory = options?.WorkerTools;
+        _revoiceThink = options?.RevoiceThink ?? false;
+
+        if (options?.Tools is { } overrideTools)
+        {
+            // A re-targeted surface (Slack) supplies its own toolset for both general and pinned modes —
+            // it has no projects, so the distinction collapses to one set.
+            _orchestratorTools = overrideTools.ToArray();
+            _pinnedTools = _orchestratorTools;
+        }
+        else
+        {
+            // The orchestrator's tools = task tools + global memory-access + project create/list (all executed
+            // in HandleToolCall by name).
+            _orchestratorTools = OrchestratorTools
+                .Append(MemoryTools.SearchTool(memory))
+                .Append(MemoryTools.SetChatTool(memory))
+                .Append(ProjectTools.CreateTool(projects))
+                .Append(ProjectTools.ListTool(projects))
+                .ToArray();
+            // A pinned project chat is already inside one project — no resolving, creating or listing projects.
+            _pinnedTools = OrchestratorTools.Where(t => t.Name != "find_project")
+                .Append(MemoryTools.SearchTool(memory))
+                .Append(MemoryTools.SetChatTool(memory))
+                .ToArray();
+        }
     }
 
     private readonly AgentTool[] _orchestratorTools;
     private readonly AgentTool[] _pinnedTools;
+    private readonly string _system;
+    private readonly Func<TaskInfo, IReadOnlyList<AgentTool>>? _workerToolsFactory;
+    private readonly bool _revoiceThink;
+
+    /// <summary>The project-free task tools — delegate + task management, with no find_project /
+    /// create_project / project_summary. The toolset for a surface that doesn't use projects (Slack).</summary>
+    public static IReadOnlyList<AgentTool> TaskTools =>
+        OrchestratorTools.Where(t => t.Name is not ("find_project" or "project_summary")).ToArray();
 
     // Project agent messages/tools into clean, training-shaped JSON (system + messages + tools → output).
     private static object ProjectMessages(IEnumerable<Message> messages) =>
@@ -211,7 +258,7 @@ public sealed class Orchestrator
             var request = new ModelRequest
             {
                 Model = _model,
-                SystemPrompt = OrchestratorSystem, // static → KV cache reused every turn; dynamic context is in `convo`
+                SystemPrompt = _system, // static → KV cache reused every turn; dynamic context is in `convo`
                 Messages = convo,
                 Tools = tools,
                 RepeatPenalty = 1.0,
@@ -391,8 +438,12 @@ public sealed class Orchestrator
                 Model = _model,
                 SystemPrompt = "You are Smarty, the user's warm, concise personal assistant.",
                 Messages = convo,
-                Think = false, // a quick ack, not a deliberation
-                MaxOutputTokens = 60,
+                // think:false would be faster, but on a thinking model it leaks the chain-of-thought into the
+                // content (which becomes the ack). With think:true the reasoning goes to the separate channel
+                // and only the clean one-liner lands in content — at the cost of a slightly slower ack. The
+                // budget is larger here so there's room to both think and still emit the short line.
+                Think = _revoiceThink,
+                MaxOutputTokens = _revoiceThink ? 512 : 60,
                 TurnTimeout = TimeSpan.FromSeconds(30),
             };
             var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
@@ -646,6 +697,16 @@ public sealed class Orchestrator
             var provider = new OllamaModelProvider(_ollamaBaseUrl);
             // If this task runs inside a project, inject that project's context and reframe memory toward
             // tracking the project (not the user); writes are auto-tagged to the project's slug.
+            // A re-targeted surface (Slack) supplies its own worker toolset (web-only, no shell/memory);
+            // the default is the full shell + web + project-memory set.
+            var tools = _workerToolsFactory?.Invoke(task) ?? new AgentTool[]
+            {
+                ShellTool.Create(),
+                WebResearch.SearchTool(),
+                WebResearch.PageAnswerTool(provider, _model),
+                MemoryTools.SearchTool(_memory, task.Project),
+                MemoryTools.SetTool(_memory, task.Project),
+            };
             var input = new AgentInput
             {
                 SystemPrompt = _workerSystem() + ProjectContext(task.Project),
@@ -653,14 +714,7 @@ public sealed class Orchestrator
                 // Seed with the task's running transcript so a resumed worker keeps everything it found and
                 // the Q&A so far. AnswerStream appends to this list, so afterwards it IS the full transcript.
                 Conversation = task.Conversation,
-                Tools =
-                {
-                    ShellTool.Create(),
-                    WebResearch.SearchTool(),
-                    WebResearch.PageAnswerTool(provider, _model),
-                    MemoryTools.SearchTool(_memory, task.Project),
-                    MemoryTools.SetTool(_memory, task.Project),
-                },
+                Tools = tools.ToList(),
                 DrainInbox = () => DrainInbox(task),
                 // Honesty over speed: with reasoning on, the worker inspects tool output, notices junk
                 // (e.g. a blank free-space field) and either recovers or says it couldn't — instead of
@@ -813,7 +867,7 @@ public sealed class Orchestrator
 
             Trace($"[worker #{task.Id}] re-voice start{(failed ? " (failed task — honest, no invent)" : "")}");
             string content = await RunOrchestratorTurnAsync(
-                session, convo, Array.Empty<AgentTool>(), think: false, CancellationToken.None).ConfigureAwait(false);
+                session, convo, Array.Empty<AgentTool>(), think: _revoiceThink, CancellationToken.None).ConfigureAwait(false);
             Trace($"[worker #{task.Id}] re-voice done (user now sees the answer)");
 
             session.History.Add(Message.Assistant(string.IsNullOrWhiteSpace(content) ? result : content));
