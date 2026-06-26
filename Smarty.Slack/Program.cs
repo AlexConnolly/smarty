@@ -35,7 +35,10 @@ var schedules = new ScheduleStore(Path.Combine(config.DataDir, "schedules.json")
 // model — capabilities read them to build authenticated tools. Built-in personas for now; Kibana is the first
 // real integration (read-only log/exception search), which contributes tools only when it's configured.
 var integrations = IntegrationConfig.Load(Path.Combine(config.DataDir, "integrations.json"));
-var capabilities = new CapabilityRegistry(new ICapability[] { new KibanaCapability(), new CodeCapability() });
+var capabilities = new CapabilityRegistry(new ICapability[]
+{
+    new KibanaCapability(), new CodeCapability(), new GitHubCapability(), new JiraCapability(),
+});
 var personas = new PersonaStore();
 
 var provider = new OllamaModelProvider(config.OllamaBaseUrl);
