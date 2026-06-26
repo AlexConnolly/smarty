@@ -20,6 +20,7 @@ public sealed class SlackSocketMode
     public async Task RunAsync(Func<JsonElement, Task> onPayload, CancellationToken ct)
     {
         int backoffSeconds = 1;
+        int tooManyStreak = 0;
         while (!ct.IsCancellationRequested)
         {
             try
@@ -28,9 +29,28 @@ public sealed class SlackSocketMode
                 using var ws = new ClientWebSocket();
                 await ws.ConnectAsync(new Uri(url), ct).ConfigureAwait(false);
                 Console.WriteLine("[slack] socket connected — listening for @mentions");
-                backoffSeconds = 1; // a healthy connection resets the backoff
 
-                await ReceiveLoopAsync(ws, onPayload, ct).ConfigureAwait(false);
+                var reason = await ReceiveLoopAsync(ws, onPayload, ct).ConfigureAwait(false);
+
+                // Slack rotates connections routinely (a "refresh"/normal disconnect) — reconnect promptly. But
+                // "too_many_websockets" means another live connection already holds this app's slot: one we were
+                // force-killed out of that Slack hasn't reaped yet, or a second instance running elsewhere.
+                // Reconnecting instantly just keeps the slot busy and piles on, so back off (growing, capped) and
+                // wait quietly for it to free — don't hammer.
+                if (string.Equals(reason, "too_many_websockets", StringComparison.OrdinalIgnoreCase))
+                {
+                    backoffSeconds = Math.Min(Math.Max(backoffSeconds * 2, 5), 60);
+                    if (tooManyStreak++ == 0)
+                        Console.Error.WriteLine("[slack] another Socket Mode connection holds this app's slot — backing " +
+                            "off until it frees. If it persists, stop the other instance or rotate the app-level token.");
+                    try { await Task.Delay(TimeSpan.FromSeconds(backoffSeconds), ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                }
+                else
+                {
+                    tooManyStreak = 0;
+                    backoffSeconds = 1; // healthy rotation — reconnect promptly
+                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             catch (Exception ex)
@@ -43,7 +63,9 @@ public sealed class SlackSocketMode
         }
     }
 
-    private async Task ReceiveLoopAsync(ClientWebSocket ws, Func<JsonElement, Task> onPayload, CancellationToken ct)
+    // Returns the disconnect REASON when Slack drops the socket with a disconnect frame (so RunAsync can pace
+    // the reconnect), or null when the socket simply closed / was cancelled.
+    private async Task<string?> ReceiveLoopAsync(ClientWebSocket ws, Func<JsonElement, Task> onPayload, CancellationToken ct)
     {
         var buffer = new byte[16 * 1024];
         var message = new MemoryStream();
@@ -58,38 +80,41 @@ public sealed class SlackSocketMode
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
                     await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", ct).ConfigureAwait(false);
-                    return;
+                    return null;
                 }
                 message.Write(buffer, 0, result.Count);
             }
             while (!result.EndOfMessage);
 
             if (message.Length == 0) continue;
-            await HandleFrameAsync(ws, Encoding.UTF8.GetString(message.GetBuffer(), 0, (int)message.Length), onPayload, ct)
+            var reason = await HandleFrameAsync(ws, Encoding.UTF8.GetString(message.GetBuffer(), 0, (int)message.Length), onPayload, ct)
                 .ConfigureAwait(false);
+            if (reason is not null) return reason; // a disconnect frame — bubble its reason up to RunAsync
         }
+        return null;
     }
 
-    private async Task HandleFrameAsync(ClientWebSocket ws, string frame, Func<JsonElement, Task> onPayload, CancellationToken ct)
+    private async Task<string?> HandleFrameAsync(ClientWebSocket ws, string frame, Func<JsonElement, Task> onPayload, CancellationToken ct)
     {
         JsonDocument doc;
         try { doc = JsonDocument.Parse(frame); }
-        catch { return; } // ignore anything that isn't JSON
+        catch { return null; } // ignore anything that isn't JSON
 
         using (doc)
         {
             var root = doc.RootElement;
             string? type = root.GetPropertyOrNull("type");
 
-            // A rotating connection: Slack tells us it's about to drop this socket — let the receive loop
-            // end so RunAsync opens a fresh one.
+            // A rotating connection: Slack tells us it's about to drop this socket — end the receive loop and
+            // return the REASON so RunAsync can pace the reconnect (rotation = prompt; too_many = back off).
             if (type == "disconnect")
             {
-                Console.WriteLine($"[slack] disconnect ({root.GetPropertyOrNull("reason")}) — will reconnect");
+                string reason = root.GetPropertyOrNull("reason") ?? "disconnect";
+                Console.WriteLine($"[slack] disconnect ({reason}) — will reconnect");
                 await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "reconnect", ct).ConfigureAwait(false);
-                return;
+                return reason;
             }
-            if (type == "hello") return; // connection acknowledged by Slack
+            if (type == "hello") return null; // connection acknowledged by Slack
 
             // Every actionable envelope carries an envelope_id that MUST be acked within 3s.
             string? envelopeId = root.GetPropertyOrNull("envelope_id");
@@ -110,6 +135,7 @@ public sealed class SlackSocketMode
                 }
             }
         }
+        return null;
     }
 
     private static async Task SendAsync(ClientWebSocket ws, string text, CancellationToken ct)

@@ -22,7 +22,7 @@ public sealed class SlackConfig
     public string? CompanyContext { get; init; }
 
     public string OllamaBaseUrl { get; init; } = "http://localhost:11434";
-    public string Model { get; init; } = "qwen3:4b";
+    public string Model { get; init; } = "qwen3.5:latest";
 
     /// <summary>Isolated data directory for Slack — its own memory/projects/training, NEVER the web app's
     /// real data dir. Defaults to a sibling folder so a test run can't touch the user's personal data.</summary>
@@ -46,7 +46,7 @@ public sealed class SlackConfig
             CompanyName = Opt("SMARTY_COMPANY_NAME") is { Length: > 0 } c ? c : "the team",
             CompanyContext = Opt("SMARTY_COMPANY_CONTEXT"),
             OllamaBaseUrl = Opt("OLLAMA_BASE_URL") is { Length: > 0 } u ? u : "http://localhost:11434",
-            Model = Opt("SMARTY_MODEL") is { Length: > 0 } m ? m : "qwen3:4b",
+            Model = Opt("SMARTY_MODEL") is { Length: > 0 } m ? m : "qwen3.5:latest",
             DataDir = Opt("SMARTY_SLACK_DATA_DIR") is { Length: > 0 } d ? d
                 : Path.Combine(AppContext.BaseDirectory, "slack-data"),
         };

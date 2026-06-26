@@ -95,8 +95,13 @@ string runsPath = builder.Configuration["Projects:RunsPath"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "data", "runs.json");
 var projectRuns = new ProjectRunStore(runsPath, json);
 
+// Each delegated task gets a working dir under data/tasks/ — task.md plus any files the user attached.
+string workspaceRoot = builder.Configuration["Tasks:WorkspaceRoot"]
+    ?? Path.Combine(builder.Environment.ContentRootPath, "data", "tasks");
+
 var sessions = new SessionStore();
-var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory, projects, projectRuns);
+var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory, projects, projectRuns,
+    new OrchestratorOptions { WorkspaceRoot = workspaceRoot });
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok", model = defaultModel }));
 

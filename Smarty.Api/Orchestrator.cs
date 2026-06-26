@@ -28,6 +28,43 @@ public sealed class OrchestratorOptions
     /// content, so deliberation leaks into the reply. Slack sets this true so the reasoning goes to the
     /// (ignored) reasoning channel and the posted message stays clean. The web app keeps false (faster).</summary>
     public bool RevoiceThink { get; init; }
+
+    /// <summary>Per-inference time limit for an orchestrator turn (default 90s). A chat surface where the
+    /// model only decides tools + writes a short reply wants this shorter, so a spiralling turn is cut and
+    /// recovered quickly instead of burning the full 90s. Slack sets ~45s.</summary>
+    public TimeSpan? TurnTimeout { get; init; }
+
+    /// <summary>An optional planner. When set, a delegated worker's FIRST leg is sized up by a cheap gate, and
+    /// a complex task gets a plan — both built in the BACKGROUND (inside the task, never on the chat turn, so
+    /// the conversation can't hang) and seeded into the executor before it runs. Null = no planning (straight
+    /// to the worker), the current behaviour.</summary>
+    public TaskPlanner? Planner { get; init; }
+
+    /// <summary>An optional supervisor that watches running workers and steps in when they thrash (a relentless
+    /// failing search): it nudges the worker to wrap up, or aborts a hopeless task. Null = no supervision.</summary>
+    public TaskWatchdog? Watchdog { get; init; }
+
+    /// <summary>Where delegated tasks get their own working directory (task.md + a files/ folder for the
+    /// user's attachments). Each task gets <c>&lt;WorkspaceRoot&gt;/&lt;session&gt;/&lt;taskId&gt;/</c>. Null =
+    /// no workspaces (no task.md, attachments aren't carried) — the original behaviour.</summary>
+    public string? WorkspaceRoot { get; init; }
+
+    /// <summary>An optional persisted schedule store. When set, the orchestrator exposes schedule_task /
+    /// cancel_schedule, and a <see cref="Scheduler"/> fires due tasks back into their thread at their time
+    /// (a proactive nudge). Null = no scheduling (the tools report it's unavailable).</summary>
+    public ScheduleStore? Schedules { get; init; }
+
+    /// <summary>Optional specialist personas a delegated task can be routed to (software engineer, PM…). When
+    /// set, <c>delegate</c> accepts a <c>persona</c> and the roster is surfaced to the orchestrator. Null =
+    /// no personas (the persona arg is ignored), the current behaviour.</summary>
+    public PersonaStore? Personas { get; init; }
+
+    /// <summary>The capability registry backing personas — resolves a persona's capability ids into the tools a
+    /// worker runs with. Required for personas to actually add tools (else they're prompt-only).</summary>
+    public CapabilityRegistry? Capabilities { get; init; }
+
+    /// <summary>Integration credentials/config for capabilities, read from disk and NEVER shown to the model.</summary>
+    public IntegrationConfig? IntegrationConfig { get; init; }
 }
 
 /// <summary>
@@ -73,6 +110,14 @@ public sealed class Orchestrator
         _system = options?.SystemPrompt ?? OrchestratorSystem;
         _workerToolsFactory = options?.WorkerTools;
         _revoiceThink = options?.RevoiceThink ?? false;
+        _planner = options?.Planner;
+        _watchdog = options?.Watchdog;
+        _turnTimeout = options?.TurnTimeout ?? TimeSpan.FromSeconds(90);
+        _workspaceRoot = options?.WorkspaceRoot;
+        _schedules = options?.Schedules;
+        _personas = options?.Personas;
+        _capabilities = options?.Capabilities;
+        _integrationConfig = options?.IntegrationConfig ?? new IntegrationConfig();
 
         if (options?.Tools is { } overrideTools)
         {
@@ -104,6 +149,14 @@ public sealed class Orchestrator
     private readonly string _system;
     private readonly Func<TaskInfo, IReadOnlyList<AgentTool>>? _workerToolsFactory;
     private readonly bool _revoiceThink;
+    private readonly TaskPlanner? _planner;
+    private readonly TaskWatchdog? _watchdog;
+    private readonly TimeSpan _turnTimeout;
+    private readonly string? _workspaceRoot;
+    private readonly ScheduleStore? _schedules;
+    private readonly PersonaStore? _personas;
+    private readonly CapabilityRegistry? _capabilities;
+    private readonly IntegrationConfig _integrationConfig;
 
     /// <summary>The project-free task tools — delegate + task management, with no find_project /
     /// create_project / project_summary. The toolset for a surface that doesn't use projects (Slack).</summary>
@@ -171,20 +224,31 @@ public sealed class Orchestrator
         "kick off work or delegate open-ended planning on your own; only delegate when the user actually asks " +
         "for something specific to be done (tag that task with the slug). Only genuine one-offs need no project.\n" +
         "\n" +
+        "When the user attaches a file and wants something done with it (summarise/tldr, pull out a detail, " +
+        "act on it), delegate — the attached file is handed to the worker automatically (it reads it with " +
+        "read_file / file_summary), so you don't need to repeat any path; just describe what to do with it.\n" +
+        "\n" +
         "Just answer (no tools) for chat, jokes, opinions, or things you already know. If a message has both " +
         "an easy part and a work part, answer the easy part AND delegate the work part in the same reply. " +
         "Reply in English, brief and human.";
 
     /// <summary>Handle a user message: echo it, run the orchestrator turn, dispatch any delegated work.</summary>
-    public async Task HandleMessageAsync(Session session, string userText, CancellationToken ct)
+    public async Task HandleMessageAsync(Session session, string userText, CancellationToken ct,
+        string? userScope = null, string? userName = null, IReadOnlyList<Attachment>? attachments = null)
     {
         await session.TurnLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             Trace("[turn] user message received");
             session.LastUserMessageAt = DateTimeOffset.UtcNow;
-            EmitMessage(session, "user", userText);
-            session.History.Add(Message.User(userText));
+            session.CurrentUserScope = userScope; // who's talking — drives per-user memory (null in the web app)
+            session.CurrentUserName = userName;
+            // Hold the turn's attachments so delegate can copy them into the task workspace; the model sees a
+            // human-readable note (names/types, not raw paths — those are carried deterministically).
+            session.PendingAttachments = attachments is { Count: > 0 } ? attachments : null;
+            string shownText = session.PendingAttachments is null ? userText : userText + AttachmentNote(session.PendingAttachments);
+            EmitMessage(session, "user", shownText);
+            session.History.Add(Message.User(shownText));
 
             // The user-facing turn is where the real decisions live (which tools, answer-and-delegate,
             // refine-vs-new, cancel). Let the model think here so it gets them right; re-voice
@@ -197,8 +261,56 @@ public sealed class Orchestrator
         }
         finally
         {
+            session.PendingAttachments = null; // turn-scoped — never leaks into a later turn
             session.TurnLock.Release();
         }
+    }
+
+    /// <summary>Fire a scheduled task into its thread. The host re-attaches the session and refreshes the live
+    /// thread BEFORE calling this, so the frozen instruction runs against current context (a "check back and
+    /// note the decision" task sees what was decided meanwhile). Injected as a SYSTEM turn — no fake user echo —
+    /// and the orchestrator carries it out (delegating as needed); the result/file rides the sink into the
+    /// thread as a proactive nudge.</summary>
+    public async Task RunScheduledAsync(Session session, string taskText, string? userScope = null, string? userName = null)
+    {
+        await session.TurnLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            Trace($"[schedule] firing into {session.Id}: {Snip(taskText, 120)}");
+            session.CurrentUserScope = userScope;
+            session.CurrentUserName = userName;
+            session.History.Add(Message.System(
+                "A task you SCHEDULED earlier is now due. Carry it out NOW, using the conversation above as " +
+                "context (it may have moved on since you set this). Do it and report the outcome to the thread " +
+                "in one short, natural line — a proactive heads-up. If it involves a file from this " +
+                "conversation, send it with send_file (delegate the work; the worker has the file tools). Don't " +
+                "ask the user to confirm — only stop if you genuinely can't proceed without a decision only they " +
+                "can make. Never mention scheduling, tasks, or any internal mechanics.\n\nScheduled task: " + taskText));
+            await RunOrchestratorTurnAsync(
+                session, session.History, _orchestratorTools, think: true, CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            session.CurrentUserScope = null;
+            session.CurrentUserName = null;
+            session.TurnLock.Release();
+        }
+    }
+
+    // Parse a Slack session id ("slack:<channel>:<threadTs>") into its channel + thread timestamp. False for
+    // any non-Slack session (e.g. the web app), which is how scheduling stays Slack-only for now.
+    private static bool TryParseSlackSession(string sessionId, out string channel, out string threadTs)
+    {
+        channel = ""; threadTs = "";
+        const string prefix = "slack:";
+        if (string.IsNullOrEmpty(sessionId) || !sessionId.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return false;
+        var rest = sessionId.Substring(prefix.Length);
+        int i = rest.IndexOf(':');
+        if (i <= 0 || i >= rest.Length - 1) return false;
+        channel = rest.Substring(0, i);
+        threadTs = rest.Substring(i + 1);
+        return true;
     }
 
     /// <summary>
@@ -230,10 +342,10 @@ public sealed class Orchestrator
         }
         else
         {
-            profile = await ProfileNote(message, ct).ConfigureAwait(false);
+            profile = await ProfileNote(session, message, session.CurrentUserScope, ct).ConfigureAwait(false);
             focus = await ProjectFocusNote(session, message, ct).ConfigureAwait(false);
         }
-        var dynamicContext = (DateContext() + profile + focus + RunningTasksNote(session)).TrimStart();
+        var dynamicContext = (DateContext() + profile + focus + RunningTasksNote(session) + ScheduledNote(session) + PersonaNote()).TrimStart();
         if (dynamicContext.Length > 0)
             convo.Insert(Math.Max(0, convo.Count - 1), Message.System(dynamicContext));
 
@@ -245,6 +357,7 @@ public sealed class Orchestrator
         string? delegatedTask = null; // the description of work just kicked off (for a contextual ack)
         bool anyToolCalled = false; // any tool called across this whole user-turn (incl. earlier iterations)
         bool nudgedNoTool = false;  // we re-prompt at most once if the model named a tool but didn't call it
+        bool nudgedTruncation = false; // we retry once if a turn ran out of budget / looped before a real reply
         bool spokenFromModel = false; // did the spoken text come from the model inline (vs. a generated ack)?
 
         // When this turn runs on the live history, we persist the WHOLE exchange below (tool calls + their
@@ -263,7 +376,7 @@ public sealed class Orchestrator
                 Tools = tools,
                 RepeatPenalty = 1.0,
                 MaxOutputTokens = 4096,
-                TurnTimeout = TimeSpan.FromSeconds(90),
+                TurnTimeout = _turnTimeout,
                 Think = think, // user turns think (right tool choices); re-voice/status don't (speed)
             };
 
@@ -311,6 +424,29 @@ public sealed class Orchestrator
             });
 
             var calls = final.ToolCalls;
+
+            // Truncation / loop recovery: the model ran past the token cap, timed out, or looped WITHOUT ever
+            // calling a tool — so the streamed text is a broken, half-finished fragment (often reasoning-style
+            // narration), not a real reply. A small thinking model can spiral like this on a trivial message
+            // with rich context, burning the whole budget on reasoning before it writes anything. Discard the
+            // fragment and retry once, telling it to answer directly and briefly. Done before the assistant
+            // message is added to the convo, so the broken fragment never pollutes the next attempt.
+            if (calls.Count == 0 && !nudgedTruncation && think
+                && final.Finish is FinishReason.Length or FinishReason.Loop or FinishReason.Timeout)
+            {
+                nudgedTruncation = true;
+                if (turnText.Length > 0)
+                {
+                    spoken.Remove(spoken.Length - turnText.Length, turnText.Length); // drop the broken fragment
+                    session.Append("content_cleared", Json(new { id = msgId })); // clear the partial; msg_end self-heals
+                }
+                convo.Add(Message.System(
+                    "You ran out of room before giving a real reply — you over-thought a simple message. Answer " +
+                    "the user NOW in ONE short, direct line: no analysis, no narrating what you're about to do, " +
+                    "just say it."));
+                continue;
+            }
+
             convo.Add(Message.Assistant(turnText.ToString(), final.Reasoning, calls.Count > 0 ? calls : null));
 
             if (calls.Count == 0)
@@ -330,12 +466,28 @@ public sealed class Orchestrator
                     else if (!anyToolCalled &&
                              ReferencesUncalledTool(turnText.ToString(), final.Reasoning, tools) is { } named)
                         nudge = $"You referred to the {named} tool but didn't actually call it, so nothing " +
-                                $"happened. A tool call is the only way to do it — if you meant to, call {named} " +
-                                "now. If you were only chatting and no action was needed, just reply normally.";
+                                $"happened — and your previous text was NOT shown to the user. A tool call is " +
+                                $"the only way to do it — if you meant to, call {named} now. If you were only " +
+                                "chatting and no action was needed, reply to the user fresh — they haven't seen " +
+                                "anything yet.\n" +
+                                $"Your draft (for reference only — not shown): {turnText}\n" +
+                                "If the draft contained useful information, weave the key points into your " +
+                                "new reply naturally. Do NOT say \"as I mentioned\" or reference it as something " +
+                                "you already told them.";
                 }
                 if (nudge is not null)
                 {
                     nudgedNoTool = true;
+                    if (turnText.Length > 0)
+                    {
+                        spoken.Remove(spoken.Length - turnText.Length, turnText.Length);
+                        session.Append("content_cleared", Json(new { id = msgId }));
+                        // The assistant message was already added (line 378) — remove it so the
+                        // model can't reference content that was cleared from the user's view,
+                        // and so the system nudge follows the user message directly.
+                        if (convo.Count > 0 && convo[^1].Role == Role.Assistant)
+                            convo.RemoveAt(convo.Count - 1);
+                    }
                     convo.Add(Message.System(nudge));
                     continue;
                 }
@@ -353,6 +505,16 @@ public sealed class Orchestrator
                 convo.Add(Message.ToolResult(call.Id, call.Name, r.Text));
             }
 
+            // If we're looping to voice tool data, anything the model said in THIS (pre-tool) iteration was a
+            // preamble — and the model often answers inline here AND again after the tool, doubling the reply
+            // ("Cleveland Street, FitzroviaCleveland Street, Fitzrovia"). Drop this iteration's text so only the
+            // final voicing survives. (Delegation acks aren't data-returning, so "On it" is never dropped.)
+            if (needAnotherTurn && turnText.Length > 0)
+            {
+                spoken.Remove(spoken.Length - turnText.Length, turnText.Length);
+                session.Append("content_cleared", Json(new { id = msgId }));
+            }
+
             if (!needAnotherTurn)
                 break; // the spoken text (ack / answer) stands; no tool data to relay
         }
@@ -364,7 +526,7 @@ public sealed class Orchestrator
         {
             string ack = delegatedTask is not null
                 ? await GenerateDelegateAckAsync(message, delegatedTask, ct).ConfigureAwait(false)
-                : "On it.";
+                : "On the case 🔍";
             spoken.Append(ack);
             session.Append("content", Json(new { id = msgId, text = ack }));
         }
@@ -428,32 +590,45 @@ public sealed class Orchestrator
                 Message.User(userMessage),
                 Message.System(
                     "You've just quietly started working on this for the user, in the background:\n" + task + "\n\n" +
-                    "Reply with ONE short, natural line telling them you're on it and what you're doing — in the " +
-                    "SAME language as their message above. A single friendly, concrete clause (e.g. \"Looking up " +
-                    "the flight times now.\" / \"Finding a few Covent Garden pubs for you.\"). Don't mention tasks, " +
-                    "workers, delegation or any internal mechanics, don't ask anything, don't pad."),
+                    "Write your one line now — telling them you're going off to do it and NAMING the specific " +
+                    "thing (pull the subject straight from the task). In the SAME language as their message."),
             };
             var request = new ModelRequest
             {
                 Model = _model,
-                SystemPrompt = "You are Smarty, the user's warm, concise personal assistant.",
+                // A tight persona that forces a single clean chat line. Plain text (no schema — the schema made
+                // qwen emit malformed JSON that failed to parse) + think:false: fast, and the explicit "no
+                // reasoning, just the line" keeps the chain-of-thought out of the output.
+                SystemPrompt =
+                    "You are Smarty, a warm, witty teammate. Output ONLY a single short chat line (max ~14 words) " +
+                    "saying what you're going off to do, naming the specific thing. A little personality/banter is " +
+                    "good. No preamble, no quotes, no reasoning — and NEVER a limp \"On it\". Only the line.",
                 Messages = convo,
-                // think:false would be faster, but on a thinking model it leaks the chain-of-thought into the
-                // content (which becomes the ack). With think:true the reasoning goes to the separate channel
-                // and only the clean one-liner lands in content — at the cost of a slightly slower ack. The
-                // budget is larger here so there's room to both think and still emit the short line.
-                Think = _revoiceThink,
-                MaxOutputTokens = _revoiceThink ? 512 : 60,
-                TurnTimeout = TimeSpan.FromSeconds(30),
+                Think = false,
+                MaxOutputTokens = 60,
+                TurnTimeout = TimeSpan.FromSeconds(20),
             };
             var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
-            var text = response.Content?.Trim();
-            return string.IsNullOrWhiteSpace(text) ? "On it." : text!;
+            var line = CleanAckLine(response.Content);
+            return line.Length > 0 ? line : "On the case 🔍"; // non-wet fallback (the line almost always lands)
         }
         catch
         {
-            return "On it.";
+            return "On the case 🔍";
         }
+    }
+
+    // Take the model's ack down to one clean chat line: drop any stray <think> tags, keep the first non-empty
+    // line, strip wrapping quotes.
+    private static string CleanAckLine(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+        text = System.Text.RegularExpressions.Regex.Replace(text, "<think>.*?</think>", "",
+            System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        text = System.Text.RegularExpressions.Regex.Replace(text, "</?think>", "",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var first = text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? "";
+        return first.Trim().Trim('"', '\'', '`').Trim();
     }
 
     /// <summary>Execute one orchestrator tool call against the session's task registry / stores.</summary>
@@ -473,9 +648,19 @@ public sealed class Orchestrator
                 if (!string.IsNullOrEmpty(project) && !_projects.Exists(project))
                     return Data($"There's no project \"{project}\". Use find_project to resolve which one this is, " +
                                 "or create_project if it's genuinely new (confirm with the user first).");
-                var task = StartTask(session, desc!.Trim(), string.IsNullOrEmpty(project) ? null : project);
+                // Optional persona routing: validate against the roster so a typo doesn't silently run unspecialised.
+                var persona = call.Arguments.GetStringOrNull("persona")?.Trim();
+                if (!string.IsNullOrEmpty(persona) && _personas is not null && _personas.Get(persona) is null)
+                    return Data($"There's no persona \"{persona}\". Available: " +
+                                $"{string.Join(", ", _personas.All.Select(p => p.Id))}. Use one of those, or omit persona.");
+                var task = StartTask(session, desc!.Trim(),
+                    string.IsNullOrEmpty(project) ? null : project,
+                    string.IsNullOrEmpty(persona) ? null : persona);
+                var tags = string.Concat(
+                    task.Project is null ? "" : $" (project: {task.Project})",
+                    task.Persona is null ? "" : $" (persona: {task.Persona})");
                 return new ToolResultInfo(
-                    $"Task #{task.Id} started in the background{(task.Project is null ? "" : $" (project: {task.Project})")}; its result will come back to you to relay.",
+                    $"Task #{task.Id} started in the background{tags}; its result will come back to you to relay.",
                     DataReturning: false, WasDelegate: true, DelegatedTask: desc!.Trim());
             }
 
@@ -544,7 +729,14 @@ public sealed class Orchestrator
                 var progress = string.IsNullOrWhiteSpace(t.LatestThought) ? "(no detail yet)" : t.LatestThought;
                 var line = $"#{t.Id} [{t.Status}] {t.Description}\nRunning {age:F0}s. Latest: {progress}";
                 if (t.Status == "done" && !string.IsNullOrWhiteSpace(t.Result))
-                    line += $"\nResult: {t.Result}";
+                {
+                    // In per-user/Slack mode the finished result is delivered by the worker's own re-voice, so a
+                    // status check that lands AFTER completion must NOT restate it (that's the stale "still
+                    // looking / here it is again" double). Elsewhere (web app) the status reply carries it.
+                    line += session.Id.StartsWith("slack:", StringComparison.OrdinalIgnoreCase)
+                        ? "\n(Finished — the result has already been posted in the thread. Don't repeat it; just confirm it's done if asked.)"
+                        : $"\nResult: {t.Result}";
+                }
                 return Data(line);
             }
 
@@ -576,16 +768,75 @@ public sealed class Orchestrator
                 return Data($"Message passed along to task #{t.Id}; it'll pick it up shortly.");
             }
 
+            case "schedule_task":
+            {
+                if (_schedules is null)
+                    return Data("Scheduling isn't available in this context.");
+                var when = call.Arguments.GetStringOrNull("when");
+                var taskText = call.Arguments.GetStringOrNull("task");
+                if (string.IsNullOrWhiteSpace(when) || string.IsNullOrWhiteSpace(taskText))
+                    return Data("To schedule something I need both `when` (an absolute time like 2026-06-26T14:27, " +
+                                "or a relative \"in 25m\") and `task` (what to do then).");
+                if (!ScheduleStore.TryParseWhen(when!.Trim(), DateTimeOffset.Now, out var fireAt))
+                    return Data($"I couldn't read the time \"{when}\". Give an absolute local time " +
+                                "(e.g. 2026-06-26T14:27) or a relative one (\"in 25m\", \"in 2 hours\", \"in 3 days\").");
+                if (fireAt <= DateTimeOffset.UtcNow.AddSeconds(5))
+                    return Data("That time is in the past. Give a time in the future.");
+                if (!TryParseSlackSession(session.Id, out var channel, out var threadTs))
+                    return Data("I can only schedule things inside a Slack thread right now.");
+                var st = _schedules.Add(session.Id, channel, threadTs, taskText!.Trim(), fireAt,
+                    session.CurrentUserScope, session.CurrentUserName);
+                return Data($"Scheduled (#{st.Id}) for {fireAt.ToLocalTime():dddd d MMM, HH:mm} — I'll act in this " +
+                            "thread then, nothing before. Tell the user briefly you'll handle it at that time; " +
+                            "don't restate any internals.");
+            }
+
+            case "cancel_schedule":
+            {
+                if (_schedules is null) return Data("Scheduling isn't available in this context.");
+                var id = call.Arguments.GetStringOrNull("id")?.TrimStart('#').Trim();
+                if (string.IsNullOrEmpty(id)) return Data("Which scheduled item? Use the id from the scheduled list.");
+                return Data(_schedules.Cancel(id)
+                    ? $"Cancelled scheduled item #{id}."
+                    : $"There's no pending scheduled item #{id}.");
+            }
+
             case "search_memory":
             {
                 var q = call.Arguments.GetStringOrNull("query") ?? "";
-                var r = _memory.Search(q);
+                // Per-user mode (Slack): read the speaker's own facts AND the shared team facts together.
+                var scope = session.PersonalMemoryEnabled ? session.CurrentUserScope : null;
+                var r = scope is { } s
+                    ? _memory.SearchScopes(q, new[] { s, (string?)null })
+                    : _memory.Search(q);
+                if (!session.PersonalMemoryEnabled && session.Id.StartsWith("slack:", StringComparison.OrdinalIgnoreCase))
+                {
+                    r += "\n(Note: Personal memory is not accessible in public/group channels to protect privacy. Only shared team facts are shown.)";
+                }
                 Trace($"[mem] search({q}) -> {Snip(r, 160)}");
                 return Data(r);
             }
 
             case "set_memory":
             {
+                // Per-user mode (Slack): a fact is scoped to the SPEAKER by default (so "I'm X" attaches to
+                // them); the model sets shared=true for a genuine team-wide fact (the office address). No
+                // projects here, so this short-circuits the project routing below.
+                if (session.CurrentUserScope is { } userScope)
+                {
+                    var shared = call.Arguments.GetBool("shared", false);
+                    if (!shared && !session.PersonalMemoryEnabled)
+                    {
+                        return Data("Couldn't save that — personal memories cannot be recorded in public/group channels to protect user privacy. If this is a team-wide fact that everyone should share, set `shared = true`.");
+                    }
+                    return Data(_memory.Set(
+                        call.Arguments.GetStringOrNull("type") ?? "",
+                        call.Arguments.GetStringOrNull("key") ?? "",
+                        call.Arguments.GetStringOrNull("value") ?? "",
+                        call.Arguments.GetStringOrNull("context"),
+                        shared ? null : userScope));
+                }
+
                 // Project facts are the authority's job: written by a worker running INSIDE the project, with
                 // the project's context loaded, so the write is reconciled — never recorded here. Scope =
                 // explicit project arg, else the project in focus. If that's a real project, DON'T write: tell
@@ -658,9 +909,21 @@ public sealed class Orchestrator
     private const double ResolveWeak = 0.52;    // below this, treat as "no match" (ask, don't guess)
 
     /// <summary>Register a delegated task, announce it, and spawn its worker + status monitor.</summary>
-    private TaskInfo StartTask(Session session, string description, string? project = null)
+    private TaskInfo StartTask(Session session, string description, string? project = null, string? persona = null)
     {
-        var task = new TaskInfo { Id = session.NextTaskId(), Description = description, Project = project };
+        var task = new TaskInfo
+        {
+            Id = session.NextTaskId(),
+            Description = description,
+            Project = project,
+            Persona = persona,
+            UserScope = session.CurrentUserScope, // so the worker's memory writes attach to the right person
+            UserName = session.CurrentUserName,
+            PersonalMemoryEnabled = session.PersonalMemoryEnabled,
+        };
+        // Give the task its own workspace (task.md + any attached files), so the worker reads the brief and
+        // the user's files from one place. No-op when no workspace root is configured.
+        task.WorkspaceDir = CreateWorkspace(session, task, session.PendingAttachments);
         session.Tasks[task.Id] = task;
         session.Append("working", Json(new { id = task.Id, task = description }));
         _ = Task.Run(() => RunWorkerAsync(session, task));
@@ -674,9 +937,20 @@ public sealed class Orchestrator
     /// <summary>Resume a worker that paused to ask a question: feed the user's answer back in. The worker
     /// re-runs seeded with its prior transcript, so it continues with full context (a clean, stateless
     /// resume rather than a live suspended process). Safe to fire-and-forget.</summary>
-    public async Task AnswerTaskAsync(Session session, TaskInfo task, string answer)
+    public async Task AnswerTaskAsync(Session session, TaskInfo task, string answer,
+        string? userScope = null, string? userName = null, IReadOnlyList<Attachment>? attachments = null)
     {
+        if (userScope is not null) { session.CurrentUserScope = userScope; session.CurrentUserName = userName; }
         EmitMessage(session, "user", answer); // the answer shows in the chat like any user turn
+        // Files attached to the answer: drop them into this conversation's file area and tell the worker.
+        if (attachments is { Count: > 0 } && ThreadFilesDir(session) is { } filesDir)
+        {
+            var added = CopyAttachments(filesDir, attachments);
+            if (added.Count > 0)
+                task.Conversation.Add(Message.System(
+                    "The user has added these files to this conversation's files area: " +
+                    string.Join(", ", added) + ". List them with list_files; read them with read_file / file_summary."));
+        }
         task.Pending = null;
         task.Status = "running";
         session.Append("working", Json(new { id = task.Id, task = task.Description }));
@@ -691,30 +965,103 @@ public sealed class Orchestrator
     {
         string result = "(no result)";
         bool cancelled = false;
+        bool firstLeg = task.Conversation.Count == 0; // capture before the gate/seeds append to the transcript
         Trace($"[worker #{task.Id}] drive: {Snip(message, 120)}");
         try
         {
+            // PLANNING GATE — runs HERE, inside the background task (never on the orchestrator's chat turn, so
+            // it can't slow or hang the conversation). First leg only: size the task up, and if it's complex,
+            // build a plan and seed it so the executor follows a structured approach on long-horizon work.
+            if (_planner is not null && firstLeg)
+            {
+                task.LatestThought = "sizing up the task…";
+                if (await _planner.IsComplexAsync(task.Description, task.Cts.Token).ConfigureAwait(false))
+                {
+                    task.LatestThought = "planning the approach…";
+                    Trace($"[worker #{task.Id}] gate → complex; planning");
+                    var plan = await _planner.PlanAsync(task.Description, task.Cts.Token).ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(plan))
+                    {
+                        task.Conversation.Add(Message.System(
+                            "A plan has been prepared for this task. Follow it, adapting as you learn:\n\n" + plan));
+                        Trace($"[worker #{task.Id}] plan:\n{Snip(plan, 600)}");
+                    }
+                }
+                else Trace($"[worker #{task.Id}] gate → simple; no plan");
+            }
+
+            // WORKSPACE — first leg only: point the worker at its working directory (the brief in task.md and
+            // any files the user attached, copied into files/). Seeded into the transcript so it persists across
+            // any Q&A legs. Done after the planning gate so it doesn't trip the gate's "first leg" check.
+            if (firstLeg && task.WorkspaceDir is { } ws)
+            {
+                string? filesDir = ThreadFilesDir(session);
+                var seed = new StringBuilder(
+                    $"You have a working directory for this task at: {ws}\n- The brief is in task.md.\n");
+                if (filesDir is not null)
+                {
+                    Directory.CreateDirectory(filesDir);
+                    seed.Append($"- This conversation's files are in: {filesDir}\n");
+                    seed.Append(
+                        "List them with list_files; read one with read_file / file_summary. Write a new file " +
+                        "with write_file, and hand a file to the user with send_file. ONLY files in this " +
+                        "conversation are accessible — you cannot see or send files from anywhere else.\n");
+                }
+                seed.Append("Use run_shell_command too, if you have it. Write any output into this conversation's files area.");
+                task.Conversation.Add(Message.System(seed.ToString()));
+                Trace($"[worker #{task.Id}] workspace seeded: {ws}");
+            }
+
             var provider = new OllamaModelProvider(_ollamaBaseUrl);
             // If this task runs inside a project, inject that project's context and reframe memory toward
             // tracking the project (not the user); writes are auto-tagged to the project's slug.
             // A re-targeted surface (Slack) supplies its own worker toolset (web-only, no shell/memory);
             // the default is the full shell + web + project-memory set.
-            var tools = _workerToolsFactory?.Invoke(task) ?? new AgentTool[]
+            var tools = (_workerToolsFactory?.Invoke(task) ?? new AgentTool[]
             {
                 ShellTool.Create(),
                 WebResearch.SearchTool(),
                 WebResearch.PageAnswerTool(provider, _model),
+                FileTools.ReadFileTool(),
+                FileTools.SummaryTool(provider, _model),
                 MemoryTools.SearchTool(_memory, task.Project),
                 MemoryTools.SetTool(_memory, task.Project),
-            };
+            }).ToList();
+
+            // Every worker also gets the conversation-scoped file tools, rooted at THIS thread's file area:
+            // write_file (author), list_files (discover), send_file (hand a file back). send_file emits a "file"
+            // event on the session stream, which the surface (Slack thread / SSE) turns into an upload — so a
+            // worker can return a file the moment it's ready. No workspace root → no file area → skip (web default).
+            if (ThreadFilesDir(session) is { } threadFiles)
+            {
+                Directory.CreateDirectory(threadFiles);
+                tools.Add(FileTools.WriteFileTool(threadFiles));
+                tools.Add(FileTools.ListFilesTool(threadFiles));
+                tools.Add(FileTools.SendFileTool(threadFiles, (path, caption) =>
+                {
+                    session.Append("file", Json(new { path, name = Path.GetFileName(path), caption }));
+                    return true;
+                }));
+            }
+
+            // Persona routing: a delegated task tagged with a persona runs that role's capability tools (Kibana,
+            // etc.) on TOP of the base set, so a specialist keeps general competence. Credentials are read from
+            // IntegrationConfig at build time — never via the model. Unknown/unconfigured capabilities add nothing.
+            if (task.Persona is { } pid && _personas?.Get(pid) is { } persona && _capabilities is { } caps)
+            {
+                foreach (var t in caps.BuildFor(persona.CapabilityIds, _integrationConfig, task))
+                    tools.Add(t);
+                Trace($"[worker #{task.Id}] persona '{persona.Id}' → {tools.Count} tools total");
+            }
+
             var input = new AgentInput
             {
-                SystemPrompt = _workerSystem() + ProjectContext(task.Project),
+                SystemPrompt = _workerSystem() + ProjectContext(task.Project) + PersonaContext(task),
                 Model = ModelSpec.Ollama(_model, _ollamaBaseUrl),
                 // Seed with the task's running transcript so a resumed worker keeps everything it found and
                 // the Q&A so far. AnswerStream appends to this list, so afterwards it IS the full transcript.
                 Conversation = task.Conversation,
-                Tools = tools.ToList(),
+                Tools = tools,
                 DrainInbox = () => DrainInbox(task),
                 // Honesty over speed: with reasoning on, the worker inspects tool output, notices junk
                 // (e.g. a blank free-space field) and either recovers or says it couldn't — instead of
@@ -724,30 +1071,44 @@ public sealed class Orchestrator
             };
             var worker = new SmartyAgent(input);
 
+            // Supervise this leg: a background watchdog watches the live transcript and nudges the worker to
+            // wrap up (or aborts it) if it starts thrashing — a relentless failing search. Stopped the instant
+            // the leg ends, so it never lingers past the worker.
+            using var monitorCts = CancellationTokenSource.CreateLinkedTokenSource(task.Cts.Token);
+            if (_watchdog is not null)
+                _ = _watchdog.MonitorAsync(task, monitorCts.Token, Trace);
+
             var thought = new StringBuilder();
-            await foreach (var ev in worker.AnswerStream(message, task.Cts.Token).ConfigureAwait(false))
+            try
             {
-                switch (ev)
+                await foreach (var ev in worker.AnswerStream(message, task.Cts.Token).ConfigureAwait(false))
                 {
-                    case AgentEvent.ReasoningDelta r:
-                        thought.Append(r.Text);
-                        task.LatestThought = Tail(thought, 240);
-                        break;
-                    case AgentEvent.ContentDelta c:
-                        thought.Append(c.Text);
-                        task.LatestThought = Tail(thought, 240);
-                        break;
-                    case AgentEvent.ToolStarted ts:
-                        task.LatestThought = $"running {ts.ToolName}…";
-                        Trace($"[tool] start {ts.ToolName} {Snip(ts.Arguments, 160)}");
-                        break;
-                    case AgentEvent.ToolCompleted tc:
-                        Trace($"[tool] done  {tc.ToolName} -> {Snip(tc.Result, 300)}");
-                        break;
-                    case AgentEvent.Completed done:
-                        result = done.Answer;
-                        break;
+                    switch (ev)
+                    {
+                        case AgentEvent.ReasoningDelta r:
+                            thought.Append(r.Text);
+                            task.LatestThought = Tail(thought, 240);
+                            break;
+                        case AgentEvent.ContentDelta c:
+                            thought.Append(c.Text);
+                            task.LatestThought = Tail(thought, 240);
+                            break;
+                        case AgentEvent.ToolStarted ts:
+                            task.LatestThought = $"running {ts.ToolName}…";
+                            Trace($"[tool] start {ts.ToolName} {Snip(ts.Arguments, 160)}");
+                            break;
+                        case AgentEvent.ToolCompleted tc:
+                            Trace($"[tool] done  {tc.ToolName} -> {Snip(tc.Result, 300)}");
+                            break;
+                        case AgentEvent.Completed done:
+                            result = done.Answer;
+                            break;
+                    }
                 }
+            }
+            finally
+            {
+                monitorCts.Cancel(); // stop supervising the moment this leg ends
             }
 
             // Capture the worker transcript (task → tool calls → results → answer) for the dataset.
@@ -959,13 +1320,27 @@ public sealed class Orchestrator
     // find_project) on word boundaries — distinctive enough that plain chat won't trip it.
     private static string? ReferencesUncalledTool(string content, string? reasoning, IReadOnlyList<AgentTool> tools)
     {
-        var hay = (content + " " + reasoning).ToLowerInvariant();
+        // Only check content (what the model said to the user), not reasoning — the model
+        // often discusses tools in reasoning without intending to call them (e.g. "without
+        // needing to delegate"), causing false positives that clear valid replies.
+        var hay = content.ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(hay)) return null;
         foreach (var t in tools)
         {
             var name = t.Name.ToLowerInvariant();
-            if (System.Text.RegularExpressions.Regex.IsMatch(hay, $@"\b{System.Text.RegularExpressions.Regex.Escape(name)}\b"))
-                return t.Name;
+            if (name == "delegate")
+            {
+                // For 'delegate', check if it's used as an active command rather than a negation/discussion.
+                // Ignore phrases like "no need to delegate", "don't delegate", etc.
+                var pattern = @"(?<!\b(no\s+need\s+to|not|don't|won't|can't|cannot|never|without|instead\s+of|rather\s+than|no)\s+)\bdelegate\b";
+                if (System.Text.RegularExpressions.Regex.IsMatch(hay, pattern))
+                    return t.Name;
+            }
+            else
+            {
+                if (System.Text.RegularExpressions.Regex.IsMatch(hay, $@"\b{System.Text.RegularExpressions.Regex.Escape(name)}\b"))
+                    return t.Name;
+            }
         }
         return null;
     }
@@ -1030,12 +1405,32 @@ public sealed class Orchestrator
     // The facts RELEVANT TO THIS MESSAGE, surfaced automatically so the model always has the personal
     // context it needs (allergies, where they live) without deciding to search — but only what's relevant,
     // not the whole store. The system does the retrieval; embeddings will make "relevant" semantic later.
-    private async Task<string> ProfileNote(string message, CancellationToken ct)
+    private async Task<string> ProfileNote(Session session, string message, string? userScope, CancellationToken ct)
     {
-        var facts = await _memory.RelevantTo(message, k: 6, ct: ct).ConfigureAwait(false);
+        IReadOnlyList<MemoryFact> facts;
+        if (userScope is null || !session.PersonalMemoryEnabled)
+        {
+            // Web app, or group Slack channel: relevance over the shared team facts (null scope).
+            facts = await _memory.RelevantToScopes(message, k: 6, scopes: new[] { (string?)null }, ct: ct).ConfigureAwait(false);
+        }
+        else
+        {
+            // Per-user (Slack DM): this message's relevant facts (the speaker's own + shared), UNIONed with the
+            // conversation's sticky working set, so facts that have surfaced before stay in play (re-loaded to
+            // their current value each turn) and don't drop out when the topic drifts.
+            var fresh = await _memory.RelevantToScopes(message, 6, new[] { userScope, (string?)null }, ct).ConfigureAwait(false);
+            facts = HydrateWorkingSet(session, userScope, fresh);
+        }
         Trace($"[mem] relevant-to({Snip(message, 50)}) -> {(facts.Count == 0 ? "(none)" : string.Join(", ", facts.Select(f => f.Key + "=" + f.Value)))}");
-        if (facts.Count == 0) return "";
-        var sb = new StringBuilder("\n\nRelevant to this, here's what you know about the user (apply it; never advise against it):\n");
+        
+        var sb = new StringBuilder();
+        if (!session.PersonalMemoryEnabled && session.Id.StartsWith("slack:", StringComparison.OrdinalIgnoreCase))
+        {
+            sb.Append("\n\nNote: You are in a public or group channel. Personal memories for individual users are disabled here to protect privacy. Only shared team facts are accessible.\n");
+        }
+        if (facts.Count == 0) return sb.ToString();
+        
+        sb.Append("\n\nRelevant to this, here's what you know about the user (apply it; never advise against it):\n");
         foreach (var f in facts)
         {
             sb.Append($"- {f.Key}: {f.Value}");
@@ -1043,6 +1438,41 @@ public sealed class Orchestrator
             sb.Append('\n');
         }
         return sb.ToString();
+    }
+
+    // The sticky "facts in play" for a conversation: keep the IDENTITY of every fact that has surfaced, and
+    // re-load its CURRENT value each turn (so updates show and superseded values never go stale). A key that
+    // no longer resolves is dropped (self-heal). Bounded LRU so a long thread can't bloat the prompt. Only
+    // facts THIS speaker may see (their own scope + shared) are returned — never another person's.
+    private List<MemoryFact> HydrateWorkingSet(Session session, string userScope, IReadOnlyList<MemoryFact> fresh)
+    {
+        const int Cap = 12;
+        var set = session.MemoryWorkingSet;
+
+        // Freshly surfaced facts join the set as most-recently-used.
+        foreach (var f in fresh)
+        {
+            var r = new MemoryRef(f.Project, f.Type, f.Key);
+            set.RemoveAll(x => x.Equals(r));
+            set.Add(r);
+        }
+
+        // Re-load current values; drop any key that no longer resolves.
+        var resolved = new Dictionary<MemoryRef, MemoryFact>();
+        for (int i = set.Count - 1; i >= 0; i--)
+        {
+            var fact = _memory.GetActive(set[i].Scope, set[i].Type, set[i].Key);
+            if (fact is null) { set.RemoveAt(i); continue; }
+            resolved[set[i]] = fact;
+        }
+
+        // Bound to the most-recently-used keys.
+        if (set.Count > Cap) set.RemoveRange(0, set.Count - Cap);
+
+        // Inject only what THIS speaker may see (their scope + the shared scope).
+        var allowed = new HashSet<string?> { userScope.Trim().ToLowerInvariant(), null };
+        return set.Where(r => allowed.Contains(r.Scope) && resolved.ContainsKey(r))
+                  .Select(r => resolved[r]).ToList();
     }
 
     // The READ side of project focus: once find_project has resolved a reference, surface that project's
@@ -1129,6 +1559,34 @@ public sealed class Orchestrator
         return sb.ToString();
     }
 
+    // The worker-side persona framing: the role's expertise prompt, plus a "how to use it" hint for each
+    // capability that actually produced tools (so it's only told about integrations it really has). Empty when
+    // the task has no persona or personas aren't wired.
+    private string PersonaContext(TaskInfo task)
+    {
+        if (task.Persona is not { } pid || _personas?.Get(pid) is not { } persona) return "";
+        var sb = new StringBuilder($"\n\nYou are working as the {persona.Name}.\n{persona.SystemPrompt}\n");
+        if (_capabilities is { } caps)
+            foreach (var hint in caps.ActiveHints(persona.CapabilityIds, _integrationConfig, task))
+                sb.Append($"- {hint}\n");
+        return sb.ToString();
+    }
+
+    // The persona roster, surfaced to the orchestrator so it can route a fitting task to a specialist (by
+    // passing `persona` to delegate) — explicitly ("ask the software engineer…") or by recognising the fit.
+    // Empty when no personas are configured.
+    private string PersonaNote()
+    {
+        if (_personas is null) return "";
+        var all = _personas.All;
+        if (all.Count == 0) return "";
+        var sb = new StringBuilder("\n\nSpecialist personas you can delegate to (pass `persona` to delegate when " +
+                                   "the task fits one — otherwise delegate normally):\n");
+        foreach (var p in all)
+            sb.Append($"- {p.Id} ({p.Name}): {p.Description}\n");
+        return sb.ToString();
+    }
+
     // A live snapshot of in-flight tasks, appended to the system prompt so the orchestrator always knows
     // what it has running (and their ids) — even across turns, so "cancel that" / "how's it going" work.
     private static string RunningTasksNote(Session session)
@@ -1141,6 +1599,20 @@ public sealed class Orchestrator
             sb.Append($"- #{t.Id}: {t.Description}\n");
         sb.Append("Don't delegate anything that overlaps one of these — it's already being done. If the user " +
                   "is adding to one, delegate ONLY the genuinely new part (or steer it with message_task).\n");
+        return sb.ToString();
+    }
+
+    // What's scheduled for later in THIS thread, surfaced so the model can reference or cancel it (and won't
+    // re-schedule the same thing). Empty when scheduling isn't wired or nothing's pending here.
+    private string ScheduledNote(Session session)
+    {
+        if (_schedules is null) return "";
+        var pending = _schedules.PendingFor(session.Id);
+        if (pending.Count == 0) return "";
+        var sb = new StringBuilder("\n\nScheduled for later in this thread (refer to / cancel by id):\n");
+        foreach (var t in pending)
+            sb.Append($"- #{t.Id} at {t.FireAt.ToLocalTime():ddd d MMM HH:mm}: {t.TaskText}\n");
+        sb.Append("Use cancel_schedule(id) to drop one. Don't re-schedule something already listed here.\n");
         return sb.ToString();
     }
 
@@ -1210,7 +1682,15 @@ public sealed class Orchestrator
             var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(response.Content)) return null;
 
-            using var doc = JsonDocument.Parse(response.Content);
+            string content = response.Content.Trim();
+            int firstBrace = content.IndexOf('{');
+            int lastBrace = content.LastIndexOf('}');
+            if (firstBrace >= 0 && lastBrace > firstBrace)
+            {
+                content = content.Substring(firstBrace, lastBrace - firstBrace + 1);
+            }
+
+            using var doc = JsonDocument.Parse(content);
             var root = doc.RootElement;
             var status = root.TryGetProperty("status", out var s) ? s.GetString() : null;
             if (!string.Equals(status, "question", StringComparison.OrdinalIgnoreCase)) return null;
@@ -1236,6 +1716,91 @@ public sealed class Orchestrator
         }
     }
 
+    // A short, human-readable line listing what the user attached, appended to their message so the model
+    // knows files are in play. Names/types/sizes only — the actual paths are carried into the task workspace
+    // deterministically, so the model never has to repeat a path.
+    private static string AttachmentNote(IReadOnlyList<Attachment> attachments)
+    {
+        var sb = new StringBuilder($"\n\n[Attached {(attachments.Count == 1 ? "file" : $"{attachments.Count} files")}: ");
+        sb.Append(string.Join(", ", attachments.Select(a =>
+            $"{a.Name}{(a.Size > 0 ? $" ({HumanSize(a.Size)})" : "")}")));
+        sb.Append(" — delegate to do anything with these; they're handed to the worker automatically.]");
+        return sb.ToString();
+    }
+
+    private static string HumanSize(long bytes) => bytes switch
+    {
+        >= 1024 * 1024 => $"{bytes / (1024.0 * 1024.0):0.#} MB",
+        >= 1024 => $"{bytes / 1024.0:0.#} KB",
+        _ => $"{bytes} B",
+    };
+
+    // Materialise a task's working directory: <root>/<session>/<taskId>/ with task.md (the brief) and a
+    // files/ folder holding copies of the turn's attachments. Returns the absolute workspace path, or null
+    // when no workspace root is configured. Best-effort — a copy failure is logged and skipped, never fatal.
+    private static string SafeSession(string? id) =>
+        string.Concat((id ?? "session").Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+
+    // The CONVERSATION's file area: one folder per thread/session holding every file shared into, or produced
+    // in, this conversation. The scoped file tools (write/list/send) are rooted here, so files persist across
+    // the thread's tasks — you can re-send something shared three tasks ago — and never cross between threads.
+    private string? ThreadFilesDir(Session session)
+    {
+        if (string.IsNullOrEmpty(_workspaceRoot)) return null;
+        return Path.Combine(_workspaceRoot, SafeSession(session.Id), "files");
+    }
+
+    private string? CreateWorkspace(Session session, TaskInfo task, IReadOnlyList<Attachment>? attachments)
+    {
+        if (string.IsNullOrEmpty(_workspaceRoot)) return null;
+        try
+        {
+            string dir = Path.Combine(_workspaceRoot, SafeSession(session.Id), task.Id);
+            Directory.CreateDirectory(dir);
+
+            var brief = new StringBuilder($"# Task\n\n{task.Description}\n");
+            // Attachments go to the CONVERSATION's file area (shared across the thread's tasks), not under this
+            // one task — so a later task (or a scheduled one) can read or re-send them.
+            if (attachments is { Count: > 0 } && ThreadFilesDir(session) is { } filesDir)
+            {
+                var copied = CopyAttachments(filesDir, attachments);
+                if (copied.Count > 0)
+                {
+                    brief.Append("\n## Files provided (in this conversation's files area)\n\n");
+                    foreach (var name in copied) brief.Append($"- {name}\n");
+                }
+            }
+            File.WriteAllText(Path.Combine(dir, "task.md"), brief.ToString());
+            Trace($"[workspace] #{task.Id} -> {dir}");
+            return dir;
+        }
+        catch (Exception ex)
+        {
+            Trace($"[workspace] #{task.Id} failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    // Copy attachments into a files/ directory, returning the (sanitised) file names actually copied.
+    // Best-effort per file — a copy that fails is logged and skipped, not fatal.
+    private List<string> CopyAttachments(string filesDir, IReadOnlyList<Attachment> attachments)
+    {
+        var copied = new List<string>();
+        Directory.CreateDirectory(filesDir);
+        foreach (var a in attachments)
+        {
+            string safeName = string.Concat(a.Name.Select(c =>
+                Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+            try
+            {
+                File.Copy(a.LocalPath, Path.Combine(filesDir, safeName), overwrite: true);
+                copied.Add(safeName);
+            }
+            catch (Exception ex) { Trace($"[workspace] copy {a.Name} failed: {ex.Message}"); }
+        }
+        return copied;
+    }
+
     private string Json(object value) => JsonSerializer.Serialize(value, _json);
 
     // Emit a complete message (start + one content block + end) — used to echo the user's turn.
@@ -1254,11 +1819,13 @@ public sealed class Orchestrator
         new("delegate",
             "Hand a task to a capable background worker that has real tools (shell, internet, files). Provide " +
             "a clear, self-contained description of the work. Optionally tag it to a project (by slug) so the " +
-            "worker has that project's context — leave blank for one-off tasks.",
+            "worker has that project's context, and/or route it to a specialist persona (by id) so it runs with " +
+            "that role's expertise and tools — leave both blank for ordinary one-off tasks.",
             new[]
             {
                 ToolParameter.String("task", "A clear, self-contained description of the work to do.", required: true),
                 ToolParameter.String("project", "Optional project slug to run the task within.", required: false),
+                ToolParameter.String("persona", "Optional specialist persona id to handle it (e.g. software_engineer, product_manager).", required: false),
             },
             NoOp),
         new("find_project",
@@ -1293,6 +1860,23 @@ public sealed class Orchestrator
                 ToolParameter.String("id", "The id of the running task to message.", required: true),
                 ToolParameter.String("message", "The follow-up to pass along to the task.", required: true),
             },
+            NoOp),
+        new("schedule_task",
+            "Schedule something to happen LATER in THIS conversation — a reminder or an action at a future " +
+            "time (\"remind me at 4pm\", \"send me the ticket 5 minutes before my 14:32 train\", \"check back " +
+            "next week and note the decision\"). At that time you'll proactively act in this same thread. Give " +
+            "`when` as an absolute LOCAL time in ISO form (e.g. 2026-06-26T14:27) — do any \"X before/after\" " +
+            "arithmetic yourself — or a relative \"in N minutes/hours/days\". `task` is exactly what to do then, " +
+            "written so it stands on its own; the live thread context is also available when it runs.",
+            new[]
+            {
+                ToolParameter.String("when", "Absolute ISO local time (2026-06-26T14:27) or relative (\"in 25m\", \"in 2 hours\", \"in 3 days\").", required: true),
+                ToolParameter.String("task", "What to do at that time, self-contained.", required: true),
+            },
+            NoOp),
+        new("cancel_schedule",
+            "Cancel a previously scheduled item by its id (as shown in the scheduled-for-later list).",
+            new[] { ToolParameter.String("id", "The id of the scheduled item to cancel.", required: true) },
             NoOp),
     };
 

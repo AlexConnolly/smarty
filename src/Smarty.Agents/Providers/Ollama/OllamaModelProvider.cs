@@ -231,7 +231,7 @@ public sealed class OllamaModelProvider : IModelProvider
         if (request.ResponseFormat is { } format)
             payload["format"] = JsonNode.Parse(format.ToJsonString());
 
-        var options = new JsonObject { ["repeat_last_n"] = 256, ["temperature"] = 0.0 };
+        var options = new JsonObject { ["repeat_last_n"] = 256, ["temperature"] = 0.0, ["num_ctx"] = 12288 };
         if (request.RepeatPenalty is { } rp && rp > 0)
             options["repeat_penalty"] = rp;
         if (request.MaxOutputTokens is { } np && np > 0)

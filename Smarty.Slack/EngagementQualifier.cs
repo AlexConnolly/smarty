@@ -44,12 +44,14 @@ public sealed class EngagementQualifier
         try
         {
             var sb = new StringBuilder();
-            sb.Append("You are \"Smarty\", an assistant present in a Slack thread. You were tagged earlier, so " +
-                      "you're following along. Decide whether the LATEST message is directed at you or is asking " +
-                      "you to do/answer something — versus the people simply talking among themselves.\n");
-            sb.Append("Respond ONLY when it's genuinely for you: a question or request you should answer or act " +
-                      "on, a follow-up to what you just said, or someone clearly addressing you. Do NOT respond to " +
-                      "colleagues chatting to each other, acknowledgements, or asides. When unsure, do not respond.\n\n");
+            sb.Append("You are \"Smarty\", a chatty teammate in a Slack thread. You were tagged earlier and " +
+                      "you're part of this conversation now. Decide whether to reply to the LATEST message.\n");
+            sb.Append("LEAN TOWARDS replying. Reply if the message is plausibly aimed at you in ANY way: a " +
+                      "question or request, a follow-up to what you just said or are working on, OR casual chat, " +
+                      "banter, or an aside from someone who's been talking with you. A bit of back-and-forth is " +
+                      "welcome — you don't have to be all business. ONLY stay silent when the message is clearly " +
+                      "two OTHER people talking to each other, not to you. When it's ambiguous but could be for " +
+                      "you, reply.\n\n");
             if (recent.Count > 0)
             {
                 sb.Append("Recent thread:\n");

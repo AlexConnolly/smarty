@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Smarty.Agents\Smarty.Agents.csproj" />
+    <ProjectReference Include="..\..\Smarty.Api\Smarty.Api.csproj" />
   </ItemGroup>
 
 </Project>

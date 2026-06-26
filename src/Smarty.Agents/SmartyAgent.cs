@@ -46,9 +46,12 @@ public sealed class SmartyAgent
         LastRun = run;
 
         int toolFailures = 0; // cumulative failed tool calls this run — drives the failure budget
+        var toolCallCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase); // per-tool call budget
+        var successfulToolCalls = new HashSet<string>(); // exact (name+args) signatures that succeeded
 
         for (int iteration = 0; iteration < _input.MaxIterations; iteration++)
         {
+            var seenToolCallsInThisTurn = new HashSet<string>();
             // Pull in any out-of-band messages a caller queued while we were working, so a long task
             // can be steered or interrupted between turns rather than only before it starts.
             if (_input.DrainInbox is { } drain)
@@ -150,7 +153,44 @@ public sealed class SmartyAgent
             {
                 yield return new AgentEvent.ToolStarted(call.Name, call.Arguments.ToString());
 
-                ToolOutput output = await ExecuteToolAsync(call, ct).ConfigureAwait(false);
+                // Structural blocks — BEFORE running the tool — so the model can't burn the run repeating a
+                // call or hammering one tool forever. These catch the failure mode where every call "succeeds"
+                // with useless results (so the failure budget never trips): a relentless, going-nowhere loop.
+                string signature = call.Name + "|" + call.Arguments.ToString().ToLowerInvariant();
+                int priorCalls = toolCallCounts.TryGetValue(call.Name, out var cc) ? cc : 0;
+                ToolOutput output;
+                if (!seenToolCallsInThisTurn.Add(signature))
+                {
+                    // Exact repeat in the same turn
+                    output = ToolOutput.DeadEnd(
+                        $"You already ran {call.Name} with these exact arguments in this turn. Running it " +
+                        "again changes nothing.");
+                }
+                else if (successfulToolCalls.Contains(signature))
+                {
+                    // Exact repeat of a successful call from a prior turn
+                    output = ToolOutput.DeadEnd(
+                        $"You already successfully ran {call.Name} with these exact arguments — its result is above. Running it " +
+                        "again changes nothing. Use what you already have, take a genuinely different approach, or " +
+                        "stop and give your best answer (or say plainly you couldn't get it).");
+                }
+                else if (priorCalls >= _input.MaxCallsPerTool)
+                {
+                    // Relentless: this tool has been called enough times this run without converging.
+                    output = ToolOutput.DeadEnd(
+                        $"You've called {call.Name} {priorCalls} times this run and you're not getting there. STOP " +
+                        $"calling {call.Name} now — work with what you've already got and either give your best " +
+                        "answer or say plainly you couldn't find it. Don't call it again.");
+                }
+                else
+                {
+                    toolCallCounts[call.Name] = priorCalls + 1;
+                    output = await ExecuteToolAsync(call, ct).ConfigureAwait(false);
+                    if (!output.IsError)
+                    {
+                        successfulToolCalls.Add(signature);
+                    }
+                }
                 run.ToolInvocations.Add(new ToolInvocation(call.Name, call.Arguments.ToString(), output.Content, output.IsError));
 
                 var toolMessage = Message.ToolResult(call.Id, call.Name, output.Content);

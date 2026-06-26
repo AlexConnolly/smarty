@@ -43,6 +43,11 @@ public sealed class AgentInput
     /// dead ends; resilience below this stays high.</summary>
     public int MaxToolFailures { get; set; } = 4;
 
+    /// <summary>How many times a SINGLE tool may be called in one run before further calls are blocked. Stops
+    /// a relentless loop (e.g. searching the same un-findable thing over and over) even when each call
+    /// "succeeds" with useless results — the failure budget never catches that, but this does. Per tool name.</summary>
+    public int MaxCallsPerTool { get; set; } = 5;
+
     /// <summary>Hard cap on tokens the model may generate per turn (backstop against runaway output).</summary>
     public int MaxOutputTokensPerTurn { get; set; } = 16384;
 

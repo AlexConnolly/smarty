@@ -4,6 +4,10 @@ using Smarty.Agents;
 
 namespace Smarty.Api;
 
+/// <summary>A scope-qualified identity of a memory slot — the sticky key a conversation pins so its CURRENT
+/// value can be re-loaded fresh each turn (handling supersession), and dropped if it no longer resolves.</summary>
+public readonly record struct MemoryRef(string? Scope, string Type, string Key);
+
 /// <summary>One remembered fact about the user (an edge: type/key → value), with its own metadata.</summary>
 public sealed class MemoryFact
 {
@@ -99,9 +103,13 @@ public sealed class MemoryStore
 
     /// <summary>Keyword search across type/key/value/context of active facts in a scope (null = global
     /// user facts; a slug = that project's facts). Pass keywords, not sentences.</summary>
-    public string Search(string query, string? project = null)
+    public string Search(string query, string? project = null) => SearchScopes(query, new[] { project });
+
+    /// <summary>Keyword search across SEVERAL scopes at once (e.g. a person's own facts + the shared team
+    /// scope), merged into one ranked list. The read side of per-user memory: "mine" and "the team's" together.</summary>
+    public string SearchScopes(string query, IReadOnlyList<string?> scopes)
     {
-        project = string.IsNullOrWhiteSpace(project) ? null : project.Trim().ToLowerInvariant();
+        var norm = NormalizeScopes(scopes);
         var terms = query.ToLowerInvariant()
             .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(t => t.Length >= 2)
@@ -111,7 +119,7 @@ public sealed class MemoryStore
 
         lock (_lock)
         {
-            var hits = _facts.Where(f => f.Status == "active" && f.Project == project)
+            var hits = _facts.Where(f => f.Status == "active" && norm.Contains(f.Project))
                 .Select(f => (f, score: Score(f, terms)))
                 .Where(x => x.score > 0)
                 .OrderByDescending(x => x.score)
@@ -132,6 +140,17 @@ public sealed class MemoryStore
         }
     }
 
+    /// <summary>The current active fact for a (scope, type, key) slot, or null if none — used to re-load a
+    /// pinned key to its live value (and to detect a key that no longer resolves, so it can be dropped).</summary>
+    public MemoryFact? GetActive(string? scope, string type, string key)
+    {
+        scope = string.IsNullOrWhiteSpace(scope) ? null : scope.Trim().ToLowerInvariant();
+        type = type.Trim().ToLowerInvariant();
+        key = key.Trim().ToLowerInvariant();
+        lock (_lock)
+            return _facts.FirstOrDefault(f => f.Status == "active" && f.Project == scope && f.Type == type && f.Key == key);
+    }
+
     /// <summary>Active facts in a scope (null = global user facts; a slug = that project's facts).</summary>
     public IReadOnlyList<MemoryFact> Active(string? project = null)
     {
@@ -142,12 +161,17 @@ public sealed class MemoryStore
     /// <summary>The active facts most relevant to a message — for auto-surfacing context per turn (the
     /// system retrieves; the model doesn't have to decide to search). Keyword-scored for now; this is the
     /// seam where embeddings/vectors slot in to make "relevant" semantic.</summary>
-    public async Task<IReadOnlyList<MemoryFact>> RelevantTo(string message, int k, string? project = null, CancellationToken ct = default)
+    public Task<IReadOnlyList<MemoryFact>> RelevantTo(string message, int k, string? project = null, CancellationToken ct = default)
+        => RelevantToScopes(message, k, new[] { project }, ct);
+
+    /// <summary>Relevant facts across SEVERAL scopes (e.g. the speaker's own + the shared team scope), for
+    /// auto-surfacing per-user context each turn. Same ranking as <see cref="RelevantTo"/>, wider scope filter.</summary>
+    public async Task<IReadOnlyList<MemoryFact>> RelevantToScopes(string message, int k, IReadOnlyList<string?> scopes, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(message)) return Array.Empty<MemoryFact>();
-        project = string.IsNullOrWhiteSpace(project) ? null : project.Trim().ToLowerInvariant();
+        var norm = NormalizeScopes(scopes);
         List<MemoryFact> active;
-        lock (_lock) active = _facts.Where(f => f.Status == "active" && f.Project == project).ToList();
+        lock (_lock) active = _facts.Where(f => f.Status == "active" && norm.Contains(f.Project)).ToList();
         if (active.Count == 0) return Array.Empty<MemoryFact>();
 
         // Semantic path: embed the query + any facts missing a vector (nomic prefixes), rank by cosine.
@@ -246,6 +270,11 @@ public sealed class MemoryStore
         return (na == 0 || nb == 0) ? 0 : dot / (Math.Sqrt(na) * Math.Sqrt(nb));
     }
 
+    // Normalise a set of scopes (null/blank → the global scope) for membership tests. A fact's Project is the
+    // scope it lives in: null = global/shared, "user:U123" = that person, a slug = a project.
+    private static HashSet<string?> NormalizeScopes(IReadOnlyList<string?> scopes) =>
+        scopes.Select(s => string.IsNullOrWhiteSpace(s) ? null : s.Trim().ToLowerInvariant()).ToHashSet();
+
     private static List<string> Terms(string s) =>
         s.ToLowerInvariant()
             .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -343,4 +372,64 @@ public static class MemoryTools
         },
         (args, _) => Task.FromResult(ToolOutput.Ok(
             m.Set(args.GetString("type"), args.GetString("key"), args.GetString("value"), args.GetStringOrNull("context"), project))));
+
+    // ---- per-user memory (a worker/chat that knows WHO it's talking to) ----
+    // A fact is scoped to the speaker by default (so "I'm X" attaches to that person), or shared team-wide when
+    // the model marks it so. Reads span the speaker's own scope AND the shared scope, so both surface together.
+
+    /// <summary>Search that spans the current person's own facts PLUS the shared team facts.</summary>
+    public static AgentTool SearchPersonalTool(MemoryStore m, string? personalScope, bool personalMemoryEnabled = true) => new(
+        "search_memory",
+        "Search what you remember — this person's own facts and the shared team facts together. Search by " +
+        "KEYWORDS, not sentences.",
+        new[] { ToolParameter.String("query", "Keywords to look up.", required: true) },
+        (args, _) =>
+        {
+            var scopes = personalMemoryEnabled ? new[] { personalScope, null } : new[] { (string?)null };
+            var r = m.SearchScopes(args.GetString("query"), scopes);
+            if (!personalMemoryEnabled)
+            {
+                r += "\n(Note: Personal memory is not accessible in public/group channels to protect privacy. Only shared team facts are shown.)";
+            }
+            return Task.FromResult(ToolOutput.Ok(r));
+        });
+
+    /// <summary>Remember a fact. Scoped to the CURRENT PERSON by default (their preference, diet, role); set
+    /// <c>shared = true</c> for a team-wide fact everyone should share (the office address, a team choice).</summary>
+    public static AgentTool SetPersonalTool(MemoryStore m, string? personalScope, bool personalMemoryEnabled = true) => new(
+        "set_memory",
+        PersonalSetDescription,
+        PersonalSetParameters,
+        (args, _) =>
+        {
+            var shared = args.GetBool("shared", false);
+            if (!shared && !personalMemoryEnabled)
+            {
+                return Task.FromResult(ToolOutput.Ok("Couldn't save that — personal memories cannot be recorded in public/group channels to protect user privacy. If this is a team-wide fact that everyone should share, set `shared = true`."));
+            }
+            var scope = shared ? null : personalScope;
+            return Task.FromResult(ToolOutput.Ok(m.Set(
+                args.GetString("type"), args.GetString("key"), args.GetString("value"), args.GetStringOrNull("context"), scope)));
+        });
+
+    /// <summary>The orchestrator-facing set_memory SCHEMA for per-user memory. The orchestrator routes the call
+    /// through its own handler (using the live speaker's scope), so this executor is inert — only the schema
+    /// matters, mirroring <see cref="SetChatTool"/>.</summary>
+    public static AgentTool SetChatPersonalTool(MemoryStore m) => new(
+        "set_memory", PersonalSetDescription, PersonalSetParameters,
+        (args, _) => Task.FromResult(ToolOutput.Ok("ok")));
+
+    private const string PersonalSetDescription =
+        "Remember a durable fact. By DEFAULT it's saved as PERSONAL to the person you're talking to (their own " +
+        "preference or detail). Set shared=true ONLY for a genuine team/workspace fact everyone shares. " +
+        "key = the slot it fills (a new value updates it).";
+
+    private static readonly ToolParameter[] PersonalSetParameters =
+    {
+        ToolParameter.String("type", "The category of the fact.", required: true),
+        ToolParameter.String("key", "The attribute/slot this fact fills.", required: true),
+        ToolParameter.String("value", "The value.", required: true),
+        ToolParameter.String("context", "Optional short note/explanation.", required: false),
+        ToolParameter.Boolean("shared", "true = a team-wide fact for everyone; false/omitted = personal to this person.", required: false),
+    };
 }

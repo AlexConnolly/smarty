@@ -27,6 +27,16 @@ var memory = new MemoryStore(Path.Combine(config.DataDir, "memory.json"), json);
 var projects = new ProjectStore(Path.Combine(config.DataDir, "projects.json"), json);
 var runs = new ProjectRunStore(Path.Combine(config.DataDir, "runs.json"), json);
 var training = new TrainingLog(Path.Combine(config.DataDir, "training-data"), json);
+// Scheduled tasks (reminders / future actions), persisted so they survive a restart.
+var schedules = new ScheduleStore(Path.Combine(config.DataDir, "schedules.json"), json);
+
+// Specialist personas (software engineer, PM…) and the capabilities (integrations) they draw on. Integration
+// credentials live in <dataDir>/integrations.json (or SMARTY_<CAP>_<KEY> env vars) and are NEVER shown to the
+// model — capabilities read them to build authenticated tools. Built-in personas for now; Kibana is the first
+// real integration (read-only log/exception search), which contributes tools only when it's configured.
+var integrations = IntegrationConfig.Load(Path.Combine(config.DataDir, "integrations.json"));
+var capabilities = new CapabilityRegistry(new ICapability[] { new KibanaCapability(), new CodeCapability() });
+var personas = new PersonaStore();
 
 var provider = new OllamaModelProvider(config.OllamaBaseUrl);
 
@@ -34,20 +44,47 @@ var provider = new OllamaModelProvider(config.OllamaBaseUrl);
 // repeated lookups don't re-hit — and re-trip the bot-blocks of — the search engines and sites.
 WebResearch.Cache = new FileResearchCache(Path.Combine(config.DataDir, "research-cache.json"));
 
-// Web research only — no shell (anyone who can @mention the bot would otherwise get code execution on this
-// host) and no memory (multi-user; deferred). Built once and shared by every delegated worker.
-var workerTools = new AgentTool[]
+// Web research + read-only file tools — no shell (anyone who can @mention the bot would otherwise get code
+// execution on this host). The file tools only READ files the user attached (carried into the task workspace).
+var webTools = new AgentTool[]
 {
     WebResearch.SearchTool(),
     WebResearch.PageAnswerTool(provider, config.Model),
+    FileTools.ReadFileTool(),
+    FileTools.SummaryTool(provider, config.Model),
 };
+
+// Per-user memory: a fact is scoped to the SPEAKER by default ("I'm vegetarian" → that person), or shared
+// team-wide when flagged (the office address). Reads span the speaker's own scope + the shared scope. The
+// worker's tools are built PER TASK so they carry the asker's scope (TaskInfo.UserScope); the orchestrator's
+// set_memory is a schema only — it's executed with the live speaker's scope inside the orchestrator.
+var planner = new TaskPlanner(config.Model, config.OllamaBaseUrl, () => webTools); // recon = web only, read-only
+
+// Supervisor: watches running workers and, when one thrashes (relentless failing search), nudges it to wrap
+// up with what it has — or aborts a hopeless task. The go/no-go check only runs when cheap signals trip.
+var watchdog = new TaskWatchdog(config.Model, config.OllamaBaseUrl);
 
 var options = new OrchestratorOptions
 {
     SystemPrompt = SlackPrompts.OrchestratorSystem(config.CompanyName, config.CompanyContext),
-    Tools = Orchestrator.TaskTools,                  // delegate + task management, no project tools
-    WorkerTools = _ => workerTools,
-    RevoiceThink = true,                             // keep relayed results clean (CoT → ignored reasoning channel)
+    // delegate + task management (no project tools) + per-user memory (recall/record from chat).
+    Tools = Orchestrator.TaskTools
+        .Append(MemoryTools.SearchTool(memory))
+        .Append(MemoryTools.SetChatPersonalTool(memory))
+        .ToArray(),
+    WorkerTools = task => webTools
+        .Append(MemoryTools.SearchPersonalTool(memory, task.UserScope, task.PersonalMemoryEnabled))
+        .Append(MemoryTools.SetPersonalTool(memory, task.UserScope, task.PersonalMemoryEnabled))
+        .ToArray(),
+    RevoiceThink = false,                            // re-voicing only relays completed results; disable think/CoT for speed
+    Planner = planner,                               // size-gate + plan complex tasks in the background
+    Watchdog = watchdog,                             // supervise workers: go/no-go when a search thrashes
+    TurnTimeout = TimeSpan.FromSeconds(90),          // chat turn: cut a spiral early so recovery is quick (longer margin for local models)
+    WorkspaceRoot = Path.Combine(config.DataDir, "tasks"), // each task gets task.md + the user's attached files
+    Schedules = schedules,                           // schedule_task / cancel_schedule + proactive firing into the thread
+    Personas = personas,                             // specialist roles delegate can route to
+    Capabilities = capabilities,                     // integrations (Kibana…) personas draw on
+    IntegrationConfig = integrations,                // credentials for capabilities — never shown to the model
 };
 
 var orchestrator = new Orchestrator(
@@ -67,11 +104,16 @@ catch (Exception ex)
 Console.WriteLine($"[slack] Smarty is @{botUserId}, working with \"{config.CompanyName}\" via model {config.Model}.");
 
 var qualifier = new EngagementQualifier(provider, config.Model);
-var gateway = new SlackGateway(api, orchestrator, qualifier, botUserId);
+var gateway = new SlackGateway(api, orchestrator, qualifier, botUserId, config.DataDir);
 var socket = new SlackSocketMode(api);
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+// Fire scheduled tasks into their threads at their time (a proactive nudge). Runs alongside the socket;
+// pending tasks already past due (e.g. set before a restart) go off on the first tick.
+var scheduler = new Scheduler(schedules, gateway.FireScheduledAsync);
+_ = scheduler.RunAsync(cts.Token);
 
 try { await socket.RunAsync(gateway.HandlePayloadAsync, cts.Token); }
 catch (OperationCanceledException) { /* shutting down */ }

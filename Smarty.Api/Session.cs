@@ -21,12 +21,20 @@ public interface IEventSink
 /// (the user can always type their own instead).</summary>
 public sealed record PendingQuestion(string Question, IReadOnlyList<string> Options);
 
+/// <summary>A file the user attached to a turn, already downloaded to local disk. Surfaced to the
+/// orchestrator in context and copied into a delegated task's workspace so the worker can read/use it.</summary>
+public sealed record Attachment(string Name, string LocalPath, string? MimeType, long Size);
+
 /// <summary>A delegated background task the orchestrator can track, peek at, steer, answer, and cancel.</summary>
 public sealed class TaskInfo
 {
     public required string Id { get; init; }
     public required string Description { get; init; }
     public string? Project { get; init; }            // slug of the project this task runs within, if any
+    public string? Persona { get; init; }            // id of the specialist persona handling it, if any
+    public string? UserScope { get; init; }          // memory scope of the person who asked, e.g. "user:U123"
+    public string? UserName { get; init; }            // their display name, for context
+    public bool PersonalMemoryEnabled { get; init; } = true; // whether personal memory is enabled for this task
     public string Status { get; set; } = "running"; // running | waiting | done | cancelled | failed
     public string? LatestThought { get; set; } // the worker's recent reasoning, for status peeks
     public string? Result { get; set; } // the final answer once finished
@@ -38,6 +46,11 @@ public sealed class TaskInfo
 
     /// <summary>Set while the worker is paused on a question (status == waiting).</summary>
     public PendingQuestion? Pending { get; set; }
+
+    /// <summary>The task's own working directory (when the orchestrator is configured with a workspace root).
+    /// Holds task.md (the brief) and a files/ subfolder with any attachments — handed to the worker so it
+    /// reads the brief and the provided files from one place.</summary>
+    public string? WorkspaceDir { get; set; }
 
     /// <summary>The worker's accumulated transcript. When the user answers a question, the worker is re-run
     /// seeded with this, so it continues with its full prior context (findings + the Q&amp;A) — a clean,
@@ -88,6 +101,24 @@ public sealed class Session
     /// memory — and won't wander. Distinct from <see cref="CurrentProject"/>, which is a soft, shifting
     /// focus on the general chat.</summary>
     public string? PinnedProject { get; set; }
+
+    /// <summary>The current turn's speaker as a memory scope (e.g. "user:U123") and display name — set per
+    /// turn by the host that knows who's talking (Slack). Drives per-user memory: writes default to this
+    /// person, reads span this person + the shared scope. Null in the single-user web app.</summary>
+    public string? CurrentUserScope { get; set; }
+    public string? CurrentUserName { get; set; }
+    public bool PersonalMemoryEnabled { get; set; } = true;
+
+    /// <summary>Files attached to the turn currently being handled — set at the top of a turn by the host
+    /// (Slack), read by delegate so the files are copied into the task's workspace, then cleared. Turn-scoped:
+    /// only valid while a turn holds <see cref="TurnLock"/>.</summary>
+    public IReadOnlyList<Attachment>? PendingAttachments { get; set; }
+
+    /// <summary>The sticky "facts in play" for this conversation — identities (not values) of memory slots
+    /// that have surfaced, so each turn re-loads their CURRENT values (handling updates) and they don't drop
+    /// out when the topic drifts. Bounded LRU; a key that no longer resolves is removed. Touched only inside a
+    /// turn (under <see cref="TurnLock"/>), so no extra locking needed.</summary>
+    public List<MemoryRef> MemoryWorkingSet { get; } = new();
 
     public DateTimeOffset LastActivity { get; private set; } = DateTimeOffset.UtcNow;
 

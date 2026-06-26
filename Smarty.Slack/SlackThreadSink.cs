@@ -57,7 +57,7 @@ public sealed class SlackThreadSink : IEventSink
 
                 string text = root.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "";
                 text = StripThinking(text);
-                if (!string.IsNullOrWhiteSpace(text)) Post(text);
+                if (!string.IsNullOrWhiteSpace(text)) Post(ToSlackMrkdwn(text));
                 break;
             }
 
@@ -75,7 +75,22 @@ public sealed class SlackThreadSink : IEventSink
                     if (list.Count > 0)
                         sb.Append("\n\n").Append(string.Join("  ·  ", list.Select(o => $"_{o}_")));
                 }
-                Post(sb.ToString());
+                Post(ToSlackMrkdwn(sb.ToString()));
+                break;
+            }
+
+            case "file":
+            {
+                // A worker is sending a file back into the thread. The path is a thread-scoped file the
+                // orchestrator vouched for; we just upload it (fire-and-forget, like Post).
+                using var doc = JsonDocument.Parse(data);
+                var root = doc.RootElement;
+                string? path = root.TryGetProperty("path", out var pe) ? pe.GetString() : null;
+                if (string.IsNullOrWhiteSpace(path)) break;
+                string? name = root.TryGetProperty("name", out var ne) ? ne.GetString() : null;
+                string? caption = root.TryGetProperty("caption", out var ce) ? ce.GetString() : null;
+                _ = _api.UploadFileAsync(_channel, _threadTs, path!, name,
+                    string.IsNullOrWhiteSpace(caption) ? null : ToSlackMrkdwn(caption!));
                 break;
             }
         }
@@ -94,6 +109,22 @@ public sealed class SlackThreadSink : IEventSink
         text = ThinkUnclosed.Replace(text, "");
         text = ThinkTag.Replace(text, "");
         return text.Trim();
+    }
+
+    private static readonly Regex MarkdownLinkRegex = new(@"\[([^\]]+)\]\(([a-zA-Z]+://[^\s)]+)\)", RegexOptions.Compiled);
+    private static readonly Regex MarkdownBoldRegex = new(@"\*\*([^*]+)\*\*", RegexOptions.Compiled);
+    private static readonly Regex MarkdownHeaderRegex = new(@"^#+\s+(.+)$", RegexOptions.Multiline | RegexOptions.Compiled);
+
+    internal static string ToSlackMrkdwn(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return text;
+        // 1. Convert bold: **text** -> *text*
+        text = MarkdownBoldRegex.Replace(text, "*$1*");
+        // 2. Convert links: [text](url) -> <url|text>
+        text = MarkdownLinkRegex.Replace(text, "<$2|$1>");
+        // 3. Convert headers: ## Header -> *Header*
+        text = MarkdownHeaderRegex.Replace(text, "*$1*");
+        return text;
     }
 
     // Fire-and-forget the post (Append is called synchronously inside the orchestrator turn; we mustn't block it).

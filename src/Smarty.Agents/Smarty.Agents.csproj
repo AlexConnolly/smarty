@@ -9,4 +9,8 @@
     <AssemblyName>Smarty.Agents</AssemblyName>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="PdfPig" Version="0.1.15" />
+  </ItemGroup>
+
 </Project>
