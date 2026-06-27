@@ -19,3 +19,10 @@ Smarty.Api/sse_*.txt
 # Personal memory store
 Smarty.Api/data/
 data/
+
+# Integration credentials (Kibana/GitHub/Jira tokens, endpoints) — NEVER commit
+integrations.json
+**/integrations.json
+
+# Slack isolated data dir (memory/projects/uploads/schedules) if placed outside bin/
+slack-data/
