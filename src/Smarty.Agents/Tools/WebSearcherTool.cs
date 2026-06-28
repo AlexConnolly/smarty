@@ -99,8 +99,12 @@ public static class WebSearcherTool
         }
 
         // If URL is not provided, run a sub-agent with the web_page_load tool
-        var provider = modelProvider ?? ModelProviderRegistry.Default.Resolve(ModelSpec.Default);
-        var modelName = model ?? "qwen3:4b";
+        var provider = modelProvider ?? 
+                       (ModelSpec.SecondaryDefault != null ? ModelProviderRegistry.Default.Resolve(ModelSpec.SecondaryDefault) : null) ?? 
+                       ModelProviderRegistry.Default.Resolve(ModelSpec.Default);
+        var modelName = model ?? 
+                        (ModelSpec.SecondaryDefault != null ? ModelSpec.SecondaryDefault.Model : null) ?? 
+                        ModelSpec.Default.Model;
 
         var agentInput = new AgentInput
         {
@@ -187,8 +191,12 @@ public static class WebSearcherTool
                 .ThenBy(c => c.Number)
                 .ToList();
 
-            var provider = modelProvider ?? ModelProviderRegistry.Default.Resolve(ModelSpec.Default);
-            var modelName = model ?? "qwen3:4b";
+            var provider = modelProvider ?? 
+                           (ModelSpec.SecondaryDefault != null ? ModelProviderRegistry.Default.Resolve(ModelSpec.SecondaryDefault) : null) ?? 
+                           ModelProviderRegistry.Default.Resolve(ModelSpec.Default);
+            var modelName = model ?? 
+                            (ModelSpec.SecondaryDefault != null ? ModelSpec.SecondaryDefault.Model : null) ?? 
+                            ModelSpec.Default.Model;
 
             var candidatesToScore = rankedCandidates.Take(Math.Min(maxChunks, 4)).ToList();
             var llmRanked = new List<RankedChunk>();

@@ -21,12 +21,15 @@ public sealed class SmartyAgent
 {
     private readonly AgentInput _input;
     private readonly IModelProvider _provider;
+    private readonly IModelProvider _secondaryProvider;
     private readonly Dictionary<string, AgentTool> _tools;
 
     public SmartyAgent(AgentInput input, ModelProviderRegistry? registry = null)
     {
         _input = input ?? throw new ArgumentNullException(nameof(input));
-        _provider = (registry ?? ModelProviderRegistry.Default).Resolve(input.Model);
+        var reg = registry ?? ModelProviderRegistry.Default;
+        _provider = reg.Resolve(input.Model);
+        _secondaryProvider = reg.Resolve(input.SecondaryModel ?? input.Model);
         _tools = input.Tools.ToDictionary(t => t.Name, StringComparer.OrdinalIgnoreCase);
     }
 

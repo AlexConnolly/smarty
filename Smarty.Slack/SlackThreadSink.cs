@@ -20,16 +20,19 @@ public sealed class SlackThreadSink : IEventSink
     private readonly SlackApiClient _api;
     private readonly string _channel;
     private readonly string _threadTs;
+    private readonly Session _session;
 
     // msg id -> role, captured at msg_start so we only post the assistant's messages (never echo the human's).
     private readonly Dictionary<int, string> _roles = new();
     private readonly object _lock = new();
+    private readonly List<PendingFile> _pendingFiles = new();
 
-    public SlackThreadSink(SlackApiClient api, string channel, string threadTs)
+    public SlackThreadSink(SlackApiClient api, string channel, string threadTs, Session session)
     {
         _api = api;
         _channel = channel;
         _threadTs = threadTs;
+        _session = session;
     }
 
     public void OnEvent(string @event, string data)
@@ -45,6 +48,12 @@ public sealed class SlackThreadSink : IEventSink
                 break;
             }
 
+            case "gate_request":
+            {
+                HandleGateRequest(data);
+                break;
+            }
+
             case "msg_end":
             {
                 using var doc = JsonDocument.Parse(data);
@@ -57,7 +66,33 @@ public sealed class SlackThreadSink : IEventSink
 
                 string text = root.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "";
                 text = StripThinking(text);
-                if (!string.IsNullOrWhiteSpace(text)) Post(ToSlackMrkdwn(text));
+
+                List<PendingFile> filesToUpload;
+                lock (_lock)
+                {
+                    filesToUpload = _pendingFiles.ToList();
+                    _pendingFiles.Clear();
+                }
+
+                if (filesToUpload.Count > 0)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        var first = filesToUpload[0];
+                        await _api.UploadFileAsync(_channel, _threadTs, first.Path, first.Name,
+                            string.IsNullOrWhiteSpace(text) ? null : ToSlackMrkdwn(text)).ConfigureAwait(false);
+
+                        for (int i = 1; i < filesToUpload.Count; i++)
+                        {
+                            var f = filesToUpload[i];
+                            await _api.UploadFileAsync(_channel, _threadTs, f.Path, f.Name, null).ConfigureAwait(false);
+                        }
+                    });
+                }
+                else
+                {
+                    if (!string.IsNullOrWhiteSpace(text)) Post(ToSlackMrkdwn(text));
+                }
                 break;
             }
 
@@ -81,16 +116,22 @@ public sealed class SlackThreadSink : IEventSink
 
             case "file":
             {
-                // A worker is sending a file back into the thread. The path is a thread-scoped file the
-                // orchestrator vouched for; we just upload it (fire-and-forget, like Post).
                 using var doc = JsonDocument.Parse(data);
                 var root = doc.RootElement;
                 string? path = root.TryGetProperty("path", out var pe) ? pe.GetString() : null;
                 if (string.IsNullOrWhiteSpace(path)) break;
                 string? name = root.TryGetProperty("name", out var ne) ? ne.GetString() : null;
                 string? caption = root.TryGetProperty("caption", out var ce) ? ce.GetString() : null;
-                _ = _api.UploadFileAsync(_channel, _threadTs, path!, name,
-                    string.IsNullOrWhiteSpace(caption) ? null : ToSlackMrkdwn(caption!));
+                lock (_lock)
+                {
+                    _pendingFiles.Add(new PendingFile { Path = path, Name = name, Caption = caption });
+                }
+                break;
+            }
+
+            case "task_progress_digest":
+            {
+                HandleProgressDigest(data);
                 break;
             }
         }
@@ -130,4 +171,79 @@ public sealed class SlackThreadSink : IEventSink
     // Fire-and-forget the post (Append is called synchronously inside the orchestrator turn; we mustn't block it).
     private void Post(string text) =>
         _ = _api.PostMessageAsync(_channel, _threadTs, text);
+
+    private void HandleProgressDigest(string data)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(data);
+            var root = doc.RootElement;
+            string text = root.TryGetProperty("text", out var txtProp) ? txtProp.GetString() ?? "" : "";
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                Post(ToSlackMrkdwn(text));
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[slack] handle-progress-digest error: {ex.Message}");
+        }
+    }
+
+    private void HandleGateRequest(string data)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(data);
+            var root = doc.RootElement;
+            string taskId = root.GetProperty("id").GetString() ?? "";
+            string gateRequestId = root.GetProperty("gateRequestId").GetString() ?? "";
+            string action = root.GetProperty("action").GetString() ?? "";
+            string description = root.GetProperty("description").GetString() ?? "";
+
+            string text = $"Smarty needs permission to run the following action in task #{taskId}:\n*Action:* {action}\n*Details:* `{description}`";
+
+            var blocks = new object[]
+            {
+                new
+                {
+                    type = "section",
+                    text = new { type = "mrkdwn", text = $"*Permission Request*\nSmarty wants to perform the following action in task *#{taskId}*:\n*Action:* {action}\n*Details:* `{description}`" }
+                },
+                new
+                {
+                    type = "actions",
+                    block_id = $"gate_actions:{taskId}:{gateRequestId}",
+                    elements = new object[]
+                    {
+                        new { type = "button", text = new { type = "plain_text", text = "Approve for task" }, style = "primary", action_id = "gate_approve_task", value = "approve_task" },
+                        new { type = "button", text = new { type = "plain_text", text = "Approve once" }, action_id = "gate_approve", value = "approve" },
+                        new { type = "button", text = new { type = "plain_text", text = "Deny" }, style = "danger", action_id = "gate_deny", value = "deny" }
+                    }
+                }
+            };
+
+            string blocksJson = JsonSerializer.Serialize(blocks);
+
+            _ = Task.Run(async () =>
+            {
+                string? ts = await _api.PostMessageBlocksAsync(_channel, _threadTs, text, blocksJson).ConfigureAwait(false);
+                if (ts is not null && _session.Tasks.TryGetValue(taskId, out var task) && task.PendingGates.TryGetValue(gateRequestId, out var pending))
+                {
+                    pending.SlackMessageTs = ts;
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[slack] handle-gate-request error: {ex.Message}");
+        }
+    }
+
+    private sealed class PendingFile
+    {
+        public required string Path { get; set; }
+        public string? Name { get; set; }
+        public string? Caption { get; set; }
+    }
 }

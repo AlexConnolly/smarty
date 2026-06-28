@@ -18,6 +18,9 @@ public sealed class AgentInput
     /// <summary>Which provider and model to use. Defaults to the local Ollama gateway.</summary>
     public ModelSpec Model { get; set; } = ModelSpec.Default;
 
+    /// <summary>Which provider and model to use for lighter tasks (like chunk ranking) when speed/cost is preferred over full reasoning.</summary>
+    public ModelSpec? SecondaryModel { get; set; }
+
     /// <summary>Whether the model should run its chain-of-thought. Off makes each turn much faster on a
     /// thinking model (no deliberation) — good for mechanical tool-driven work where deep reasoning isn't
     /// needed. Defaults to true.</summary>

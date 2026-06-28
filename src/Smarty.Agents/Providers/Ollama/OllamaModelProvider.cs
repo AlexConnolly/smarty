@@ -20,6 +20,10 @@ public sealed class OllamaModelProvider : IModelProvider
 
     private static readonly HttpClient Shared = new() { Timeout = TimeSpan.FromMinutes(5) };
 
+    // Models that rejected the `think` parameter (e.g. Gemma). Learned at runtime on the first 400 so we stop
+    // sending `think` to them — making the provider work with non-thinking models, not just qwen.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> NoThinkModels = new();
+
     private readonly HttpClient _http;
     private readonly string _baseUrl;
 
@@ -34,22 +38,47 @@ public sealed class OllamaModelProvider : IModelProvider
     {
         var payload = BuildPayload(request);
 
-        using var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/api/chat")
+        async Task<HttpResponseMessage> SendAsync(JsonObject body)
         {
-            Content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json"),
-        };
+            using var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/api/chat")
+            {
+                Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"),
+            };
+            return await _http.SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        }
 
-        using var httpResponse = await _http
-            .SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, ct)
-            .ConfigureAwait(false);
+        var httpResponse = await SendAsync(payload).ConfigureAwait(false);
+
+        // Some models (e.g. Gemma) reject the `think` parameter outright with a 400. Detect that, remember it
+        // for this model so we never pay the round-trip again, and retry without thinking — keeping the provider
+        // model-agnostic rather than hard-failing on any non-thinking model.
+        if (httpResponse.StatusCode == System.Net.HttpStatusCode.BadRequest && payload.ContainsKey("think"))
+        {
+            var err = await httpResponse.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            if (err.Contains("does not support thinking", StringComparison.OrdinalIgnoreCase))
+            {
+                NoThinkModels[request.Model] = true;
+                payload.Remove("think");
+                httpResponse.Dispose();
+                httpResponse = await SendAsync(payload).ConfigureAwait(false);
+            }
+            else
+            {
+                httpResponse.Dispose();
+                throw new InvalidOperationException($"Ollama request failed (400 Bad Request): {err}");
+            }
+        }
 
         if (!httpResponse.IsSuccessStatusCode)
         {
             var error = await httpResponse.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            httpResponse.Dispose();
             throw new InvalidOperationException(
                 $"Ollama request failed ({(int)httpResponse.StatusCode} {httpResponse.ReasonPhrase}): {error}");
         }
 
+        try
+        {
         await using var stream = await httpResponse.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         using var reader = new StreamReader(stream);
 
@@ -62,6 +91,8 @@ public sealed class OllamaModelProvider : IModelProvider
         var content = new StringBuilder();
         var reasoning = new StringBuilder();
         var toolCalls = new List<ToolCall>();
+        int promptEvalCount = 0;
+        int evalCount = 0;
 
         // Detection buffer over the live token stream (reasoning + content) to catch repetition loops.
         var recent = new StringBuilder();
@@ -113,6 +144,15 @@ public sealed class OllamaModelProvider : IModelProvider
                     }
                 }
 
+                if (root.TryGetProperty("prompt_eval_count", out var pec) && pec.ValueKind == JsonValueKind.Number)
+                {
+                    promptEvalCount = pec.GetInt32();
+                }
+                if (root.TryGetProperty("eval_count", out var ec) && ec.ValueKind == JsonValueKind.Number)
+                {
+                    evalCount = ec.GetInt32();
+                }
+
                 if (root.TryGetProperty("done_reason", out var dr) && dr.ValueKind == JsonValueKind.String &&
                     string.Equals(dr.GetString(), "length", StringComparison.OrdinalIgnoreCase))
                 {
@@ -146,14 +186,28 @@ public sealed class OllamaModelProvider : IModelProvider
             }
         }
 
+        TokenTracker.Record(promptEvalCount, evalCount);
+        try
+        {
+            File.WriteAllText("token_usage.json", $"{{\"Input\": {TokenTracker.TotalInputTokens}, \"Output\": {TokenTracker.TotalOutputTokens}}}");
+        }
+        catch {}
+
         var response = new ModelResponse
         {
             Content = content.Length > 0 ? content.ToString() : null,
             Reasoning = reasoning.Length > 0 ? reasoning.ToString() : null,
             ToolCalls = toolCalls,
             Finish = finish,
+            InputTokens = promptEvalCount,
+            OutputTokens = evalCount,
         };
         yield return new ModelStreamEvent.Completed(response);
+        }
+        finally
+        {
+            httpResponse.Dispose();
+        }
     }
 
     // Loop detection: treat the tail as degenerate if a short cycle (period 3..160) repeats
@@ -214,9 +268,11 @@ public sealed class OllamaModelProvider : IModelProvider
         {
             ["model"] = request.Model,
             ["stream"] = true,
-            ["think"] = request.Think,
             ["messages"] = messages,
         };
+        // Only send `think` to models that accept it; once a model 400s on it, it's remembered and skipped.
+        if (!NoThinkModels.ContainsKey(request.Model))
+            payload["think"] = request.Think;
 
         if (request.Tools.Count > 0)
         {

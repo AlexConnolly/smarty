@@ -13,17 +13,24 @@ namespace Smarty.Api;
 /// </summary>
 public sealed class TaskPlanner
 {
-    private readonly OllamaModelProvider _provider;
-    private readonly string _model;
-    private readonly string _ollamaBaseUrl;
+    private readonly IModelProvider _provider;
+    private readonly ModelSpec _modelSpec;
     private readonly Func<IReadOnlyList<AgentTool>>? _reconTools;
+    private readonly string _model;
+    private readonly ModelProviderRegistry _registry;
+
+    public TaskPlanner(ModelSpec modelSpec, ModelProviderRegistry? registry = null, Func<IReadOnlyList<AgentTool>>? reconTools = null)
+    {
+        _modelSpec = modelSpec;
+        _registry = registry ?? ModelProviderRegistry.Default;
+        _provider = _registry.Resolve(modelSpec);
+        _model = modelSpec.Model;
+        _reconTools = reconTools;
+    }
 
     public TaskPlanner(string model, string ollamaBaseUrl, Func<IReadOnlyList<AgentTool>>? reconTools = null)
+        : this(ModelSpec.Ollama(model, ollamaBaseUrl), null, reconTools)
     {
-        _provider = new OllamaModelProvider(ollamaBaseUrl);
-        _model = model;
-        _ollamaBaseUrl = ollamaBaseUrl;
-        _reconTools = reconTools;
     }
 
     private static JsonNode ComplexitySchema() => new JsonObject
@@ -92,12 +99,12 @@ public sealed class TaskPlanner
             var input = new AgentInput
             {
                 SystemPrompt = PlannerSystem,
-                Model = ModelSpec.Ollama(_model, _ollamaBaseUrl),
+                Model = _modelSpec,
                 Tools = tools.ToList(),
                 Think = true,
                 MaxIterations = tools.Count > 0 ? 5 : 2, // room for a little recon, never the whole job
             };
-            var plan = await new SmartyAgent(input).Answer(
+            var plan = await new SmartyAgent(input, _registry).Answer(
                 "Plan this task (do not carry it out):\n" + task, ct).ConfigureAwait(false);
             return string.IsNullOrWhiteSpace(plan) ? null : plan.Trim();
         }

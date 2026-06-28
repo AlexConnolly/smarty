@@ -12,6 +12,9 @@ namespace Smarty.Agents;
 public static class ShellTool
 {
     public static AgentTool Create(string name = "run_shell_command")
+        => Create(null, name);
+
+    public static AgentTool Create(IGateProvider? gateProvider, string name = "run_shell_command")
     {
         return new AgentTool(
             name,
@@ -22,14 +25,23 @@ public static class ShellTool
                 ToolParameter.String("working_dir", "Directory to run the command in. Defaults to the current directory.", required: false),
                 ToolParameter.Integer("timeout_seconds", "Maximum seconds to wait before aborting. Defaults to 30.", required: false),
             },
-            RunAsync);
+            (args, ct) => RunAsync(args, gateProvider, ct));
     }
 
-    private static async Task<ToolOutput> RunAsync(ToolCallArguments args, CancellationToken ct)
+    private static async Task<ToolOutput> RunAsync(ToolCallArguments args, IGateProvider? gateProvider, CancellationToken ct)
     {
         string command = args.GetString("command");
         string? workingDir = args.GetStringOrNull("working_dir");
         int timeoutSeconds = args.GetInt("timeout_seconds", 30);
+
+        if (gateProvider != null)
+        {
+            bool approved = await gateProvider.RequestAccessAsync("run_shell_command", command, ct).ConfigureAwait(false);
+            if (!approved)
+            {
+                return ToolOutput.DeadEnd("Access denied by the user. I cannot perform this action.");
+            }
+        }
 
         bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 

@@ -13,5 +13,15 @@ public sealed record ModelSpec(string Provider, string Model, string? BaseUrl = 
     public static ModelSpec Ollama(string model = "qwen3:4b", string? baseUrl = null)
         => new("ollama", model, baseUrl);
 
-    public static ModelSpec Default => Ollama();
+    private static ModelSpec _default = Ollama();
+
+    /// <summary>The primary model specification default.</summary>
+    public static ModelSpec Default
+    {
+        get => _default;
+        set => _default = value ?? throw new ArgumentNullException(nameof(value));
+    }
+
+    /// <summary>The secondary/dumber model specification default.</summary>
+    public static ModelSpec? SecondaryDefault { get; set; }
 }

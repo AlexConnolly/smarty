@@ -8,7 +8,7 @@ namespace Smarty.Api;
 /// in the ACTUAL source instead of inferring from logs alone. Three tools, all sandboxed under a single
 /// configured root (no path can escape it): <c>code_tree</c> (browse), <c>code_search</c> (grep for a symbol
 /// or string), <c>code_read</c> (read a file window). It deliberately CANNOT modify the repo — a fix is
-/// proposed by writing a patch to the conversation's file area (write_file/send_file), never applied here.
+/// proposed by writing a patch to the conversation's file area (write_file; delivered automatically), never applied here.
 /// Config key (under <c>code.*</c>): <c>root</c> (required) — absolute path to the repo.
 /// </summary>
 public sealed class CodeCapability : ICapability
@@ -21,7 +21,7 @@ public sealed class CodeCapability : ICapability
         "Read the codebase with code_tree (browse files), code_search (find a symbol/string) and code_read " +
         "(read a file). Ground any proposed fix in the ACTUAL code — name the file and method and show the " +
         "change. It's READ-ONLY: you can't modify the repo, but you can write a proposed patch with write_file " +
-        "and send it with send_file. Propose the fix; never claim you've applied it.";
+        "(it's delivered to the user automatically). Propose the fix; never claim you've applied it.";
 
     // Directories and files that are never worth searching/listing in a source tree.
     private static readonly HashSet<string> SkipDirs = new(StringComparer.OrdinalIgnoreCase)

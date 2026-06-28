@@ -17,15 +17,22 @@ namespace Smarty.Api;
 /// </summary>
 public sealed class TaskWatchdog
 {
-    private readonly OllamaModelProvider _provider;
-    private readonly string _model;
+    private readonly IModelProvider _provider;
+    private readonly ModelSpec _modelSpec;
     private readonly TimeSpan _checkEvery;
+    private readonly string _model;
+
+    public TaskWatchdog(ModelSpec modelSpec, ModelProviderRegistry? registry = null, TimeSpan? checkEvery = null)
+    {
+        _modelSpec = modelSpec;
+        _provider = (registry ?? ModelProviderRegistry.Default).Resolve(modelSpec);
+        _model = modelSpec.Model;
+        _checkEvery = checkEvery ?? TimeSpan.FromSeconds(25);
+    }
 
     public TaskWatchdog(string model, string ollamaBaseUrl, TimeSpan? checkEvery = null)
+        : this(ModelSpec.Ollama(model, ollamaBaseUrl), null, checkEvery)
     {
-        _provider = new OllamaModelProvider(ollamaBaseUrl);
-        _model = model;
-        _checkEvery = checkEvery ?? TimeSpan.FromSeconds(25);
     }
 
     // Failure markers our tools emit (bot-walls, fetch errors, empty results). Used for the cheap trip signal.
@@ -133,7 +140,7 @@ public sealed class TaskWatchdog
 
             var request = new ModelRequest
             {
-                Model = _model,
+                Model = _modelSpec.Model,
                 Messages = new[] { Message.User(sb.ToString()) },
                 Think = false,
                 ResponseFormat = Schema(),

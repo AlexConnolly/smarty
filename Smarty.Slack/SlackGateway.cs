@@ -75,9 +75,15 @@ public sealed class SlackGateway
     private static void Trace(string msg) { if (TraceOn) Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} [gw] {msg}"); }
     private static string Snip(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 
-    /// <summary>Handle one Events API payload (already acked by the socket layer).</summary>
+    /// <summary>Handle one Events API payload or interactive payload (already acked by the socket layer).</summary>
     public async Task HandlePayloadAsync(JsonElement payload)
     {
+        if (payload.TryGetProperty("type", out var typeEl) && typeEl.GetString() == "block_actions")
+        {
+            HandleInteraction(payload);
+            return;
+        }
+
         if (payload.GetPropertyOrNull("event_id") is { } eventId && !FirstTime(eventId))
         { Trace($"dup event_id {eventId} — skipped"); return; }
         if (!payload.TryGetProperty("event", out var ev)) return;
@@ -345,7 +351,7 @@ public sealed class SlackGateway
             bool isDm = channel.StartsWith("D", StringComparison.OrdinalIgnoreCase);
             session.PersonalMemoryEnabled = isDm;
             Trace($"session created for thread {key}; DM={isDm}, personal memory {(isDm ? "enabled" : "disabled")}");
-            session.Sink = new SlackThreadSink(_api, channel, threadTs); // events -> this thread
+            session.Sink = new SlackThreadSink(_api, channel, threadTs, session); // events -> this thread
             var thread = new SlackThread { Session = session, Channel = channel, ThreadTs = threadTs };
             _threads[key] = thread;
             return thread;
@@ -423,6 +429,99 @@ public sealed class SlackGateway
             _seenOrder.Enqueue(eventId);
             if (_seenOrder.Count > 1000) _seen.Remove(_seenOrder.Dequeue()); // bound the memory
             return true;
+        }
+    }
+
+    private void HandleInteraction(JsonElement payload)
+    {
+        try
+        {
+            if (!payload.TryGetProperty("actions", out var actionsEl) || actionsEl.ValueKind != JsonValueKind.Array)
+                return;
+
+            foreach (var actionEl in actionsEl.EnumerateArray())
+            {
+                var actionId = actionEl.GetPropertyOrNull("action_id") ?? "";
+                var blockId = actionEl.GetPropertyOrNull("block_id") ?? "";
+
+                if (actionId is "gate_approve_task" or "gate_approve" or "gate_deny")
+                {
+                    var parts = blockId.Split(':');
+                    if (parts.Length < 3 || parts[0] != "gate_actions") continue;
+
+                    string taskId = parts[1];
+                    string gateRequestId = parts[2];
+
+                    // channel is an object { "id": "C...", "name": "..." } in interactive payloads
+                    string channel = "";
+                    if (payload.TryGetProperty("channel", out var chanEl))
+                    {
+                        channel = chanEl.ValueKind == JsonValueKind.Object
+                            ? (chanEl.GetPropertyOrNull("id") ?? "")
+                            : (chanEl.GetPropertyOrNull("id") ?? chanEl.GetString() ?? "");
+                    }
+
+                    // container has the thread_ts that roots this thread
+                    string threadTs = "";
+                    if (payload.TryGetProperty("container", out var containerEl))
+                    {
+                        threadTs = containerEl.GetPropertyOrNull("thread_ts") ?? "";
+                    }
+                    // fallback: dig into message.thread_ts
+                    if (string.IsNullOrEmpty(threadTs) && payload.TryGetProperty("message", out var msgEl))
+                    {
+                        threadTs = msgEl.GetPropertyOrNull("thread_ts") ?? msgEl.GetPropertyOrNull("ts") ?? "";
+                    }
+
+                    Trace($"gate interaction: action={actionId} task={taskId} gate={gateRequestId} ch={channel} thread={threadTs}");
+
+                    if (string.IsNullOrEmpty(channel) || string.IsNullOrEmpty(threadTs)) continue;
+
+                    string key = $"{channel}:{threadTs}";
+                    SlackThread? thread;
+                    lock (_threadsLock)
+                    {
+                        _threads.TryGetValue(key, out thread);
+                    }
+
+                    if (thread == null)
+                    {
+                        Trace($"gate interaction: no thread found for {key}");
+                        continue;
+                    }
+
+                    var session = thread.Session;
+                    bool approved = actionId is "gate_approve_task" or "gate_approve";
+                    bool rememberForTask = actionId == "gate_approve_task";
+
+                    if (session.Tasks.TryGetValue(taskId, out var task) && task.PendingGates.TryGetValue(gateRequestId, out var pendingGate))
+                    {
+                        pendingGate.CompletionSource.TrySetResult(new GateResolution(approved, rememberForTask));
+                        Trace($"gate resolved: task={taskId} approved={approved} rememberForTask={rememberForTask}");
+
+                        // Delete the interactive message and post a brief confirmation
+                        string actionDetail = $"Using tool *{pendingGate.Action}* ({pendingGate.Description})";
+                        string confirmation = approved
+                            ? (rememberForTask
+                                ? $"✅ Approved: {actionDetail}"
+                                : $"✅ Approved once: {actionDetail}")
+                            : $"❌ Denied: {actionDetail}";
+                        if (pendingGate.SlackMessageTs is { } msgTs)
+                        {
+                            _ = _api.DeleteMessageAsync(channel, msgTs);
+                        }
+                        _ = _api.PostMessageAsync(channel, threadTs, confirmation);
+                    }
+                    else
+                    {
+                        Trace($"gate interaction: task {taskId} not found or gate mismatch");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[slack] handle-interaction error: {ex.Message}");
         }
     }
 }

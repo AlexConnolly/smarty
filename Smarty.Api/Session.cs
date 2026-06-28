@@ -21,6 +21,19 @@ public interface IEventSink
 /// (the user can always type their own instead).</summary>
 public sealed record PendingQuestion(string Question, IReadOnlyList<string> Options);
 
+/// <summary>The user's answer to a gate permission request.</summary>
+public sealed record GateResolution(bool Approved, bool RememberForTask);
+
+/// <summary>Set while the worker is paused on a gate permission request.</summary>
+public sealed class PendingGateRequest
+{
+    public required string GateRequestId { get; init; }
+    public required string Action { get; init; }
+    public required string Description { get; init; }
+    public TaskCompletionSource<GateResolution> CompletionSource { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public string? SlackMessageTs { get; set; }
+}
+
 /// <summary>A file the user attached to a turn, already downloaded to local disk. Surfaced to the
 /// orchestrator in context and copied into a delegated task's workspace so the worker can read/use it.</summary>
 public sealed record Attachment(string Name, string LocalPath, string? MimeType, long Size);
@@ -35,7 +48,7 @@ public sealed class TaskInfo
     public string? UserScope { get; init; }          // memory scope of the person who asked, e.g. "user:U123"
     public string? UserName { get; init; }            // their display name, for context
     public bool PersonalMemoryEnabled { get; init; } = true; // whether personal memory is enabled for this task
-    public string Status { get; set; } = "running"; // running | waiting | done | cancelled | failed
+    public string Status { get; set; } = "running"; // running | waiting | done | cancelled | failed | waiting_gate
     public string? LatestThought { get; set; } // the worker's recent reasoning, for status peeks
     public string? Result { get; set; } // the final answer once finished
     public DateTimeOffset StartedAt { get; } = DateTimeOffset.UtcNow;
@@ -47,6 +60,15 @@ public sealed class TaskInfo
     /// <summary>Set while the worker is paused on a question (status == waiting).</summary>
     public PendingQuestion? Pending { get; set; }
 
+    /// <summary>The permission gate provider for the task.</summary>
+    public IGateProvider? GateProvider { get; set; }
+
+    /// <summary>Set while the worker is paused on a gate request (status == waiting_gate).</summary>
+    public PendingGateRequest? PendingGate { get; set; }
+
+    /// <summary>All permission gate requests currently open for this task, keyed by gate request id.</summary>
+    public ConcurrentDictionary<string, PendingGateRequest> PendingGates { get; } = new();
+
     /// <summary>The task's own working directory (when the orchestrator is configured with a workspace root).
     /// Holds task.md (the brief) and a files/ subfolder with any attachments — handed to the worker so it
     /// reads the brief and the provided files from one place.</summary>
@@ -57,8 +79,26 @@ public sealed class TaskInfo
     /// stateless resume rather than a live suspended process.</summary>
     public List<Message> Conversation { get; set; } = new();
 
+    public List<ProgressLogEntry> ProgressLog { get; } = new();
+    public int LastProgressIndex { get; set; } = 0;
+
+    public void RecordProgress(string message)
+    {
+        lock (ProgressLog)
+        {
+            if (ProgressLog.Count > 0 && ProgressLog[^1].Message == message) return;
+            ProgressLog.Add(new ProgressLogEntry { Message = message });
+        }
+    }
+
     public bool IsRunning => Status == "running";
-    public bool IsActive => Status is "running" or "waiting";
+    public bool IsActive => Status is "running" or "waiting" or "waiting_gate";
+}
+
+public sealed class ProgressLogEntry
+{
+    public DateTimeOffset Timestamp { get; } = DateTimeOffset.UtcNow;
+    public string Message { get; init; } = "";
 }
 
 /// <summary>
@@ -74,6 +114,10 @@ public sealed class Session
     private volatile TaskCompletionSource<bool> _signal = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _nextMessageId;
     private int _nextTaskId;
+    private int _progressMonitorActive;
+
+    public bool StartProgressMonitor() => Interlocked.CompareExchange(ref _progressMonitorActive, 1, 0) == 0;
+    public void StopProgressMonitor() => Interlocked.Exchange(ref _progressMonitorActive, 0);
 
     public Session(string id) => Id = id;
 
@@ -183,4 +227,6 @@ public sealed class SessionStore
     public Session GetOrCreate(string id) => _sessions.GetOrAdd(id, key => new Session(key));
 
     public Session? Get(string id) => _sessions.TryGetValue(id, out var s) ? s : null;
+
+    public IEnumerable<Session> GetAll() => _sessions.Values;
 }

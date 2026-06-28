@@ -75,6 +75,45 @@ public sealed class SlackApiClient
         }
     }
 
+    /// <summary>Post a message with blocks (for interactivity) into a thread. Returns the new message ts.</summary>
+    public async Task<string?> PostMessageBlocksAsync(string channel, string threadTs, string text, string blocksJson, CancellationToken ct = default)
+    {
+        try
+        {
+            using var doc = await PostAsync("chat.postMessage", _botToken,
+                new() { ["channel"] = channel, ["thread_ts"] = threadTs, ["text"] = text, ["blocks"] = blocksJson }, ct).ConfigureAwait(false);
+            var root = doc.RootElement;
+            if (!root.GetProperty("ok").GetBoolean())
+            {
+                Console.Error.WriteLine($"[slack] chat.postMessage with blocks failed: {root.GetPropertyOrNull("error")}");
+                return null;
+            }
+            return root.GetPropertyOrNull("ts");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[slack] chat.postMessage with blocks error: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>Delete a message by channel and message ts.</summary>
+    public async Task<bool> DeleteMessageAsync(string channel, string ts, CancellationToken ct = default)
+    {
+        try
+        {
+            using var doc = await PostAsync("chat.delete", _botToken,
+                new() { ["channel"] = channel, ["ts"] = ts }, ct).ConfigureAwait(false);
+            var root = doc.RootElement;
+            return root.GetProperty("ok").GetBoolean();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[slack] chat.delete error: {ex.Message}");
+            return false;
+        }
+    }
+
     /// <summary>All messages in a thread, oldest first — used to backfill what humans said before tagging us.</summary>
     public async Task<IReadOnlyList<SlackMessage>> GetThreadRepliesAsync(string channel, string threadTs, CancellationToken ct = default)
     {

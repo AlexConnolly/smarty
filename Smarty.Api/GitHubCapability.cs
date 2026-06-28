@@ -22,8 +22,8 @@ public sealed class GitHubCapability : ICapability
     public string? PromptHint =>
         "Read a GitHub repo with github_list (browse), github_read_file (read a file), github_search_code " +
         "(find a symbol/string) and github_commits (recent history). Ground proposed fixes in the ACTUAL code " +
-        "— name the file and lines. It's READ-ONLY: propose a patch (write_file/send_file), never claim to have " +
-        "pushed or opened a PR.";
+        "— name the file and lines. It's READ-ONLY: propose a patch with write_file (it's delivered to the user " +
+        "automatically), never claim to have pushed or opened a PR.";
 
     public IReadOnlyList<AgentTool> BuildTools(IntegrationConfig config, TaskInfo task)
     {

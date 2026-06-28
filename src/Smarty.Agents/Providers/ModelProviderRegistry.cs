@@ -16,6 +16,10 @@ public sealed class ModelProviderRegistry
     {
         var registry = new ModelProviderRegistry();
         registry.Register("ollama", spec => new OllamaModelProvider(spec.BaseUrl));
+        registry.Register("together", spec => {
+            string apiKey = Environment.GetEnvironmentVariable("TOGETHER_API_KEY") ?? "";
+            return new TogetherModelProvider(apiKey, spec.BaseUrl);
+        });
         return registry;
     }
 

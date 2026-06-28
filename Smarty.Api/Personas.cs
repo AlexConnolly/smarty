@@ -49,7 +49,7 @@ public sealed class PersonaStore
             "Then PROPOSE A FIX, grounded in the real code: use code_search/code_read to find the exact file and " +
             "method involved, identify the root cause in the source, and write a concrete proposed change — name " +
             "the file and method, show the before/after, and explain why it addresses the cause. Prefer writing " +
-            "the proposed patch to a file with write_file and sending it with send_file. You are PROPOSING only: " +
+            "the proposed patch to a file with write_file (it's delivered to the user automatically). You are PROPOSING only: " +
             "you cannot and must not modify the repository or claim you have applied anything — leave the decision " +
             "to a human.",
             new[] { "kibana", "code", "github" }),
@@ -132,9 +132,18 @@ public sealed class CapabilityRegistry
 public sealed class IntegrationConfig
 {
     private readonly Dictionary<string, string> _values;
+    private readonly Func<string, string, string?>? _getValue;
 
-    public IntegrationConfig(IDictionary<string, string>? values = null) =>
+    public IntegrationConfig(IDictionary<string, string>? values = null)
+    {
         _values = values is null ? new() : new(values, StringComparer.OrdinalIgnoreCase);
+    }
+
+    public IntegrationConfig(Func<string, string, string?> getValue)
+    {
+        _values = new();
+        _getValue = getValue;
+    }
 
     public static IntegrationConfig Load(string path)
     {
@@ -150,6 +159,12 @@ public sealed class IntegrationConfig
     /// <summary>A config value for a capability key — file first, then a SMARTY_CAP_KEY env var. Null if unset.</summary>
     public string? Get(string capabilityId, string key)
     {
+        if (_getValue is not null)
+        {
+            var dbVal = _getValue(capabilityId, key);
+            if (!string.IsNullOrWhiteSpace(dbVal)) return dbVal;
+        }
+
         if (_values.TryGetValue($"{capabilityId}.{key}", out var v) && !string.IsNullOrWhiteSpace(v)) return v;
         var envName = $"SMARTY_{capabilityId}_{key}".ToUpperInvariant().Replace('.', '_').Replace('-', '_');
         var env = Environment.GetEnvironmentVariable(envName);

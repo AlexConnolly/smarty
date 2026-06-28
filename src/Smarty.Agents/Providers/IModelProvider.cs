@@ -63,6 +63,12 @@ public sealed class ModelResponse
     /// <summary>Why generation stopped.</summary>
     public FinishReason Finish { get; init; } = FinishReason.Stop;
 
+    /// <summary>Input tokens used for this request.</summary>
+    public int InputTokens { get; init; }
+
+    /// <summary>Output tokens generated for this request.</summary>
+    public int OutputTokens { get; init; }
+
     public bool HasToolCalls => ToolCalls.Count > 0;
 
     public Message ToMessage() => Message.Assistant(Content, Reasoning, ToolCalls.Count > 0 ? ToolCalls : null);
@@ -100,5 +106,32 @@ public interface IModelProvider
             if (ev is ModelStreamEvent.Completed completed)
                 final = completed.Response;
         return final ?? new ModelResponse();
+    }
+}
+
+public static class TokenTracker
+{
+    private static long _totalInputTokens;
+    private static long _totalOutputTokens;
+
+    public static long TotalInputTokens => System.Threading.Volatile.Read(ref _totalInputTokens);
+    public static long TotalOutputTokens => System.Threading.Volatile.Read(ref _totalOutputTokens);
+
+    public static void Initialize(long input, long output)
+    {
+        System.Threading.Volatile.Write(ref _totalInputTokens, input);
+        System.Threading.Volatile.Write(ref _totalOutputTokens, output);
+    }
+
+    public static void Reset()
+    {
+        System.Threading.Volatile.Write(ref _totalInputTokens, 0);
+        System.Threading.Volatile.Write(ref _totalOutputTokens, 0);
+    }
+
+    public static void Record(long input, long output)
+    {
+        System.Threading.Interlocked.Add(ref _totalInputTokens, input);
+        System.Threading.Interlocked.Add(ref _totalOutputTokens, output);
     }
 }

@@ -56,8 +56,21 @@ public sealed class KibanaCapability : ICapability
                 {
                     try
                     {
+                        var query = args.GetStringOrNull("query");
+                        var window = args.GetStringOrNull("window") ?? "1h";
+
+                        if (task.GateProvider != null)
+                        {
+                            bool approved = await task.GateProvider.RequestAccessAsync(
+                                "log_search", $"Query Kibana logs with query: \"{query}\", window: \"{window}\"", ct).ConfigureAwait(false);
+                            if (!approved)
+                            {
+                                return ToolOutput.DeadEnd("Access denied by the user. Cannot run log search.");
+                            }
+                        }
+
                         var text = await client.SearchAsync(
-                            args.GetStringOrNull("query"), args.GetStringOrNull("window") ?? "1h", 25, ct).ConfigureAwait(false);
+                            query, window, 25, ct).ConfigureAwait(false);
                         return ToolOutput.Ok(text);
                     }
                     catch (OperationCanceledException) { throw; }
@@ -77,8 +90,21 @@ public sealed class KibanaCapability : ICapability
                 {
                     try
                     {
+                        var window = args.GetStringOrNull("window") ?? "1h";
+                        var query = args.GetStringOrNull("query");
+
+                        if (task.GateProvider != null)
+                        {
+                            bool approved = await task.GateProvider.RequestAccessAsync(
+                                "log_summary", $"Query Kibana log summary with query: \"{query}\", window: \"{window}\"", ct).ConfigureAwait(false);
+                            if (!approved)
+                            {
+                                return ToolOutput.DeadEnd("Access denied by the user. Cannot run log summary.");
+                            }
+                        }
+
                         var text = await client.SummaryAsync(
-                            args.GetStringOrNull("window") ?? "1h", args.GetStringOrNull("query"), ct).ConfigureAwait(false);
+                            window, query, ct).ConfigureAwait(false);
                         return ToolOutput.Ok(text);
                     }
                     catch (OperationCanceledException) { throw; }

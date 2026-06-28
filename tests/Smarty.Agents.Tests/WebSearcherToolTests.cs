@@ -134,6 +134,40 @@ public class WebSearcherToolTests
         Assert.Equal(2, callCount);
     }
 
+    [Fact]
+    public async Task Tool_uses_secondary_provider_default_if_available()
+    {
+        var primaryProvider = new MockModelProvider(req => new ModelResponse { Content = "Primary should not be called" });
+        var secondaryProvider = new MockModelProvider(req => new ModelResponse { Content = "10" });
+
+        var primarySpec = new ModelSpec("primary-mock", "p-model");
+        var secondarySpec = new ModelSpec("secondary-mock", "s-model");
+
+        ModelProviderRegistry.Default.Register("primary-mock", _ => primaryProvider);
+        ModelProviderRegistry.Default.Register("secondary-mock", _ => secondaryProvider);
+
+        var prevDefault = ModelSpec.Default;
+        var prevSecondary = ModelSpec.SecondaryDefault;
+        try
+        {
+            ModelSpec.Default = primarySpec;
+            ModelSpec.SecondaryDefault = secondarySpec;
+
+            using var json = JsonDocument.Parse("""{"url":"https://en.wikipedia.org/wiki/Moby-Dick","query":"whale","max_chunks":2}""");
+            var args = new ToolCallArguments(json.RootElement);
+
+            ToolOutput result = await WebSearcherTool.CreatePageLoadTool().InvokeAsync(args);
+
+            Assert.False(result.IsError, $"Error: {result.Content}");
+            Assert.Contains("score 10", result.Content);
+        }
+        finally
+        {
+            ModelSpec.Default = prevDefault;
+            ModelSpec.SecondaryDefault = prevSecondary;
+        }
+    }
+
     private class MockModelProvider : IModelProvider
     {
         private readonly Func<ModelRequest, ModelResponse> _responseFactory;

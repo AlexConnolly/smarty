@@ -124,9 +124,20 @@ public sealed class SlackSocketMode
 
                 // Only Events API payloads carry messages/mentions we care about. Dispatch on a background
                 // task so a slow handler can't delay the next ack (we've already acked above).
-                if (type == "events_api" && root.TryGetProperty("payload", out var payload))
+                if ((type == "events_api" || type == "interactive") && root.TryGetProperty("payload", out var payload))
                 {
-                    var clone = payload.Clone();
+                    JsonElement parsedPayload;
+                    if (payload.ValueKind == JsonValueKind.String)
+                    {
+                        using var docParsed = JsonDocument.Parse(payload.GetString()!);
+                        parsedPayload = docParsed.RootElement.Clone();
+                    }
+                    else
+                    {
+                        parsedPayload = payload.Clone();
+                    }
+
+                    var clone = parsedPayload;
                     _ = Task.Run(async () =>
                     {
                         try { await onPayload(clone).ConfigureAwait(false); }

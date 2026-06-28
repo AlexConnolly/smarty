@@ -97,6 +97,13 @@ export interface WorkerQuestion {
   project?: string | null
 }
 
+export interface GateRequest {
+  taskId: string
+  gateRequestId: string
+  action: string
+  description: string
+}
+
 export interface SessionHandlers {
   onMsgStart?: (id: number, role: string) => void
   onContent?: (id: number, text: string) => void
@@ -105,6 +112,9 @@ export interface SessionHandlers {
   onWorking?: (id: string, task: string) => void
   onWorkingDone?: (id: string, status?: string) => void
   onQuestion?: (q: WorkerQuestion) => void
+  onGateRequest?: (g: GateRequest) => void
+  onGateResolved?: (taskId: string, gateRequestId: string, approved: boolean) => void
+  onTaskProgressDigest?: (digest: { id: string; text: string; items: { id: string; description: string; summary: string }[] }) => void
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -163,6 +173,25 @@ export async function answerTask(sessionId: string, taskId: string, content: str
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content }),
   })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+}
+
+/** Resolve a pending gate request for a task. */
+export async function resolveGate(
+  sessionId: string,
+  taskId: string,
+  gateRequestId: string,
+  approved: boolean,
+  rememberForTask = false,
+): Promise<void> {
+  const res = await fetch(
+    `/api/session/${sessionId}/task/${encodeURIComponent(taskId)}/gate/${encodeURIComponent(gateRequestId)}/resolve`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ approved, rememberForTask }),
+    },
+  )
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
 }
 
@@ -268,5 +297,137 @@ function dispatch(ev: Frame, h: SessionHandlers): void {
       })
       break
     }
+    case 'gate_request': {
+      const g = ev.data as {
+        id: string
+        gateRequestId: string
+        action: string
+        description: string
+      }
+      h.onGateRequest?.({
+        taskId: String(g.id),
+        gateRequestId: g.gateRequestId,
+        action: g.action,
+        description: g.description,
+      })
+      break
+    }
+    case 'gate_resolved': {
+      const g = ev.data as {
+        id: string
+        gateRequestId: string
+        approved: boolean
+      }
+      h.onGateResolved?.(String(g.id), g.gateRequestId, g.approved)
+      break
+    }
+    case 'task_progress_digest': {
+      const d = ev.data as {
+        id: string
+        text: string
+        items: { id: string; description: string; summary: string }[]
+      }
+      h.onTaskProgressDigest?.(d)
+      break;
+    }
   }
+}
+
+// ---- Command Centre Interfaces & APIs ----
+
+export interface TokenUsage {
+  input: number
+  output: number
+  total: number
+}
+
+export interface ProgressEntry {
+  timestamp: string
+  message: string
+}
+
+export interface TaskDetail {
+  id: string
+  sessionId: string
+  description: string
+  project?: string | null
+  persona?: string | null
+  status: string
+  startedAt: string
+  latestThought?: string | null
+  result?: string | null
+  progressLog: ProgressEntry[]
+}
+
+export interface CapabilityDetail {
+  id: string
+  displayName: string
+  requiredConfig: string[]
+  optionalConfig: string[]
+  promptHint?: string
+  isConnected: boolean
+}
+
+export async function fetchSettings(): Promise<Record<string, string>> {
+  const res = await fetch('/api/settings')
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.json()
+}
+
+export async function saveSettings(settings: Record<string, string>): Promise<Record<string, string>> {
+  const res = await fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings)
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error ?? `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function fetchTokens(): Promise<TokenUsage> {
+  const res = await fetch('/api/tokens')
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.json()
+}
+
+export async function resetTokens(): Promise<TokenUsage> {
+  const res = await fetch('/api/tokens/reset', { method: 'POST' })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.json()
+}
+
+export async function fetchTasks(): Promise<TaskDetail[]> {
+  const res = await fetch('/api/tasks')
+  if (!res.ok) return []
+  return res.json()
+}
+
+export async function cancelTaskGlobal(taskId: string): Promise<void> {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+    method: 'DELETE'
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+}
+
+export async function fetchCapabilities(): Promise<CapabilityDetail[]> {
+  const res = await fetch('/api/capabilities')
+  if (!res.ok) return []
+  return res.json()
+}
+
+export interface PersonaDetail {
+  id: string
+  name: string
+  description: string
+  systemPrompt: string
+  capabilityIds: string[]
+}
+
+export async function fetchPersonas(): Promise<PersonaDetail[]> {
+  const res = await fetch('/api/personas')
+  if (!res.ok) return []
+  return res.json()
 }
