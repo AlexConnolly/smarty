@@ -27,6 +27,8 @@ public sealed class KibanaCapability : ICapability
         "window). Diagnose from what the logs actually show — quote concrete error types, counts and times; " +
         "never invent a stack trace or a cause the logs don't support.";
 
+    public void ValidateSystemPrerequisites() { }
+
     public IReadOnlyList<AgentTool> BuildTools(IntegrationConfig config, TaskInfo task)
     {
         var baseUrl = config.Get(Id, "base_url");
@@ -56,21 +58,8 @@ public sealed class KibanaCapability : ICapability
                 {
                     try
                     {
-                        var query = args.GetStringOrNull("query");
-                        var window = args.GetStringOrNull("window") ?? "1h";
-
-                        if (task.GateProvider != null)
-                        {
-                            bool approved = await task.GateProvider.RequestAccessAsync(
-                                "log_search", $"Query Kibana logs with query: \"{query}\", window: \"{window}\"", ct).ConfigureAwait(false);
-                            if (!approved)
-                            {
-                                return ToolOutput.DeadEnd("Access denied by the user. Cannot run log search.");
-                            }
-                        }
-
                         var text = await client.SearchAsync(
-                            query, window, 25, ct).ConfigureAwait(false);
+                            args.GetStringOrNull("query"), args.GetStringOrNull("window") ?? "1h", 25, ct).ConfigureAwait(false);
                         return ToolOutput.Ok(text);
                     }
                     catch (OperationCanceledException) { throw; }
@@ -90,21 +79,8 @@ public sealed class KibanaCapability : ICapability
                 {
                     try
                     {
-                        var window = args.GetStringOrNull("window") ?? "1h";
-                        var query = args.GetStringOrNull("query");
-
-                        if (task.GateProvider != null)
-                        {
-                            bool approved = await task.GateProvider.RequestAccessAsync(
-                                "log_summary", $"Query Kibana log summary with query: \"{query}\", window: \"{window}\"", ct).ConfigureAwait(false);
-                            if (!approved)
-                            {
-                                return ToolOutput.DeadEnd("Access denied by the user. Cannot run log summary.");
-                            }
-                        }
-
                         var text = await client.SummaryAsync(
-                            window, query, ct).ConfigureAwait(false);
+                            args.GetStringOrNull("window") ?? "1h", args.GetStringOrNull("query"), ct).ConfigureAwait(false);
                         return ToolOutput.Ok(text);
                     }
                     catch (OperationCanceledException) { throw; }

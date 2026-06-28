@@ -13,34 +13,6 @@ builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
     policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 builder.Services.AddSingleton<AgentRunStore>();
 
-string dataDir = Path.Combine(builder.Environment.ContentRootPath, "data");
-Directory.CreateDirectory(dataDir);
-string dbPath = Path.Combine(dataDir, "settings.db");
-var settingsDb = new SettingsDatabase(dbPath);
-builder.Services.AddSingleton(settingsDb);
-
-var sessions = new SessionStore();
-builder.Services.AddSingleton(sessions);
-builder.Services.AddHostedService<SlackProcessManager>();
-
-// Load token usage to initialize TokenTracker
-try
-{
-    string tokenUsagePath = Path.Combine(builder.Environment.ContentRootPath, "..", "token_usage.json");
-    if (!File.Exists(tokenUsagePath)) tokenUsagePath = "token_usage.json";
-    if (File.Exists(tokenUsagePath))
-    {
-        var usageJson = File.ReadAllText(tokenUsagePath);
-        using var doc = JsonDocument.Parse(usageJson);
-        long input = doc.RootElement.TryGetProperty("Input", out var inProp) ? inProp.GetInt64() : 0L;
-        long output = doc.RootElement.TryGetProperty("Output", out var outProp) ? outProp.GetInt64() : 0L;
-        TokenTracker.Initialize(input, output);
-    }
-}
-catch { }
-
-ConfigureProviders(settingsDb);
-
 // Local Whisper speech-to-text. Model is downloaded once to disk and cached.
 string whisperModelPath = builder.Configuration["Whisper:ModelPath"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "models", "ggml-base.bin");
@@ -69,6 +41,9 @@ if (Directory.Exists(webRoot))
     app.MapFallbackToFile("index.html", staticOptions);
 }
 
+string ollamaBaseUrl = builder.Configuration["Ollama:BaseUrl"] ?? OllamaModelProvider.DefaultBaseUrl;
+string defaultModel = builder.Configuration["Ollama:Model"] ?? "qwen3:4b";
+
 // Cache searches + fetched pages for an hour (persisted under data/, survives restarts) so repeated
 // lookups reuse the earlier result instead of re-hitting — and re-tripping the bot-blocks of — the network.
 string researchCachePath = builder.Configuration["Research:CachePath"]
@@ -94,10 +69,15 @@ Func<string, CancellationToken, Task<float[]?>> embed = async (text, ct) =>
 {
     try
     {
-        string currentOllamaUrl = settingsDb.GetSetting("ollama.baseUrl", "http://localhost:11434")!;
         var payload = JsonSerializer.Serialize(new { model = embedModel, prompt = text }, json);
         using var content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
-        using var resp = await http.PostAsync($"{currentOllamaUrl}/api/embeddings", content, ct);
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{ollamaBaseUrl}/api/embeddings") { Content = content };
+        var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY") ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY");
+        if (!string.IsNullOrEmpty(apiKey))
+        {
+            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+        }
+        using var resp = await http.SendAsync(req, ct);
         if (!resp.IsSuccessStatusCode) return null;
         using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
         return doc.RootElement.TryGetProperty("embedding", out var arr) && arr.ValueKind == JsonValueKind.Array
@@ -121,32 +101,35 @@ string runsPath = builder.Configuration["Projects:RunsPath"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "data", "runs.json");
 var projectRuns = new ProjectRunStore(runsPath, json);
 
+// Specialist personas (software engineer, PM…) and the capabilities (integrations) they draw on.
+string dataDir = Path.Combine(builder.Environment.ContentRootPath, "data");
+var integrations = IntegrationConfig.Load(Path.Combine(dataDir, "integrations.json"));
+var capabilities = new CapabilityRegistry(new ICapability[]
+{
+    new KibanaCapability(), new CodeCapability(), new GitHubCapability(), new JiraCapability(),
+    new DataScienceCapability(),
+});
+var personas = new PersonaStore();
+
+// Run startup validation on all registered capabilities (e.g. CLI tools / Python packages).
+Console.WriteLine("[startup] Validating capability prerequisites...");
+capabilities.ValidateAll();
+
 // Each delegated task gets a working dir under data/tasks/ — task.md plus any files the user attached.
 string workspaceRoot = builder.Configuration["Tasks:WorkspaceRoot"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "data", "tasks");
 
-var capabilities = new CapabilityRegistry(new ICapability[]
-{
-    new KibanaCapability(), new CodeCapability(), new GitHubCapability(), new JiraCapability(),
-});
-var personas = new PersonaStore();
-var integrations = new IntegrationConfig((capId, key) => settingsDb.GetSetting($"{capId}.{key}"));
-
-var orchestrator = new Orchestrator(
-    ModelSpec.Default.Model,
-    ModelSpec.Default.BaseUrl ?? settingsDb.GetSetting("ollama.baseUrl", "http://localhost:11434")!,
-    WorkerSystemPrompt, json, trainingLog, memory, projects, projectRuns,
-    new OrchestratorOptions 
-    { 
+var sessions = new SessionStore();
+var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory, projects, projectRuns,
+    new OrchestratorOptions
+    {
         WorkspaceRoot = workspaceRoot,
-        Model = ModelSpec.Default,
-        SecondaryModel = ModelSpec.SecondaryDefault,
-        Capabilities = capabilities,
         Personas = personas,
+        Capabilities = capabilities,
         IntegrationConfig = integrations
     });
 
-app.MapGet("/health", (SettingsDatabase db) => Results.Ok(new { status = "ok", model = db.GetSetting("ollama.model", "qwen3.5:latest") }));
+app.MapGet("/health", () => Results.Ok(new { status = "ok", model = defaultModel }));
 
 // The projects on the go — for the slide-out bar. Only active projects, with how much is recorded against
 // each. Projects are the only thing surfaced here: work with no project isn't shown anywhere.
@@ -182,12 +165,11 @@ app.MapGet("/api/projects/{slug}", (string slug) =>
 });
 
 // Open passthrough of the available Ollama models, so the UI can offer a picker.
-app.MapGet("/api/models", async (SettingsDatabase db) =>
+app.MapGet("/api/models", async () =>
 {
     try
     {
-        string currentOllamaUrl = db.GetSetting("ollama.baseUrl", "http://localhost:11434")!;
-        var body = await http.GetStringAsync($"{currentOllamaUrl}/api/tags");
+        var body = await http.GetStringAsync($"{ollamaBaseUrl}/api/tags");
         return Results.Content(body, "application/json");
     }
     catch (Exception ex)
@@ -419,160 +401,11 @@ app.MapGet("/api/chat/{id}", async (string id, int? from, AgentRunStore store, H
     }
 });
 
-// ---- Command Centre settings endpoints ----
-
-app.MapGet("/api/settings", (SettingsDatabase db) =>
+// Explicitly stop a run (the UI's Stop button). A disconnect does NOT do this.
+app.MapDelete("/api/chat/{id}", (string id, AgentRunStore store) =>
 {
-    return Results.Ok(db.GetAllSettings());
-});
-
-app.MapPost("/api/settings", (Dictionary<string, string> newSettings, SettingsDatabase db) =>
-{
-    if (newSettings == null) return Results.BadRequest("Settings cannot be null.");
-    db.SaveSettings(newSettings);
-    // Reload model providers in memory
-    try
-    {
-        ConfigureProviders(db, orchestrator);
-    }
-    catch (Exception ex)
-    {
-        return Results.Json(new { error = $"Settings saved but providers failed to reload: {ex.Message}" }, statusCode: 400);
-    }
-    return Results.Ok(db.GetAllSettings());
-});
-
-app.MapGet("/api/tokens", () =>
-{
-    long input = TokenTracker.TotalInputTokens;
-    long output = TokenTracker.TotalOutputTokens;
-    return Results.Ok(new { input, output, total = input + output });
-});
-
-app.MapPost("/api/tokens/reset", () =>
-{
-    TokenTracker.Reset();
-    try
-    {
-        File.WriteAllText("token_usage.json", $"{{\"Input\": 0, \"Output\": 0}}");
-    }
-    catch { }
-    return Results.Ok(new { input = 0L, output = 0L, total = 0L });
-});
-
-app.MapGet("/api/tasks", (SessionStore sessionStore) =>
-{
-    var tasksList = new List<object>();
-    foreach (var session in sessionStore.GetAll())
-    {
-        foreach (var task in session.Tasks.Values)
-        {
-            tasksList.Add(new
-            {
-                id = task.Id,
-                sessionId = session.Id,
-                description = task.Description,
-                project = task.Project,
-                persona = task.Persona,
-                status = task.Status,
-                startedAt = task.StartedAt,
-                latestThought = task.LatestThought,
-                result = task.Result,
-                progressLog = task.ProgressLog.Select(p => new { timestamp = p.Timestamp, message = p.Message }).ToList()
-            });
-        }
-    }
-    return Results.Ok(tasksList);
-});
-
-app.MapDelete("/api/tasks/{taskId}", (string taskId, SessionStore sessionStore) =>
-{
-    taskId = taskId.TrimStart('#').Trim();
-    foreach (var session in sessionStore.GetAll())
-    {
-        if (session.Tasks.TryGetValue(taskId, out var task))
-        {
-            if (task.IsRunning)
-            {
-                task.Status = "cancelled";
-                task.Cts.Cancel();
-                session.Append("working_done", JsonSerializer.Serialize(new { id = task.Id, status = task.Status }, json));
-            }
-            return Results.Ok(new { id = task.Id, status = task.Status });
-        }
-    }
-    return Results.NotFound(new { error = $"task #{taskId} not found" });
-});
-
-app.MapGet("/api/capabilities", (SettingsDatabase db) =>
-{
-    var capRegistry = new CapabilityRegistry(new ICapability[]
-    {
-        new KibanaCapability(), new CodeCapability(), new GitHubCapability(), new JiraCapability(),
-    });
-    
-    var list = new List<object>();
-    var integrationConfig = new IntegrationConfig((capId, key) => db.GetSetting($"{capId}.{key}"));
-    
-    foreach (var cap in capRegistry.BuildFor(new string[] { "kibana", "code", "github", "jira" }, integrationConfig, new TaskInfo { Id = "diag", Description = "Diagnostic" }).Select(t => t.Name).ToList())
-    {
-        // Actually, let's just inspect capabilities from the registry directly!
-    }
-
-    foreach (var cap in new ICapability[] { new KibanaCapability(), new CodeCapability(), new GitHubCapability(), new JiraCapability() })
-    {
-        var required = cap.RequiredConfig;
-        
-        var optional = new List<string>();
-        if (cap.Id == "kibana") optional.AddRange(new[] { "api_key", "index", "time_field", "group_field" });
-        else if (cap.Id == "github") optional.AddRange(new[] { "token", "repo" });
-        
-        bool isConnected = required.Count == 0 || required.All(reqKey => !string.IsNullOrWhiteSpace(integrationConfig.Get(cap.Id, reqKey)));
-        if (cap.Id == "github")
-        {
-            isConnected = !string.IsNullOrWhiteSpace(integrationConfig.Get(cap.Id, "token"));
-        }
-
-        list.Add(new
-        {
-            id = cap.Id,
-            displayName = cap.DisplayName,
-            requiredConfig = required,
-            optionalConfig = optional,
-            promptHint = cap.PromptHint,
-            isConnected = isConnected
-        });
-    }
-
-    var slackEnabled = db.GetSetting("slack.enabled", "false") == "true";
-    var slackBotToken = db.GetSetting("slack.botToken", "")!;
-    var slackAppToken = db.GetSetting("slack.appToken", "")!;
-    var slackConnected = slackEnabled && !string.IsNullOrWhiteSpace(slackBotToken) && !string.IsNullOrWhiteSpace(slackAppToken);
-
-    list.Add(new
-    {
-        id = "slack",
-        displayName = "Slack Gateway",
-        requiredConfig = new List<string> { "enabled", "botToken", "appToken" },
-        optionalConfig = new List<string> { "companyName", "companyContext", "dataDir" },
-        promptHint = "Connects Smarty to Slack threads, allowing users to tag @smarty to start background agent workflows.",
-        isConnected = slackConnected
-    });
-    
-    return Results.Ok(list);
-});
-
-app.MapGet("/api/personas", () =>
-{
-    var store = new PersonaStore();
-    return Results.Ok(store.All.Select(p => new
-    {
-        id = p.Id,
-        name = p.Name,
-        description = p.Description,
-        systemPrompt = p.SystemPrompt,
-        capabilityIds = p.CapabilityIds
-    }));
+    store.Get(id)?.Cancel();
+    return Results.Ok();
 });
 
 app.Run();
@@ -636,20 +469,17 @@ string WorkerSystemPrompt() =>
         ? "You are a helpful assistant."
         : request.System!;
 
-    string dbOllamaUrl = settingsDb.GetSetting("ollama.baseUrl", "http://localhost:11434")!;
-    string dbDefaultModel = settingsDb.GetSetting("ollama.model", "qwen3.5:latest")!;
-
     var input = new AgentInput
     {
         SystemPrompt = baseSystem + HostContext(),
-        Model = ModelSpec.Ollama(string.IsNullOrWhiteSpace(request.Model) ? dbDefaultModel : request.Model!, dbOllamaUrl),
+        Model = ModelSpec.Ollama(string.IsNullOrWhiteSpace(request.Model) ? defaultModel : request.Model!, ollamaBaseUrl),
         Conversation = conversation,
     };
 
     if (request.EnableTools ?? true)
     {
-        string modelName = string.IsNullOrWhiteSpace(request.Model) ? dbDefaultModel : request.Model!;
-        var provider = new OllamaModelProvider(dbOllamaUrl);
+        string modelName = string.IsNullOrWhiteSpace(request.Model) ? defaultModel : request.Model!;
+        var provider = new OllamaModelProvider(ollamaBaseUrl);
         input.Tools.Add(ShellTool.Create());
         input.Tools.Add(WebResearch.SearchTool());
         input.Tools.Add(WebResearch.PageAnswerTool(provider, modelName));
@@ -694,50 +524,6 @@ async Task RunAgentAsync(AgentRunSession session, AgentInput input, string promp
     }
 }
 
-void ConfigureProviders(SettingsDatabase db, Orchestrator? orchestratorInstance = null)
-{
-    string dbOllamaUrl = db.GetSetting("ollama.baseUrl", "http://localhost:11434")!;
-    string dbDefaultModel = db.GetSetting("ollama.model", "qwen3.5:latest")!;
-    string dbTogetherKey = db.GetSetting("together.apiKey", "")!;
-    string dbTogetherUrl = db.GetSetting("together.baseUrl", "https://api.together.xyz/v1")!;
-
-    // Register together provider with active settings
-    ModelProviderRegistry.Default.Register("together", spec => new TogetherModelProvider(dbTogetherKey, spec.BaseUrl ?? dbTogetherUrl));
-
-    // Load primary model spec
-    string primaryProvider = db.GetSetting("model.provider", "ollama")!;
-    string primaryModelName = db.GetSetting("model.modelName", dbDefaultModel)!;
-    string? primaryBaseUrl = db.GetSetting("model.baseUrl");
-    if (string.IsNullOrWhiteSpace(primaryBaseUrl) && primaryProvider == "ollama")
-        primaryBaseUrl = dbOllamaUrl;
-
-    var primarySpec = new ModelSpec(primaryProvider, primaryModelName, string.IsNullOrWhiteSpace(primaryBaseUrl) ? null : primaryBaseUrl);
-    ModelSpec.Default = primarySpec;
-
-    // Load secondary model spec
-    string? secondaryProvider = db.GetSetting("secondaryModel.provider");
-    string? secondaryModelName = db.GetSetting("secondaryModel.modelName");
-    string? secondaryBaseUrl = db.GetSetting("secondaryModel.baseUrl");
-
-    ModelSpec? secondarySpec = null;
-    if (!string.IsNullOrWhiteSpace(secondaryProvider) && !string.IsNullOrWhiteSpace(secondaryModelName))
-    {
-        if (string.IsNullOrWhiteSpace(secondaryBaseUrl) && secondaryProvider == "ollama")
-            secondaryBaseUrl = dbOllamaUrl;
-        secondarySpec = new ModelSpec(secondaryProvider, secondaryModelName, string.IsNullOrWhiteSpace(secondaryBaseUrl) ? null : secondaryBaseUrl);
-        ModelSpec.SecondaryDefault = secondarySpec;
-    }
-    else
-    {
-        ModelSpec.SecondaryDefault = null;
-    }
-
-    if (orchestratorInstance is not null)
-    {
-        orchestratorInstance.UpdateModels(primarySpec, secondarySpec);
-    }
-}
-
 // ---- request DTOs ----
 
 internal sealed record ChatRequest(
@@ -752,7 +538,3 @@ internal sealed record SessionMessage(string Content);
 internal sealed record ProjectPin(string? Slug);
 
 internal sealed record FeedbackMessage(int MessageId, string Rating, string? Note);
-
-internal sealed record GateResolutionRequest(bool Approved, bool RememberForTask);
-
-

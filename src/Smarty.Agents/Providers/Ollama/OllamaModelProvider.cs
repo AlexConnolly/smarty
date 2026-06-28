@@ -1,3 +1,4 @@
+using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
@@ -26,11 +27,14 @@ public sealed class OllamaModelProvider : IModelProvider
 
     private readonly HttpClient _http;
     private readonly string _baseUrl;
+    private readonly string? _apiKey;
 
     public OllamaModelProvider(string? baseUrl = null, HttpClient? http = null)
     {
         _baseUrl = (baseUrl ?? DefaultBaseUrl).TrimEnd('/');
         _http = http ?? Shared;
+        _apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY") 
+            ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY");
     }
 
     public async IAsyncEnumerable<ModelStreamEvent> StreamAsync(
@@ -44,6 +48,10 @@ public sealed class OllamaModelProvider : IModelProvider
             {
                 Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"),
             };
+            if (!string.IsNullOrEmpty(_apiKey))
+            {
+                httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+            }
             return await _http.SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         }
 

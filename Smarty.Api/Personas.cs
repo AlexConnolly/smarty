@@ -49,7 +49,7 @@ public sealed class PersonaStore
             "Then PROPOSE A FIX, grounded in the real code: use code_search/code_read to find the exact file and " +
             "method involved, identify the root cause in the source, and write a concrete proposed change — name " +
             "the file and method, show the before/after, and explain why it addresses the cause. Prefer writing " +
-            "the proposed patch to a file with write_file (it's delivered to the user automatically). You are PROPOSING only: " +
+            "the proposed patch to a file with write_file and sending it with send_file. You are PROPOSING only: " +
             "you cannot and must not modify the repository or claim you have applied anything — leave the decision " +
             "to a human.",
             new[] { "kibana", "code", "github" }),
@@ -63,6 +63,21 @@ public sealed class PersonaStore
             "claims about current work in real Jira issues (jira_search / jira_get_issue) rather than guessing, " +
             "and when the user actually wants a ticket, create it with jira_create_issue. Don't pad with platitudes.",
             new[] { "jira" }),
+
+        new Persona(
+            "data_scientist",
+            "Data Scientist",
+            "Analyzes data files (CSVs, Excel, PDFs, etc.), writes Python code to process them, generates graphs, and compiles beautiful PDF reports.",
+            "You are acting as a DATA SCIENTIST. Your role is to analyze data, find patterns, create visualizations, and generate professional PDF reports. " +
+            "When the user asks you to analyze a file, use the available tools to understand the file structure first. " +
+            "Then, write and execute Python code using run_python to do the heavy lifting: statistical analysis, plotting, and report generation.\n" +
+            "CRITICAL INSTRUCTIONS FOR REPORTS:\n" +
+            "- NEVER use markdown tables, ascii charts, or raw markdown formatting to present detailed reports, charts, or structured summaries to the user.\n" +
+            "- Instead, ALWAYS write a Python script to generate a beautiful PDF report containing these tables and charts, and then send it to the user using send_file.\n" +
+            "- You can use matplotlib/seaborn to create charts (save them to disk), and reportlab to build multi-page PDF documents incorporating text, tables, and images.\n" +
+            "- Make your PDF reports look professional, clean, and well-designed (e.g. use proper margins, page numbers, cohesive colors, and clear table formatting).\n" +
+            "- In your final text response to the user, provide a very brief, high-level summary of your main findings (1-2 sentences) and announce the generated PDF report. Never print long markdown tables or lists of data.",
+            new[] { "datascience" }),
     };
 }
 
@@ -86,6 +101,10 @@ public interface ICapability
     /// <summary>Build this capability's tools for a task, reading any credentials from <paramref name="config"/>.
     /// Returns an empty list when the required config is absent — the persona then simply runs without it.</summary>
     IReadOnlyList<AgentTool> BuildTools(IntegrationConfig config, TaskInfo task);
+
+    /// <summary>Checks if any prerequisites on the host machine (e.g. CLI tools, local packages) are met.
+    /// Throws an exception if critical requirements are missing, preventing application startup.</summary>
+    void ValidateSystemPrerequisites();
 }
 
 /// <summary>The set of known capabilities, by id. Resolves a persona's capability ids into a flattened toolset
@@ -98,6 +117,16 @@ public sealed class CapabilityRegistry
         _caps = capabilities.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
 
     public ICapability? Get(string id) => _caps.TryGetValue(id, out var c) ? c : null;
+
+    /// <summary>Runs system prerequisite validation for all registered capabilities.</summary>
+    public void ValidateAll()
+    {
+        foreach (var cap in _caps.Values)
+        {
+            Console.WriteLine($"[startup] Validating capability: {cap.DisplayName} ({cap.Id})...");
+            cap.ValidateSystemPrerequisites();
+        }
+    }
 
     /// <summary>Every tool contributed by the given capability ids (each built with its config). Unknown or
     /// unconfigured ids contribute nothing.</summary>
@@ -132,18 +161,9 @@ public sealed class CapabilityRegistry
 public sealed class IntegrationConfig
 {
     private readonly Dictionary<string, string> _values;
-    private readonly Func<string, string, string?>? _getValue;
 
-    public IntegrationConfig(IDictionary<string, string>? values = null)
-    {
+    public IntegrationConfig(IDictionary<string, string>? values = null) =>
         _values = values is null ? new() : new(values, StringComparer.OrdinalIgnoreCase);
-    }
-
-    public IntegrationConfig(Func<string, string, string?> getValue)
-    {
-        _values = new();
-        _getValue = getValue;
-    }
 
     public static IntegrationConfig Load(string path)
     {
@@ -159,12 +179,6 @@ public sealed class IntegrationConfig
     /// <summary>A config value for a capability key — file first, then a SMARTY_CAP_KEY env var. Null if unset.</summary>
     public string? Get(string capabilityId, string key)
     {
-        if (_getValue is not null)
-        {
-            var dbVal = _getValue(capabilityId, key);
-            if (!string.IsNullOrWhiteSpace(dbVal)) return dbVal;
-        }
-
         if (_values.TryGetValue($"{capabilityId}.{key}", out var v) && !string.IsNullOrWhiteSpace(v)) return v;
         var envName = $"SMARTY_{capabilityId}_{key}".ToUpperInvariant().Replace('.', '_').Replace('-', '_');
         var env = Environment.GetEnvironmentVariable(envName);

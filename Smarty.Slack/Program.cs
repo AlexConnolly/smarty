@@ -30,60 +30,29 @@ var training = new TrainingLog(Path.Combine(config.DataDir, "training-data"), js
 // Scheduled tasks (reminders / future actions), persisted so they survive a restart.
 var schedules = new ScheduleStore(Path.Combine(config.DataDir, "schedules.json"), json);
 
-// Load dynamic configuration from the settings database (shared with the web API)
-string dbPath = Path.Combine(Directory.GetCurrentDirectory(), "data", "settings.db");
-if (!File.Exists(dbPath))
-{
-    var apiDbPath = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "..", "Smarty.Api", "data", "settings.db"));
-    if (File.Exists(apiDbPath)) dbPath = apiDbPath;
-}
-
-var settingsDb = new SettingsDatabase(dbPath);
-
-var integrations = new IntegrationConfig((capId, key) => settingsDb.GetSetting($"{capId}.{key}"));
+// Specialist personas (software engineer, PM…) and the capabilities (integrations) they draw on. Integration
+// credentials live in <dataDir>/integrations.json (or SMARTY_<CAP>_<KEY> env vars) and are NEVER shown to the
+// model — capabilities read them to build authenticated tools. Built-in personas for now; Kibana is the first
+// real integration (read-only log/exception search), which contributes tools only when it's configured.
+var integrations = IntegrationConfig.Load(Path.Combine(config.DataDir, "integrations.json"));
 var capabilities = new CapabilityRegistry(new ICapability[]
 {
     new KibanaCapability(), new CodeCapability(), new GitHubCapability(), new JiraCapability(),
+    new DataScienceCapability(),
 });
 var personas = new PersonaStore();
 
-string dbOllamaUrl = settingsDb.GetSetting("ollama.baseUrl", config.OllamaBaseUrl)!;
-string dbDefaultModel = settingsDb.GetSetting("ollama.model", config.Model)!;
-string dbTogetherKey = settingsDb.GetSetting("together.apiKey", "")!;
-string dbTogetherUrl = settingsDb.GetSetting("together.baseUrl", "https://api.together.xyz/v1")!;
+// Run startup validation on all registered capabilities
+Console.WriteLine("[startup] Validating capability prerequisites...");
+capabilities.ValidateAll();
 
-// Register Together provider
-ModelProviderRegistry.Default.Register("together", spec => new TogetherModelProvider(dbTogetherKey, spec.BaseUrl ?? dbTogetherUrl));
-
-// Load primary model spec
-string primaryProvider = settingsDb.GetSetting("model.provider", "ollama")!;
-string primaryModelName = settingsDb.GetSetting("model.modelName", dbDefaultModel)!;
-string? primaryBaseUrl = settingsDb.GetSetting("model.baseUrl");
-if (string.IsNullOrWhiteSpace(primaryBaseUrl) && primaryProvider == "ollama")
-    primaryBaseUrl = dbOllamaUrl;
-
-var primarySpec = new ModelSpec(primaryProvider, primaryModelName, string.IsNullOrWhiteSpace(primaryBaseUrl) ? null : primaryBaseUrl);
-ModelSpec.Default = primarySpec;
-
-// Load secondary model spec
-string? secondaryProvider = settingsDb.GetSetting("secondaryModel.provider");
-string? secondaryModelName = settingsDb.GetSetting("secondaryModel.modelName");
-string? secondaryBaseUrl = settingsDb.GetSetting("secondaryModel.baseUrl");
-
-if (!string.IsNullOrWhiteSpace(secondaryProvider) && !string.IsNullOrWhiteSpace(secondaryModelName))
-{
-    if (string.IsNullOrWhiteSpace(secondaryBaseUrl) && secondaryProvider == "ollama")
-        secondaryBaseUrl = dbOllamaUrl;
-    ModelSpec.SecondaryDefault = new ModelSpec(secondaryProvider, secondaryModelName, string.IsNullOrWhiteSpace(secondaryBaseUrl) ? null : secondaryBaseUrl);
-}
-else
-{
-    ModelSpec.SecondaryDefault = null;
-}
-
-var provider = ModelProviderRegistry.Default.Resolve(primarySpec);
-var secondaryModelProvider = ModelSpec.SecondaryDefault != null ? ModelProviderRegistry.Default.Resolve(ModelSpec.SecondaryDefault) : provider;
-var secondaryModelNameVal = ModelSpec.SecondaryDefault?.Model ?? primarySpec.Model;
+string apiKey = Environment.GetEnvironmentVariable("TOGETHER_API_KEY") 
+    ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY") 
+    ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY") ?? "";
+string? togetherBaseUrl = (config.OllamaBaseUrl.Contains("localhost") || config.OllamaBaseUrl.Contains("127.0.0.1")) ? null : config.OllamaBaseUrl;
+IModelProvider provider = config.Model.Contains("/") || (config.OllamaBaseUrl != null && config.OllamaBaseUrl.Contains("together"))
+    ? new TogetherModelProvider(apiKey, togetherBaseUrl)
+    : new OllamaModelProvider(config.OllamaBaseUrl);
 
 // Cache searches + fetched pages for an hour (persisted to the Slack data dir, survives restarts) so
 // repeated lookups don't re-hit — and re-trip the bot-blocks of — the search engines and sites.
@@ -96,18 +65,18 @@ var webTools = new AgentTool[]
     WebResearch.SearchTool(),
     WebResearch.PageAnswerTool(provider, config.Model),
     FileTools.ReadFileTool(),
-    FileTools.SummaryTool(secondaryModelProvider, secondaryModelNameVal),
+    FileTools.SummaryTool(provider, config.Model),
 };
 
 // Per-user memory: a fact is scoped to the SPEAKER by default ("I'm vegetarian" → that person), or shared
 // team-wide when flagged (the office address). Reads span the speaker's own scope + the shared scope. The
 // worker's tools are built PER TASK so they carry the asker's scope (TaskInfo.UserScope); the orchestrator's
 // set_memory is a schema only — it's executed with the live speaker's scope inside the orchestrator.
-var planner = new TaskPlanner(primarySpec, ModelProviderRegistry.Default, () => webTools); // recon = web only, read-only
+var planner = new TaskPlanner(config.Model, config.OllamaBaseUrl, () => webTools); // recon = web only, read-only
 
 // Supervisor: watches running workers and, when one thrashes (relentless failing search), nudges it to wrap
 // up with what it has — or aborts a hopeless task. The go/no-go check only runs when cheap signals trip.
-var watchdog = new TaskWatchdog(primarySpec, ModelProviderRegistry.Default);
+var watchdog = new TaskWatchdog(config.Model, config.OllamaBaseUrl);
 
 var options = new OrchestratorOptions
 {
@@ -130,53 +99,11 @@ var options = new OrchestratorOptions
     Personas = personas,                             // specialist roles delegate can route to
     Capabilities = capabilities,                     // integrations (Kibana…) personas draw on
     IntegrationConfig = integrations,                // credentials for capabilities — never shown to the model
-    Model = primarySpec,
-    SecondaryModel = ModelSpec.SecondaryDefault,
 };
 
 var orchestrator = new Orchestrator(
     config.Model, config.OllamaBaseUrl, () => SlackPrompts.WorkerSystem(config.CompanyName),
     json, training, memory, projects, runs, options);
-
-if (args.Contains("--demo"))
-{
-    Console.WriteLine("Running local demo...");
-    var session = new Session("demo-session");
-    try
-    {
-        TokenTracker.Reset();
-        
-        await orchestrator.HandleMessageAsync(
-            session,
-            "what is wrong with production?",
-            CancellationToken.None,
-            userScope: "user:demo",
-            userName: "DemoUser");
-
-        // Wait for all delegated background tasks to complete
-        while (session.Tasks.Values.Any(t => t.IsActive))
-        {
-            await Task.Delay(1000);
-        }
-
-        // Wait for the re-voicing phase to append the final answer to the session history
-        int historyCountBefore = session.History.Count;
-        for (int i = 0; i < 20; i++)
-        {
-            if (session.History.Count > historyCountBefore)
-                break;
-            await Task.Delay(1000);
-        }
-            
-        Console.WriteLine($"[DEMO_RESULT]\n{session.History.Last().Content}");
-        Console.WriteLine($"[DEMO_TOKENS] Input: {TokenTracker.TotalInputTokens}, Output: {TokenTracker.TotalOutputTokens}");
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"Error running demo: {ex}");
-    }
-    return 0;
-}
 
 var api = new SlackApiClient(config.BotToken, config.AppToken);
 

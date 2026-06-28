@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Smarty.Agents;
 
 namespace Smarty.Api;
@@ -65,15 +66,6 @@ public sealed class OrchestratorOptions
 
     /// <summary>Integration credentials/config for capabilities, read from disk and NEVER shown to the model.</summary>
     public IntegrationConfig? IntegrationConfig { get; init; }
-
-    /// <summary>Which provider and model to use for the orchestrator and workers. If null, defaults to Ollama(model, ollamaBaseUrl).</summary>
-    public ModelSpec? Model { get; init; }
-
-    /// <summary>Which provider and model to use for lighter tasks (like chunk ranking) when speed/cost is preferred over full reasoning.</summary>
-    public ModelSpec? SecondaryModel { get; init; }
-
-    /// <summary>Registry to resolve the models. Defaults to ModelProviderRegistry.Default.</summary>
-    public ModelProviderRegistry? ModelRegistry { get; init; }
 }
 
 /// <summary>
@@ -85,13 +77,9 @@ public sealed class OrchestratorOptions
 /// </summary>
 public sealed class Orchestrator
 {
-    private IModelProvider _provider;
-    private string _model;
-    private string _ollamaBaseUrl;
-    private ModelSpec _modelSpec;
-    private IModelProvider _secondaryProvider;
-    private ModelSpec? _secondaryModelSpec;
-    private readonly ModelProviderRegistry _registry;
+    private readonly IModelProvider _provider;
+    private readonly string _model;
+    private readonly string _ollamaBaseUrl;
     private readonly Func<string> _workerSystem;
     private readonly JsonSerializerOptions _json;
     private readonly TrainingLog _log;
@@ -111,28 +99,16 @@ public sealed class Orchestrator
 
     public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, MemoryStore memory, ProjectStore projects, ProjectRunStore runs, OrchestratorOptions? options = null)
     {
-        _registry = options?.ModelRegistry ?? ModelProviderRegistry.Default;
-        _modelSpec = options?.Model ?? ModelSpec.Ollama(model, ollamaBaseUrl);
-        _provider = _registry.Resolve(_modelSpec);
-
-        if (options?.SecondaryModel is { } sec)
-        {
-            _secondaryModelSpec = sec;
-            _secondaryProvider = _registry.Resolve(sec);
-        }
-        else if (ModelSpec.SecondaryDefault is { } secDef)
-        {
-            _secondaryModelSpec = secDef;
-            _secondaryProvider = _registry.Resolve(secDef);
-        }
-        else
-        {
-            _secondaryModelSpec = _modelSpec;
-            _secondaryProvider = _provider;
-        }
-
-        _model = _modelSpec.Model;
-        _ollamaBaseUrl = _modelSpec.BaseUrl ?? ollamaBaseUrl;
+        string apiKey = Environment.GetEnvironmentVariable("TOGETHER_API_KEY") 
+            ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY") 
+            ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY") ?? "";
+        
+        string? togetherBaseUrl = (ollamaBaseUrl.Contains("localhost") || ollamaBaseUrl.Contains("127.0.0.1")) ? null : ollamaBaseUrl;
+        _provider = model.Contains("/") || (ollamaBaseUrl != null && ollamaBaseUrl.Contains("together"))
+            ? new TogetherModelProvider(apiKey, togetherBaseUrl)
+            : new OllamaModelProvider(ollamaBaseUrl);
+        _model = model;
+        _ollamaBaseUrl = ollamaBaseUrl;
         _workerSystem = workerSystem;
         _json = json;
         _log = log;
@@ -173,24 +149,6 @@ public sealed class Orchestrator
                 .Append(MemoryTools.SearchTool(memory))
                 .Append(MemoryTools.SetChatTool(memory))
                 .ToArray();
-        }
-    }
-
-    public void UpdateModels(ModelSpec primary, ModelSpec? secondary)
-    {
-        _modelSpec = primary;
-        _provider = _registry.Resolve(primary);
-        _model = primary.Model;
-
-        if (secondary is not null)
-        {
-            _secondaryModelSpec = secondary;
-            _secondaryProvider = _registry.Resolve(secondary);
-        }
-        else
-        {
-            _secondaryModelSpec = primary;
-            _secondaryProvider = _provider;
         }
     }
 
@@ -293,6 +251,10 @@ public sealed class Orchestrator
             session.LastUserMessageAt = DateTimeOffset.UtcNow;
             session.CurrentUserScope = userScope; // who's talking — drives per-user memory (null in the web app)
             session.CurrentUserName = userName;
+            if (attachments is { Count: > 0 } && ThreadFilesDir(session) is { } filesDir)
+            {
+                CopyAttachments(filesDir, attachments);
+            }
             // Hold the turn's attachments so delegate can copy them into the task workspace; the model sees a
             // human-readable note (names/types, not raw paths — those are carried deterministically).
             session.PendingAttachments = attachments is { Count: > 0 } ? attachments : null;
@@ -332,8 +294,8 @@ public sealed class Orchestrator
             session.History.Add(Message.System(
                 "A task you SCHEDULED earlier is now due. Carry it out NOW, using the conversation above as " +
                 "context (it may have moved on since you set this). Do it and report the outcome to the thread " +
-                "in one short, natural line — a proactive heads-up. If it involves producing or returning a " +
-                "file, delegate the work — the worker writes it and it's delivered automatically. Don't " +
+                "in one short, natural line — a proactive heads-up. If it involves a file from this " +
+                "conversation, send it with send_file (delegate the work; the worker has the file tools). Don't " +
                 "ask the user to confirm — only stop if you genuinely can't proceed without a decision only they " +
                 "can make. Never mention scheduling, tasks, or any internal mechanics.\n\nScheduled task: " + taskText));
             await RunOrchestratorTurnAsync(
@@ -395,7 +357,7 @@ public sealed class Orchestrator
             profile = await ProfileNote(session, message, session.CurrentUserScope, ct).ConfigureAwait(false);
             focus = await ProjectFocusNote(session, message, ct).ConfigureAwait(false);
         }
-        var dynamicContext = (DateContext() + profile + focus + RunningTasksNote(session) + ScheduledNote(session) + PersonaNote()).TrimStart();
+        var dynamicContext = (DateContext() + profile + focus + RunningTasksNote(session) + ScheduledNote(session) + FilesNote(session) + PersonaNote()).TrimStart();
         if (dynamicContext.Length > 0)
             convo.Insert(Math.Max(0, convo.Count - 1), Message.System(dynamicContext));
 
@@ -433,6 +395,7 @@ public sealed class Orchestrator
             var sentMessages = convo.ToList(); // exact input for this inference (before we append its output)
             var turnText = new StringBuilder();
             ModelResponse? final = null;
+            var streamFilter = new XmlStreamFilter();
             await foreach (var ev in _provider.StreamAsync(request, ct).ConfigureAwait(false))
             {
                 switch (ev)
@@ -441,7 +404,11 @@ public sealed class Orchestrator
                         turnText.Append(c.Text);
                         spoken.Append(c.Text);
                         spokenFromModel = true;
-                        session.Append("content", Json(new { id = msgId, text = c.Text }));
+                        string filteredText = streamFilter.Feed(c.Text);
+                        if (filteredText.Length > 0)
+                        {
+                            session.Append("content", Json(new { id = msgId, text = filteredText }));
+                        }
                         break;
                     case ModelStreamEvent.Reasoning r:
                         session.Append("reasoning", Json(new { id = msgId, text = r.Text }));
@@ -450,6 +417,11 @@ public sealed class Orchestrator
                         final = done.Response;
                         break;
                 }
+            }
+            string flushedText = streamFilter.Flush();
+            if (flushedText.Length > 0)
+            {
+                session.Append("content", Json(new { id = msgId, text = flushedText }));
             }
             final ??= new ModelResponse();
 
@@ -474,6 +446,33 @@ public sealed class Orchestrator
             });
 
             var calls = final.ToolCalls;
+            if (turnText.ToString().Contains("<tool_call>"))
+            {
+                var availableTools = tools.ToDictionary(t => t.Name, StringComparer.OrdinalIgnoreCase);
+                if (TryExtractXmlToolCalls(turnText.ToString(), availableTools, out var xmlCalls, out var xmlCleaned))
+                {
+                    if (calls == null || calls.Count == 0)
+                    {
+                        calls = xmlCalls;
+                    }
+                    else
+                    {
+                        var merged = calls.ToList();
+                        merged.AddRange(xmlCalls);
+                        calls = merged;
+                    }
+
+                    var oldLen = turnText.Length;
+                    turnText.Clear();
+                    turnText.Append(xmlCleaned);
+
+                    if (spoken.Length >= oldLen)
+                    {
+                        spoken.Remove(spoken.Length - oldLen, oldLen);
+                        spoken.Append(xmlCleaned);
+                    }
+                }
+            }
 
             // Truncation / loop recovery: the model ran past the token cap, timed out, or looped WITHOUT ever
             // calling a tool — so the streamed text is a broken, half-finished fragment (often reasoning-style
@@ -971,7 +970,6 @@ public sealed class Orchestrator
             UserName = session.CurrentUserName,
             PersonalMemoryEnabled = session.PersonalMemoryEnabled,
         };
-        task.GateProvider = new TaskGateProvider(session, task, _json);
         // Give the task its own workspace (task.md + any attached files), so the worker reads the brief and
         // the user's files from one place. No-op when no workspace root is configured.
         task.WorkspaceDir = CreateWorkspace(session, task, session.PendingAttachments);
@@ -1014,14 +1012,9 @@ public sealed class Orchestrator
     /// transcript on a resume) so it always has its full prior context.</summary>
     private async Task DriveWorker(Session session, TaskInfo task, string message)
     {
-        EnsureProgressMonitor(session);
         string result = "(no result)";
         bool cancelled = false;
         bool firstLeg = task.Conversation.Count == 0; // capture before the gate/seeds append to the transcript
-        // Files the worker AUTHORS this run = part of its output. The worker doesn't deliver them; we do, when
-        // we relay its result (below). Declared out here so it's in scope from tool-build through delivery.
-        var produced = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        string? threadFilesDir = ThreadFilesDir(session);
         Trace($"[worker #{task.Id}] drive: {Snip(message, 120)}");
         try
         {
@@ -1031,11 +1024,9 @@ public sealed class Orchestrator
             if (_planner is not null && firstLeg)
             {
                 task.LatestThought = "sizing up the task…";
-                task.RecordProgress("Sizing up the task");
                 if (await _planner.IsComplexAsync(task.Description, task.Cts.Token).ConfigureAwait(false))
                 {
                     task.LatestThought = "planning the approach…";
-                    task.RecordProgress("Planning the approach");
                     Trace($"[worker #{task.Id}] gate → complex; planning");
                     var plan = await _planner.PlanAsync(task.Description, task.Cts.Token).ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(plan))
@@ -1061,40 +1052,51 @@ public sealed class Orchestrator
                     Directory.CreateDirectory(filesDir);
                     seed.Append($"- This conversation's files are in: {filesDir}\n");
                     seed.Append(
-                        "List them with list_files; read one with read_file / file_summary. Write your " +
-                        "deliverable with write_file — anything you write there is part of your output and is " +
-                        "delivered to the user automatically when you finish; you don't send anything yourself. " +
-                        "ONLY files in this conversation are accessible.\n");
+                        "List them with list_files; read one with read_file / file_summary. Write a new file " +
+                        "with write_file, and hand a file to the user with send_file. ONLY files in this " +
+                        "conversation are accessible — you cannot see or send files from anywhere else.\n");
                 }
                 seed.Append("Use run_shell_command too, if you have it. Write any output into this conversation's files area.");
                 task.Conversation.Add(Message.System(seed.ToString()));
                 Trace($"[worker #{task.Id}] workspace seeded: {ws}");
             }
 
+            string workerApiKey = Environment.GetEnvironmentVariable("TOGETHER_API_KEY") 
+                ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY") 
+                ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY") ?? "";
+            string? togetherBaseUrl = (_ollamaBaseUrl.Contains("localhost") || _ollamaBaseUrl.Contains("127.0.0.1")) ? null : _ollamaBaseUrl;
+            IModelProvider provider = _model.Contains("/") || (_ollamaBaseUrl != null && _ollamaBaseUrl.Contains("together"))
+                ? new TogetherModelProvider(workerApiKey, togetherBaseUrl)
+                : new OllamaModelProvider(_ollamaBaseUrl);
             // If this task runs inside a project, inject that project's context and reframe memory toward
             // tracking the project (not the user); writes are auto-tagged to the project's slug.
             // A re-targeted surface (Slack) supplies its own worker toolset (web-only, no shell/memory);
             // the default is the full shell + web + project-memory set.
             var tools = (_workerToolsFactory?.Invoke(task) ?? new AgentTool[]
             {
-                ShellTool.Create(task.GateProvider),
+                ShellTool.Create(),
                 WebResearch.SearchTool(),
-                WebResearch.PageAnswerTool(_provider, _modelSpec.Model),
+                WebResearch.PageAnswerTool(provider, _model),
                 FileTools.ReadFileTool(),
-                FileTools.SummaryTool(_secondaryProvider, _secondaryModelSpec?.Model ?? _modelSpec.Model),
+                FileTools.SummaryTool(provider, _model),
                 MemoryTools.SearchTool(_memory, task.Project),
                 MemoryTools.SetTool(_memory, task.Project),
             }).ToList();
 
-            // Every worker gets the conversation-scoped file tools, rooted at THIS thread's file area:
-            // write_file (author a deliverable) and list_files (discover). It does NOT get a send tool — a worker
-            // never touches the delivery surface; it just produces output, and we deliver any file it authored
-            // when we relay its result. No workspace root → no file area → skip (web default).
-            if (threadFilesDir is { } threadFiles)
+            // Every worker also gets the conversation-scoped file tools, rooted at THIS thread's file area:
+            // write_file (author), list_files (discover), send_file (hand a file back). send_file emits a "file"
+            // event on the session stream, which the surface (Slack thread / SSE) turns into an upload — so a
+            // worker can return a file the moment it's ready. No workspace root → no file area → skip (web default).
+            if (ThreadFilesDir(session) is { } threadFiles)
             {
                 Directory.CreateDirectory(threadFiles);
-                tools.Add(FileTools.WriteFileTool(threadFiles, onWrite: name => produced.Add(name)));
+                tools.Add(FileTools.WriteFileTool(threadFiles));
                 tools.Add(FileTools.ListFilesTool(threadFiles));
+                tools.Add(FileTools.SendFileTool(threadFiles, (path, caption) =>
+                {
+                    session.Append("file", Json(new { path, name = Path.GetFileName(path), caption }));
+                    return true;
+                }));
             }
 
             // Persona routing: a delegated task tagged with a persona runs that role's capability tools (Kibana,
@@ -1110,17 +1112,13 @@ public sealed class Orchestrator
             var input = new AgentInput
             {
                 SystemPrompt = _workerSystem() + ProjectContext(task.Project) + PersonaContext(task),
-                Model = _modelSpec,
-                SecondaryModel = _secondaryModelSpec,
+                Model = _model.Contains("/") || (_ollamaBaseUrl != null && _ollamaBaseUrl.Contains("together"))
+                    ? new ModelSpec("together", _model, togetherBaseUrl)
+                    : ModelSpec.Ollama(_model, _ollamaBaseUrl),
                 // Seed with the task's running transcript so a resumed worker keeps everything it found and
                 // the Q&A so far. AnswerStream appends to this list, so afterwards it IS the full transcript.
                 Conversation = task.Conversation,
                 Tools = tools,
-                // A delegated worker often runs a real investigation — pull logs, explore code across several
-                // files, then write up its output. The default cap of 8 turns guillotines that mid-task, so give
-                // it real room; the watchdog + per-turn timeout still bound any thrashing. (Delivery is no longer
-                // part of the budget — files it writes are delivered by the orchestrator from the result.)
-                MaxIterations = 16,
                 DrainInbox = () => DrainInbox(task),
                 // Honesty over speed: with reasoning on, the worker inspects tool output, notices junk
                 // (e.g. a blank free-space field) and either recovers or says it couldn't — instead of
@@ -1128,7 +1126,11 @@ public sealed class Orchestrator
                 // bolting model-specific crutches into this (deliberately model-agnostic) system.
                 Think = true,
             };
-            var worker = new SmartyAgent(input, _registry);
+            if (task.Persona == "data_scientist")
+            {
+                input.MaxIterations = 15;
+            }
+            var worker = new SmartyAgent(input);
 
             // Supervise this leg: a background watchdog watches the live transcript and nudges the worker to
             // wrap up (or aborts it) if it starts thrashing — a relentless failing search. Stopped the instant
@@ -1153,37 +1155,13 @@ public sealed class Orchestrator
                             task.LatestThought = Tail(thought, 240);
                             break;
                         case AgentEvent.ToolStarted ts:
-                            if (thought.Length > 0)
-                            {
-                                var cleanThought = CleanThoughtToProgress(thought.ToString());
-                                if (!string.IsNullOrWhiteSpace(cleanThought))
-                                {
-                                    task.RecordProgress(cleanThought);
-                                }
-                                thought.Clear();
-                            }
                             task.LatestThought = $"running {ts.ToolName}…";
-                            task.RecordProgress(SanitizeToolStarted(ts.ToolName, ts.Arguments));
                             Trace($"[tool] start {ts.ToolName} {Snip(ts.Arguments, 160)}");
                             break;
                         case AgentEvent.ToolCompleted tc:
-                            var compMsg = SanitizeToolCompleted(tc.ToolName, tc.Result);
-                            if (compMsg != null)
-                            {
-                                task.RecordProgress(compMsg);
-                            }
                             Trace($"[tool] done  {tc.ToolName} -> {Snip(tc.Result, 300)}");
                             break;
                         case AgentEvent.Completed done:
-                            if (thought.Length > 0)
-                            {
-                                var cleanThought = CleanThoughtToProgress(thought.ToString());
-                                if (!string.IsNullOrWhiteSpace(cleanThought))
-                                {
-                                    task.RecordProgress(cleanThought);
-                                }
-                                thought.Clear();
-                            }
                             result = done.Answer;
                             break;
                     }
@@ -1282,50 +1260,12 @@ public sealed class Orchestrator
         // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
         if (cancelled) return;
 
-        // Deliver the worker's artifacts: every file it authored this run is part of its output, so WE send it
-        // here (the worker never reaches the surface). Uploaded just before the relay so the message can refer
-        // to them; nothing depends on the model remembering to "send" within its budget.
-        var delivered = new List<string>();
-        if (threadFilesDir is { } outDir)
-            foreach (var name in produced)
-            {
-                var path = Path.Combine(outDir, name);
-                if (File.Exists(path))
-                {
-                    var finalPath = path;
-                    var finalName = name;
-
-                    if (name.EndsWith(".md", StringComparison.OrdinalIgnoreCase))
-                    {
-                        try
-                        {
-                            var markdownText = File.ReadAllText(path);
-                            var pdfBytes = MarkdownPdf.Convert(markdownText);
-                            var pdfName = Path.ChangeExtension(name, ".pdf");
-                            var pdfPath = Path.Combine(outDir, pdfName);
-                            File.WriteAllBytes(pdfPath, pdfBytes);
-                            finalPath = pdfPath;
-                            finalName = pdfName;
-                        }
-                        catch (Exception ex)
-                        {
-                            Trace($"[worker #{task.Id}] Failed to convert {name} to PDF: {ex.Message}");
-                        }
-                    }
-
-                    session.Append("file", Json(new { path = finalPath, name = finalName, caption = (string?)null }));
-                    delivered.Add(finalName);
-                }
-            }
-        if (delivered.Count > 0) Trace($"[worker #{task.Id}] delivered {delivered.Count} file(s): {string.Join(", ", delivered)}");
-
         // Did the task come back with nothing usable? Then we must NOT relay it as if it had data — the
         // re-voice would otherwise invent a plausible answer (it once fabricated a whole "latest news"
         // rundown from a blank result). We still let the MODEL phrase the reply (so it matches the user's
         // language — no hard-coded line), but on a strict "it failed, invent nothing" instruction.
-        bool failed = (string.IsNullOrWhiteSpace(result)
-                || string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase))
-            && delivered.Count == 0; // if it produced + delivered a file, it's not a failure even if the text is thin
+        bool failed = string.IsNullOrWhiteSpace(result)
+            || string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase);
 
         await session.TurnLock.WaitAsync().ConfigureAwait(false);
         try
@@ -1336,10 +1276,6 @@ public sealed class Orchestrator
                   "this just now, and offer to try again. Do NOT invent, pad, guess, or fill in any answer from " +
                   "your own knowledge. Don't mention tasks, workers, delegation, or any internal mechanics."
                 : $"A background task you delegated has finished.\nTask: {task.Description}\nResult:\n{result}\n\n" +
-                  (delivered.Count > 0
-                      ? $"File(s) it produced have ALREADY been delivered to the user: {string.Join(", ", delivered)}. " +
-                        "Mention them naturally (\"I've sent over …\"); do NOT claim you couldn't, and don't try to resend.\n"
-                      : "") +
                   "Relay this to the user now in a natural, friendly, concise way — as if you just finished " +
                   "checking for them. Do not mention tasks, workers, delegation, or any internal mechanics; " +
                   "just give them the answer conversationally.\n" +
@@ -1352,8 +1288,9 @@ public sealed class Orchestrator
             var convo = new List<Message>(session.History) { Message.System(instruction) };
 
             Trace($"[worker #{task.Id}] re-voice start{(failed ? " (failed task — honest, no invent)" : "")}");
+            var tools = session.PinnedProject is null ? _orchestratorTools : _pinnedTools;
             string content = await RunOrchestratorTurnAsync(
-                session, convo, Array.Empty<AgentTool>(), think: _revoiceThink, CancellationToken.None).ConfigureAwait(false);
+                session, convo, tools, think: _revoiceThink, CancellationToken.None).ConfigureAwait(false);
             Trace($"[worker #{task.Id}] re-voice done (user now sees the answer)");
 
             session.History.Add(Message.Assistant(string.IsNullOrWhiteSpace(content) ? result : content));
@@ -1842,15 +1779,33 @@ public sealed class Orchestrator
     }
 
     // A short, human-readable line listing what the user attached, appended to their message so the model
-    // knows files are in play. Names/types/sizes only — the actual paths are carried into the task workspace
-    // deterministically, so the model never has to repeat a path.
+    // knows files are in play.
     private static string AttachmentNote(IReadOnlyList<Attachment> attachments)
     {
-        var sb = new StringBuilder($"\n\n[Attached {(attachments.Count == 1 ? "file" : $"{attachments.Count} files")}: ");
-        sb.Append(string.Join(", ", attachments.Select(a =>
-            $"{a.Name}{(a.Size > 0 ? $" ({HumanSize(a.Size)})" : "")}")));
-        sb.Append(" — delegate to do anything with these; they're handed to the worker automatically.]");
+        var sb = new StringBuilder();
+        foreach (var a in attachments)
+        {
+            sb.Append($"\n\n[user uploaded file \"{a.Name}\"{(a.Size > 0 ? $" ({HumanSize(a.Size)})" : "")}]");
+        }
         return sb.ToString();
+    }
+
+    private string FilesNote(Session session)
+    {
+        if (ThreadFilesDir(session) is not { } filesDir || !Directory.Exists(filesDir)) return "";
+        try
+        {
+            var files = new DirectoryInfo(filesDir).GetFiles().OrderBy(f => f.Name).ToList();
+            if (files.Count == 0) return "";
+            var sb = new StringBuilder("\n\nFiles available in this conversation's files area (the 'pot' of files):\n");
+            foreach (var f in files)
+            {
+                sb.Append($"- {f.Name} ({HumanSize(f.Length)})\n");
+            }
+            sb.Append("These files persist across turns. You can refer to them or delegate tasks using them without asking the user to re-upload.");
+            return sb.ToString();
+        }
+        catch { return ""; }
     }
 
     private static string HumanSize(long bytes) => bytes switch
@@ -1950,7 +1905,7 @@ public sealed class Orchestrator
             {
                 ToolParameter.String("task", "A clear, self-contained description of the work to do.", required: true),
                 ToolParameter.String("project", "Optional project slug to run the task within.", required: false),
-                ToolParameter.String("persona", "Optional specialist persona id to handle it (e.g. software_engineer, product_manager).", required: false),
+                ToolParameter.String("persona", "Optional specialist persona id to handle it (e.g. software_engineer, product_manager, data_scientist).", required: false),
             },
             NoOp),
         new("find_project",
@@ -2008,394 +1963,234 @@ public sealed class Orchestrator
     private static Task<ToolOutput> NoOp(ToolCallArguments _, CancellationToken __) =>
         Task.FromResult(ToolOutput.Ok("ok"));
 
-    private void EnsureProgressMonitor(Session session)
+    private static bool TryExtractXmlToolCalls(string content, Dictionary<string, AgentTool> availableTools, out List<ToolCall> calls, out string cleaned)
     {
-        if (!session.StartProgressMonitor()) return;
+        calls = new List<ToolCall>();
+        cleaned = content;
+        
+        if (string.IsNullOrWhiteSpace(content) || !content.Contains("<tool_call>"))
+            return false;
 
-        _ = Task.Run(async () =>
+        var removals = new List<(int start, int length)>();
+        int index = 0;
+        int searchStart = 0;
+        while (true)
         {
-            Trace($"[orchestrator] Starting progress monitor loop for session {session.Id}");
-            try
+            int startIdx = content.IndexOf("<tool_call>", searchStart);
+            if (startIdx < 0) break;
+            
+            int endIdx = content.IndexOf("</tool_call>", startIdx);
+            if (endIdx < 0)
             {
-                while (true)
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+                endIdx = content.Length;
+            }
+            else
+            {
+                endIdx += "</tool_call>".Length;
+            }
 
-                    var runningTasks = session.Tasks.Values.Where(t => t.IsRunning).ToList();
-                    if (runningTasks.Count == 0)
+            int innerStart = startIdx + "<tool_call>".Length;
+            int innerLength = (endIdx == content.Length) ? (content.Length - innerStart) : (endIdx - "</tool_call>".Length - innerStart);
+            if (innerLength < 0) innerLength = 0;
+            string inner = content.Substring(innerStart, innerLength).Trim();
+            
+            if (TryParseXmlToolCall(inner, availableTools, index++, out var toolCall))
+            {
+                calls.Add(toolCall);
+                removals.Add((startIdx, endIdx - startIdx));
+            }
+            
+            searchStart = endIdx;
+            if (searchStart >= content.Length) break;
+        }
+
+        if (calls.Count == 0)
+            return false;
+
+        foreach (var (start, length) in removals.OrderByDescending(r => r.start))
+        {
+            cleaned = cleaned.Remove(start, length);
+        }
+        
+        cleaned = Regex.Replace(cleaned, @"```[a-zA-Z]*\s*```", "").Trim();
+        return true;
+    }
+
+    private static bool TryParseXmlToolCall(string inner, Dictionary<string, AgentTool> availableTools, int index, out ToolCall toolCall)
+    {
+        toolCall = default;
+        
+        int firstBracket = inner.IndexOf('<');
+        string toolName = firstBracket >= 0 ? inner.Substring(0, firstBracket).Trim() : inner.Trim();
+        
+        if (string.IsNullOrEmpty(toolName) || !availableTools.ContainsKey(toolName))
+            return false;
+
+        var argsObj = new JsonObject();
+        int pos = firstBracket;
+        while (pos >= 0 && pos < inner.Length)
+        {
+            int keyStart = inner.IndexOf("<arg_key>", pos);
+            if (keyStart < 0) break;
+            
+            int keyEnd = inner.IndexOf("</arg_key>", keyStart);
+            string keyName;
+            string valStr = "";
+            int nextPos = -1;
+
+            if (keyEnd >= 0)
+            {
+                keyName = inner.Substring(keyStart + "<arg_key>".Length, keyEnd - (keyStart + "<arg_key>".Length)).Trim();
+                
+                int valStart = inner.IndexOf("<arg_value>", keyEnd);
+                if (valStart >= 0)
+                {
+                    int valEnd = inner.IndexOf("</arg_value>", valStart);
+                    if (valEnd >= 0)
                     {
-                        Trace($"[orchestrator] No running tasks, stopping progress monitor loop for session {session.Id}");
-                        session.StopProgressMonitor();
-                        
-                        if (session.Tasks.Values.Any(t => t.IsRunning))
+                        valStr = inner.Substring(valStart + "<arg_value>".Length, valEnd - (valStart + "<arg_value>".Length));
+                        nextPos = valEnd + "</arg_value>".Length;
+                    }
+                    else
+                    {
+                        valStr = inner.Substring(valStart + "<arg_value>".Length);
+                        nextPos = inner.Length;
+                    }
+                }
+                else
+                {
+                    nextPos = keyEnd + "</arg_key>".Length;
+                }
+            }
+            else
+            {
+                int valEnd = inner.IndexOf("</arg_value>", keyStart);
+                string segment;
+                if (valEnd >= 0)
+                {
+                    segment = inner.Substring(keyStart + "<arg_key>".Length, valEnd - (keyStart + "<arg_key>".Length));
+                    nextPos = valEnd + "</arg_value>".Length;
+                }
+                else
+                {
+                    segment = inner.Substring(keyStart + "<arg_key>".Length);
+                    nextPos = inner.Length;
+                }
+
+                int arrowIdx = segment.IndexOf('→');
+                if (arrowIdx >= 0)
+                {
+                    keyName = segment.Substring(0, arrowIdx).Trim();
+                    valStr = segment.Substring(arrowIdx + 1);
+                }
+                else
+                {
+                    keyName = segment.Trim();
+                }
+            }
+
+            if (!string.IsNullOrEmpty(keyName))
+            {
+                argsObj[keyName] = valStr;
+            }
+            
+            pos = nextPos;
+        }
+
+        using var doc = JsonDocument.Parse(argsObj.ToJsonString());
+        toolCall = new ToolCall($"call_xml_{index}", toolName, doc.RootElement.Clone());
+        return true;
+    }
+
+    private sealed class XmlStreamFilter
+    {
+        private bool _inToolCall = false;
+        private readonly System.Text.StringBuilder _buffer = new();
+
+        public string Feed(string chunk)
+        {
+            var output = new System.Text.StringBuilder();
+            foreach (char c in chunk)
+            {
+                if (!_inToolCall)
+                {
+                    if (_buffer.Length == 0)
+                    {
+                        if (c == '<')
                         {
-                            if (session.StartProgressMonitor())
+                            _buffer.Append(c);
+                        }
+                        else
+                        {
+                            output.Append(c);
+                        }
+                    }
+                    else
+                    {
+                        _buffer.Append(c);
+                        string bufStr = _buffer.ToString();
+                        const string target = "<tool_call>";
+                        if (target.StartsWith(bufStr))
+                        {
+                            if (bufStr == target)
                             {
-                                continue;
+                                _inToolCall = true;
+                                _buffer.Clear();
                             }
                         }
-                        break;
-                    }
-
-                    var progressList = new List<(TaskInfo Task, string Summary)>();
-                    var digestItems = new List<object>();
-
-                    foreach (var task in runningTasks)
-                    {
-                        List<ProgressLogEntry> newEntries;
-                        lock (task.ProgressLog)
+                        else
                         {
-                            if (task.LastProgressIndex < task.ProgressLog.Count)
-                            {
-                                newEntries = task.ProgressLog.Skip(task.LastProgressIndex).ToList();
-                                task.LastProgressIndex = task.ProgressLog.Count;
-                            }
-                            else
-                            {
-                                newEntries = new List<ProgressLogEntry>();
-                            }
-                        }
-
-                        if (newEntries.Count > 0)
-                        {
-                            string summary = await SummarizeProgressAsync(task, newEntries).ConfigureAwait(false);
-                            if (!string.IsNullOrWhiteSpace(summary))
-                            {
-                                progressList.Add((task, summary));
-                                digestItems.Add(new
-                                {
-                                    id = task.Id,
-                                    description = task.Description,
-                                    summary = summary
-                                });
-                            }
+                            output.Append(bufStr);
+                            _buffer.Clear();
                         }
                     }
-
-                    if (progressList.Count > 0)
+                }
+                else
+                {
+                    if (_buffer.Length == 0)
                     {
-                        string synthesizedText = await SynthesizeHeartbeatUpdateAsync(session, progressList).ConfigureAwait(false);
-                        var eventId = Guid.NewGuid().ToString("N");
-                        session.Append("task_progress_digest", Json(new
+                        if (c == '<')
                         {
-                            id = eventId,
-                            text = synthesizedText,
-                            items = digestItems
-                        }));
+                            _buffer.Append(c);
+                        }
+                    }
+                    else
+                    {
+                        _buffer.Append(c);
+                        string bufStr = _buffer.ToString();
+                        const string target = "</tool_call>";
+                        if (target.StartsWith(bufStr))
+                        {
+                            if (bufStr == target)
+                            {
+                                _inToolCall = false;
+                                _buffer.Clear();
+                            }
+                        }
+                        else
+                        {
+                            _buffer.Clear();
+                            if (c == '<')
+                            {
+                                _buffer.Append(c);
+                            }
+                        }
                     }
                 }
             }
-            catch (Exception ex)
+            return output.ToString();
+        }
+
+        public string Flush()
+        {
+            if (!_inToolCall && _buffer.Length > 0)
             {
-                Console.Error.WriteLine($"[orchestrator] Progress monitor loop error in session {session.Id}: {ex}");
-                session.StopProgressMonitor();
+                string remaining = _buffer.ToString();
+                _buffer.Clear();
+                return remaining;
             }
-        });
-    }
-
-    private async Task<string> SummarizeProgressAsync(TaskInfo task, List<ProgressLogEntry> newEntries)
-    {
-        if (newEntries.Count == 0) return "";
-
-        if (_secondaryProvider != null || _provider != null)
-        {
-            var provider = _secondaryProvider ?? _provider;
-            var model = _secondaryModelSpec?.Model ?? _modelSpec.Model;
-
-            var activity = string.Join("\n", newEntries.Select(e => $"- {e.Message}"));
-            var prompt = $@"You are a progress summarizer. Summarize the recent progress of this background task into one short, user-friendly sentence (maximum 12 words).
-Use active voice and be concise (e.g. ""found 72 checkout errors, checking code path now"" or ""reading attached CSV"").
-Do NOT use internal tool names like read_file, search_web; mention them naturally.
-
-Task Description: {task.Description}
-Recent events:
-{activity}
-
-Summary:";
-            try
-            {
-                var sb = new StringBuilder();
-                await foreach (var ev in provider.StreamAsync(new ModelRequest
-                {
-                    Model = model,
-                    SystemPrompt = "You are a helpful assistant.",
-                    Messages = new List<Message> { Message.User(prompt) },
-                    MaxOutputTokens = 64,
-                    Think = false
-                }, CancellationToken.None).ConfigureAwait(false))
-                {
-                    if (ev is ModelStreamEvent.Content c) sb.Append(c.Text);
-                }
-
-                var summary = sb.ToString().Trim();
-                if (!string.IsNullOrWhiteSpace(summary))
-                {
-                    summary = summary.Trim('"', '\'', '.', ' ', '\n', '\r');
-                    return summary;
-                }
-            }
-            catch (Exception ex)
-            {
-                Trace($"[orchestrator] Failed to summarize progress via LLM: {ex.Message}");
-            }
+            _buffer.Clear();
+            return "";
         }
-
-        if (newEntries.Count == 1) return newEntries[0].Message;
-        return newEntries[^1].Message;
-    }
-
-    private async Task<string> SynthesizeHeartbeatUpdateAsync(Session session, List<(TaskInfo Task, string Summary)> progressList)
-    {
-        if (_secondaryProvider == null && _provider == null)
-        {
-            return "Still working: " + string.Join("; ", progressList.Select(p => p.Summary));
-        }
-
-        var provider = _secondaryProvider ?? _provider;
-        var model = _secondaryModelSpec?.Model ?? _modelSpec.Model;
-
-        var sb = new StringBuilder();
-        foreach (var p in progressList)
-        {
-            string plan = !string.IsNullOrWhiteSpace(p.Task.LatestThought) ? p.Task.LatestThought : "proceed with the next steps of the task";
-            sb.AppendLine($"- Task: \"{p.Task.Description}\"");
-            sb.AppendLine($"  Recent Activity (done in last minute): {p.Summary}");
-            sb.AppendLine($"  Current Plan / Next Step: {plan}");
-        }
-
-        var prompt = $@"You are a helpful assistant. Synthesize a casual, human-like progress update message for the user.
-Write it like a human developer giving a status update on what they have been doing in the last minute and what they are about to do next.
-
-Format: ""[What I've been doing] and [what I'm about to do next/plan to do next]""
-
-Guidelines:
-- Use active voice and sound natural, casual, and friendly (like a coworker in Slack).
-- Keep it concise (maximum 20 words).
-- Avoid robotic prefixes like ""Still working — quick update"".
-- Do NOT use bullet points, task IDs, or rigid templates.
-- Do NOT name internal tools (e.g. read_file, search_web); describe the actions naturally.
-- Refer to the tasks by their descriptions, not IDs.
-
-Current tasks details:
-{sb}
-
-Examples:
-- ""I've been checking over the files and am just about to dive into the database checks.""
-- ""I've been analyzing the recent error logs and plan to search the codebase next for where the transaction fails.""
-- ""I've been searching the codebase for the CheckoutService and I'm about to write a unit test to verify the fix.""
-
-Synthesized Update:";
-
-        try
-        {
-            var responseSb = new StringBuilder();
-            await foreach (var ev in provider.StreamAsync(new ModelRequest
-            {
-                Model = model,
-                SystemPrompt = "You are a helpful developer giving a status update.",
-                Messages = new List<Message> { Message.User(prompt) },
-                MaxOutputTokens = 128,
-                Think = false
-            }, CancellationToken.None).ConfigureAwait(false))
-            {
-                if (ev is ModelStreamEvent.Content c) responseSb.Append(c.Text);
-            }
-
-            var text = responseSb.ToString().Trim().Trim('"', '\'', '.', ' ', '\n', '\r');
-            if (!string.IsNullOrWhiteSpace(text))
-            {
-                return text;
-            }
-        }
-        catch (Exception ex)
-        {
-            Trace($"[orchestrator] Failed to synthesize heartbeat: {ex.Message}");
-        }
-
-        return "Still working: " + string.Join("; ", progressList.Select(p => p.Summary));
-    }
-
-    private static string SanitizeToolStarted(string toolName, string argumentsJson)
-    {
-        string? query = null;
-        string? path = null;
-        string? file = null;
-        string? command = null;
-        string? issue = null;
-        string? ticket = null;
-        try
-        {
-            using var doc = JsonDocument.Parse(argumentsJson);
-            var root = doc.RootElement;
-            if (root.TryGetProperty("query", out var q)) query = q.GetString();
-            else if (root.TryGetProperty("q", out var q2)) query = q2.GetString();
-
-            if (root.TryGetProperty("path", out var p)) path = p.GetString();
-            else if (root.TryGetProperty("file", out var f)) file = f.GetString();
-
-            if (root.TryGetProperty("command", out var c)) command = c.GetString();
-            else if (root.TryGetProperty("CommandLine", out var c2)) command = c2.GetString();
-
-            if (root.TryGetProperty("issue", out var i)) issue = i.GetString();
-            else if (root.TryGetProperty("number", out var n)) issue = n.GetString();
-
-            if (root.TryGetProperty("ticket", out var t)) ticket = t.GetString();
-            else if (root.TryGetProperty("key", out var k)) ticket = k.GetString();
-        }
-        catch {}
-
-        switch (toolName.ToLowerInvariant())
-        {
-            case "search_web":
-            case "web_search":
-                return !string.IsNullOrWhiteSpace(query) ? $"Searching the web for \"{query}\"" : "Searching the web";
-
-            case "read_file":
-            case "code_read":
-                string? fileToShow = path ?? file;
-                return !string.IsNullOrWhiteSpace(fileToShow) ? $"Reading code in {Path.GetFileName(fileToShow)}" : "Reading file";
-
-            case "write_file":
-                string? fileToWrite = path ?? file;
-                return !string.IsNullOrWhiteSpace(fileToWrite) ? $"Writing to file {Path.GetFileName(fileToWrite)}" : "Writing file";
-
-            case "code_search":
-            case "code_grep":
-                return !string.IsNullOrWhiteSpace(query) ? $"Searching the codebase for \"{query}\"" : "Searching codebase";
-
-            case "code_tree":
-                return "Browsing codebase files";
-
-            case "file_summary":
-                string? fileToSummarize = path ?? file;
-                return !string.IsNullOrWhiteSpace(fileToSummarize) ? $"Summarizing file {Path.GetFileName(fileToSummarize)}" : "Summarizing file";
-
-            case "get_page_answer":
-                return "Analyzing web page";
-
-            case "run_shell_command":
-            case "run_command":
-                return !string.IsNullOrWhiteSpace(command) ? $"Running command: {SanitizeCommand(command)}" : "Running command";
-
-            case "log_search":
-                return !string.IsNullOrWhiteSpace(query) ? $"Searching logs for \"{query}\"" : "Searching application logs";
-
-            case "log_summary":
-                return "Querying log summary";
-
-            case "github_search":
-            case "github_find_code":
-                return !string.IsNullOrWhiteSpace(query) ? $"Searching GitHub for \"{query}\"" : "Searching GitHub";
-
-            case "github_get_issue":
-                return !string.IsNullOrWhiteSpace(issue) ? $"Fetching GitHub issue #{issue}" : "Fetching GitHub issue";
-
-            case "jira_search":
-            case "jira_find_tickets":
-                return !string.IsNullOrWhiteSpace(query) ? $"Searching Jira tickets for \"{query}\"" : "Searching Jira";
-
-            case "jira_get_ticket":
-                return !string.IsNullOrWhiteSpace(ticket) ? $"Fetching Jira ticket {ticket}" : "Fetching Jira ticket";
-
-            default:
-                string cleanName = toolName.Replace('_', ' ').Replace('-', ' ').Trim();
-                if (cleanName.Length > 0)
-                {
-                    cleanName = char.ToUpper(cleanName[0]) + cleanName[1..];
-                }
-                return cleanName;
-        }
-    }
-
-    private static string SanitizeCommand(string command)
-    {
-        var parts = command.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length == 0) return "";
-        var cmd = parts[0];
-        if (cmd.Equals("git", StringComparison.OrdinalIgnoreCase) && parts.Length > 1)
-        {
-            return $"git {parts[1]}";
-        }
-        if (cmd.Equals("npm", StringComparison.OrdinalIgnoreCase) && parts.Length > 1)
-        {
-            return $"npm {parts[1]}";
-        }
-        return cmd;
-    }
-
-    private static string? SanitizeToolCompleted(string toolName, string result)
-    {
-        if (string.IsNullOrWhiteSpace(result)) return null;
-
-        switch (toolName.ToLowerInvariant())
-        {
-            case "log_search":
-                var lineCount = result.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
-                return $"Found {lineCount} log entries";
-
-            case "log_summary":
-                return "Finished analyzing log summary";
-
-            case "search_web":
-            case "web_search":
-                return "Found web search results";
-
-            case "read_file":
-            case "code_read":
-                return "Finished reading file";
-
-            case "write_file":
-                return "Saved changes to file";
-
-            case "code_search":
-            case "code_grep":
-                return "Finished searching codebase";
-
-            case "code_tree":
-                return "Finished browsing codebase files";
-
-            case "file_summary":
-                return "Finished summarizing file";
-
-            case "get_page_answer":
-                return "Finished analyzing web page";
-
-            case "run_shell_command":
-            case "run_command":
-                if (result.Contains("Error", StringComparison.OrdinalIgnoreCase) || result.Contains("Failed", StringComparison.OrdinalIgnoreCase))
-                {
-                    return "Command completed with errors";
-                }
-                return "Command completed successfully";
-
-            default:
-                return null;
-        }
-    }
-
-    private static readonly System.Text.RegularExpressions.Regex ThinkBlock = new(@"<think>.*?</think>", System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
-    private static readonly System.Text.RegularExpressions.Regex ThinkUnclosed = new(@"<think>.*$", System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
-    private static readonly System.Text.RegularExpressions.Regex ThinkTag = new(@"</?think>", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
-
-    private static string StripThinking(string text)
-    {
-        text = ThinkBlock.Replace(text, "");
-        text = ThinkUnclosed.Replace(text, "");
-        text = ThinkTag.Replace(text, "");
-        return text.Trim();
-    }
-
-    private static string CleanThoughtToProgress(string thought)
-    {
-        if (string.IsNullOrWhiteSpace(thought)) return "";
-        thought = StripThinking(thought);
-
-        var sentences = thought.Split(new[] { '.', '!', '?', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                               .Select(s => s.Trim())
-                               .Where(s => s.Length > 10)
-                               .ToList();
-        if (sentences.Count == 0) return "";
-
-        return sentences[^1];
     }
 }

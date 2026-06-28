@@ -80,4 +80,18 @@ public sealed class AgentInput
         "actual reply to the user — concise and complete. Put the answer in your response, not only in " +
         "your private thinking. Do not repeat your earlier reasoning. If you genuinely still need " +
         "information, call a tool — but do not loop or over-think.";
+
+    /// <summary>Whether to run a supervisor guard using the secondary model when turn or tool limits are reached
+    /// to decide if the agent should continue (if making progress) or wrap up (if at a dead end).</summary>
+    public bool EnableSupervisorGuard { get; set; } = true;
+
+    /// <summary>The nudge injected when the supervisor guard determines the agent is making progress but the turn limit is near.</summary>
+    public string SupervisorProgressNudge { get; set; } =
+        "Turns limit is about to be exceeded. If you are stuck in a loop and can't solve the problem, " +
+        "wrap up and exit now; if you are making active progress, you may continue.";
+
+    /// <summary>The nudge injected when the supervisor guard determines the agent is at a dead end, giving it 2 turns to wrap up.</summary>
+    public string SupervisorDeadEndNudge { get; set; } =
+        "You are stuck in a loop or have hit a dead end. You have exactly 2 more turns to wrap up your work, " +
+        "exit, and present your final answer or report the failure. Do not call any more tools unless absolutely necessary to wrap up.";
 }

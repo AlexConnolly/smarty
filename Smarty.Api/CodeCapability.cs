@@ -23,6 +23,8 @@ public sealed class CodeCapability : ICapability
         "change. It's READ-ONLY: you can't modify the repo, but you can write a proposed patch with write_file " +
         "(it's delivered to the user automatically). Propose the fix; never claim you've applied it.";
 
+    public void ValidateSystemPrerequisites() { }
+
     // Directories and files that are never worth searching/listing in a source tree.
     private static readonly HashSet<string> SkipDirs = new(StringComparer.OrdinalIgnoreCase)
         { ".git", ".vs", ".idea", "bin", "obj", "node_modules", "dist", "build", "packages", ".next", "target" };

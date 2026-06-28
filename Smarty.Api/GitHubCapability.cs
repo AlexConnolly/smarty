@@ -25,6 +25,8 @@ public sealed class GitHubCapability : ICapability
         "— name the file and lines. It's READ-ONLY: propose a patch with write_file (it's delivered to the user " +
         "automatically), never claim to have pushed or opened a PR.";
 
+    public void ValidateSystemPrerequisites() { }
+
     public IReadOnlyList<AgentTool> BuildTools(IntegrationConfig config, TaskInfo task)
     {
         var defaultRepo = config.Get(Id, "repo");

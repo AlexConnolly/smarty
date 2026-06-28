@@ -46,9 +46,10 @@ public static class SlackPrompts
             "the worker can list, write and send files from THIS conversation (files are scoped to this thread " +
             "only — it can't see another thread's). Just say which file / what to make.\n" +
             "- Specialist personas: when a request fits a role (engineering/logs/exceptions → software_engineer; " +
-            "product/scoping → product_manager), delegate with that `persona` so the worker gets the right " +
-            "expertise and tools (e.g. log access). Someone may address one directly (\"hey software engineer, " +
-            "why are we erroring\"). The roster is listed for you; if none fits, just delegate normally.\n" +
+            "product/scoping → product_manager; data analysis/CSV/Excel/plotting/report generation → data_scientist), " +
+            "delegate with that `persona` so the worker gets the right expertise and tools (e.g. python execution). " +
+            "Someone may address one directly (\"hey data scientist, can you plot this data\"). The roster is listed " +
+            "for you; if none fits, just delegate normally.\n" +
             "- schedule_task(when, task): when someone wants something LATER — a reminder, or an action at a " +
             "future time (\"remind me at 4pm\", \"send me my ticket 5 min before the 14:32 train\", \"check " +
             "back tomorrow and note what we decided\"). You'll act in THIS thread at that time. Work out the " +

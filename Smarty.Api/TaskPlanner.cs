@@ -29,8 +29,19 @@ public sealed class TaskPlanner
     }
 
     public TaskPlanner(string model, string ollamaBaseUrl, Func<IReadOnlyList<AgentTool>>? reconTools = null)
-        : this(ModelSpec.Ollama(model, ollamaBaseUrl), null, reconTools)
+        : this(ResolveModelSpec(model, ollamaBaseUrl), null, reconTools)
     {
+    }
+
+    private static ModelSpec ResolveModelSpec(string model, string ollamaBaseUrl)
+    {
+        string apiKey = Environment.GetEnvironmentVariable("TOGETHER_API_KEY") 
+            ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY") 
+            ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY") ?? "";
+        string? togetherBaseUrl = (ollamaBaseUrl.Contains("localhost") || ollamaBaseUrl.Contains("127.0.0.1")) ? null : ollamaBaseUrl;
+        return model.Contains("/") || (ollamaBaseUrl != null && ollamaBaseUrl.Contains("together"))
+            ? new ModelSpec("together", model, togetherBaseUrl)
+            : ModelSpec.Ollama(model, ollamaBaseUrl);
     }
 
     private static JsonNode ComplexitySchema() => new JsonObject

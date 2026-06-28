@@ -63,6 +63,53 @@ public class InlineToolCallTests
         Assert.DoesNotContain("\"arguments\"", result.Text);
     }
 
+    [Fact]
+    public async Task Xml_inline_tool_call_in_content_is_executed_not_printed()
+    {
+        const string xmlTurn =
+            "Alright Alex — first pass found the weirdness.\n\n" +
+            "<tool_call>run_shell_command<arg_key>command</arg_key><arg_value>measure-temp</arg_value><arg_key>timeout_seconds→30</arg_value></tool_call>";
+
+        var provider = new ScriptedProvider(new[]
+        {
+            ModelTurn.Text(xmlTurn),
+            ModelTurn.Text("The temp folder is 4.2 GB."),
+        });
+
+        var registry = new ModelProviderRegistry();
+        registry.Register("scripted", _ => provider);
+
+        bool toolRan = false;
+        string? gotCommand = null;
+        var shell = new AgentTool(
+            "run_shell_command",
+            "Run a shell command.",
+            new[] { ToolParameter.String("command", "cmd", required: true), ToolParameter.Integer("timeout_seconds", "t") },
+            (ToolCallArguments args, CancellationToken _) =>
+            {
+                toolRan = true;
+                gotCommand = args.GetStringOrNull("command");
+                return Task.FromResult(ToolOutput.Ok("Temp = 4.2 GB"));
+            });
+
+        var input = new AgentInput
+        {
+            SystemPrompt = "test",
+            Tools = { shell },
+            Model = new ModelSpec("scripted", "stub"),
+        };
+
+        var agent = new SmartyAgent(input, registry);
+        var result = await agent.AnswerStream("How big is the temp folder?").ReadAllAsync();
+
+        Assert.True(toolRan, "the xml inline tool call should have been executed");
+        Assert.Equal("measure-temp", gotCommand);
+        Assert.Single(result.Tools);
+        Assert.Equal("run_shell_command", result.Tools[0].ToolName);
+
+        Assert.Equal("The temp folder is 4.2 GB.", result.Text.Trim());
+    }
+
     // --- a tiny scripted provider: returns canned turns in order ---
 
     private sealed record ModelTurn(string Content)

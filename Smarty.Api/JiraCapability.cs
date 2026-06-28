@@ -24,6 +24,8 @@ public sealed class JiraCapability : ICapability
         "ticket (jira_create_issue). Ground statements about work in real issues — quote keys and statuses. " +
         "Only create a ticket when the user actually wants one; confirm the summary first if it's ambiguous.";
 
+    public void ValidateSystemPrerequisites() { }
+
     public IReadOnlyList<AgentTool> BuildTools(IntegrationConfig config, TaskInfo task)
     {
         var baseUrl = config.Get(Id, "base_url");

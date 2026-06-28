@@ -52,7 +52,12 @@ public sealed class SmartyAgent
         var toolCallCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase); // per-tool call budget
         var successfulToolCalls = new HashSet<string>(); // exact (name+args) signatures that succeeded
 
-        for (int iteration = 0; iteration < _input.MaxIterations; iteration++)
+        int currentMaxIterations = _input.MaxIterations;
+        int currentMaxCallsPerTool = _input.MaxCallsPerTool;
+        int currentMaxToolFailures = _input.MaxToolFailures;
+        bool isDeadEndWrapUp = false;
+
+        for (int iteration = 0; iteration < currentMaxIterations; iteration++)
         {
             var seenToolCallsInThisTurn = new HashSet<string>();
             // Pull in any out-of-band messages a caller queued while we were working, so a long task
@@ -108,7 +113,7 @@ public sealed class SmartyAgent
             // content). Nudge the model to actually answer the user, and retry. (final.Finish carries
             // the specific reason if needed; for recovery, "no answer + no tool" is what matters.)
             bool noAnswer = string.IsNullOrWhiteSpace(final.Content);
-            if (noAnswer && !final.HasToolCalls && _input.RecoverFromLoops && iteration < _input.MaxIterations - 1)
+            if (noAnswer && !final.HasToolCalls && _input.RecoverFromLoops && iteration < currentMaxIterations - 1)
             {
                 var recovery = Message.System(_input.LoopRecoveryNudge);
                 conversation.Add(recovery);
@@ -177,13 +182,54 @@ public sealed class SmartyAgent
                         "again changes nothing. Use what you already have, take a genuinely different approach, or " +
                         "stop and give your best answer (or say plainly you couldn't get it).");
                 }
-                else if (priorCalls >= _input.MaxCallsPerTool)
+                else if (priorCalls >= currentMaxCallsPerTool)
                 {
-                    // Relentless: this tool has been called enough times this run without converging.
-                    output = ToolOutput.DeadEnd(
-                        $"You've called {call.Name} {priorCalls} times this run and you're not getting there. STOP " +
-                        $"calling {call.Name} now — work with what you've already got and either give your best " +
-                        "answer or say plainly you couldn't find it. Don't call it again.");
+                    if (_input.EnableSupervisorGuard)
+                    {
+                        var decision = await RunSupervisorGuardAsync(run, ct).ConfigureAwait(false);
+                        if (decision == SupervisorDecision.Progress)
+                        {
+                            currentMaxCallsPerTool += Math.Max(2, _input.MaxCallsPerTool / 2);
+                            currentMaxToolFailures += Math.Max(2, _input.MaxToolFailures / 2);
+                            if (currentMaxIterations - iteration <= 2)
+                            {
+                                currentMaxIterations += Math.Max(4, _input.MaxIterations / 2);
+                                var turnNudge = Message.System(_input.SupervisorProgressNudge);
+                                conversation.Add(turnNudge);
+                                run.Messages.Add(turnNudge);
+                            }
+
+                            toolCallCounts[call.Name] = priorCalls + 1;
+                            output = await ExecuteToolAsync(call, ct).ConfigureAwait(false);
+                            if (!output.IsError)
+                            {
+                                successfulToolCalls.Add(signature);
+                            }
+                        }
+                        else
+                        {
+                            output = ToolOutput.DeadEnd(
+                                $"You've called {call.Name} {priorCalls} times this run and you're not getting there. STOP " +
+                                $"calling {call.Name} now — work with what you've already got and either give your best " +
+                                "answer or say plainly you couldn't find it. Don't call it again.");
+                            
+                            if (!isDeadEndWrapUp)
+                            {
+                                isDeadEndWrapUp = true;
+                                currentMaxIterations = iteration + 3; // current + 2 more
+                                var wrapUpNudge = Message.System(_input.SupervisorDeadEndNudge);
+                                conversation.Add(wrapUpNudge);
+                                run.Messages.Add(wrapUpNudge);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        output = ToolOutput.DeadEnd(
+                            $"You've called {call.Name} {priorCalls} times this run and you're not getting there. STOP " +
+                            $"calling {call.Name} now — work with what you've already got and either give your best " +
+                            "answer or say plainly you couldn't find it. Don't call it again.");
+                    }
                 }
                 else
                 {
@@ -218,7 +264,7 @@ public sealed class SmartyAgent
             if (_input.NudgeOnToolError && !anySuccess && (anyTerminal || anyRetryable))
             {
                 string nudgeText =
-                    toolFailures >= _input.MaxToolFailures
+                    toolFailures >= currentMaxToolFailures
                         ? "You've hit several failures and still have no usable result. STOP calling tools now — " +
                           "answer the user with whatever you DID manage to find, or tell them plainly you couldn't " +
                           "get it. Do not invent anything."
@@ -231,15 +277,48 @@ public sealed class SmartyAgent
                 conversation.Add(nudge);
                 run.Messages.Add(nudge);
             }
+
+            if (_input.EnableSupervisorGuard && iteration == currentMaxIterations - 1 && !isDeadEndWrapUp)
+            {
+                var decision = await RunSupervisorGuardAsync(run, ct).ConfigureAwait(false);
+                if (decision == SupervisorDecision.Progress)
+                {
+                    currentMaxIterations += Math.Max(4, _input.MaxIterations / 2);
+                    currentMaxCallsPerTool += Math.Max(2, _input.MaxCallsPerTool / 2);
+                    currentMaxToolFailures += Math.Max(2, _input.MaxToolFailures / 2);
+
+                    var turnNudge = Message.System(_input.SupervisorProgressNudge);
+                    conversation.Add(turnNudge);
+                    run.Messages.Add(turnNudge);
+                }
+                else
+                {
+                    isDeadEndWrapUp = true;
+                    currentMaxIterations = iteration + 3; // current + 2 more
+
+                    var wrapUpNudge = Message.System(_input.SupervisorDeadEndNudge);
+                    conversation.Add(wrapUpNudge);
+                    run.Messages.Add(wrapUpNudge);
+                }
+            }
         }
 
         // Iterations exhausted — emit whatever text we last produced, or a graceful message if we
         // never got a clean answer (e.g. the model kept looping).
-        var lastText = run.Messages.LastOrDefault(m => m.Role == Role.Assistant)?.Content;
-        yield return new AgentEvent.Completed(
-            string.IsNullOrWhiteSpace(lastText)
-                ? "I got stuck and couldn't finish that — please try rephrasing your request."
-                : lastText);
+        var lastInvocation = run.ToolInvocations.LastOrDefault();
+        if (lastInvocation is not null && lastInvocation.IsError)
+        {
+            yield return new AgentEvent.Completed(
+                $"The task could not be completed because the tool '{lastInvocation.ToolName}' failed:\n{lastInvocation.Result}");
+        }
+        else
+        {
+            var lastText = run.Messages.LastOrDefault(m => m.Role == Role.Assistant)?.Content;
+            yield return new AgentEvent.Completed(
+                string.IsNullOrWhiteSpace(lastText)
+                    ? "I got stuck and couldn't finish that — please try rephrasing your request."
+                    : lastText);
+        }
     }
 
     /// <summary>Ask the agent a question and get its final answer text (buffered).</summary>
@@ -267,15 +346,30 @@ public sealed class SmartyAgent
     }
 
     /// <summary>
-    /// Detect tool call(s) a model emitted as inline JSON text (shape <c>{"name": ..., "arguments": {...}}</c>)
+    /// Detect tool call(s) a model emitted as inline JSON text or XML tags
     /// where the name matches an available tool. Returns the recovered calls and the content with the
-    /// tool-call JSON (and any wrapping code fences) stripped out.
+    /// tool-call text stripped out.
     /// </summary>
     private bool TryExtractInlineToolCalls(string content, out List<ToolCall> calls, out string cleaned)
     {
         calls = new List<ToolCall>();
         cleaned = content;
-        if (string.IsNullOrWhiteSpace(content) || !content.Contains("\"name\""))
+        if (string.IsNullOrWhiteSpace(content))
+            return false;
+
+        // Try XML first
+        if (content.Contains("<tool_call>"))
+        {
+            if (TryExtractXmlToolCalls(content, _tools, out var xmlCalls, out var xmlCleaned))
+            {
+                calls = xmlCalls;
+                cleaned = xmlCleaned;
+                return true;
+            }
+        }
+
+        // Fall back to JSON
+        if (!content.Contains("\"name\""))
             return false;
 
         var removals = new List<(int start, int length)>();
@@ -304,6 +398,145 @@ public sealed class SmartyAgent
         foreach (var (start, length) in removals.OrderByDescending(r => r.start))
             cleaned = cleaned.Remove(start, length);
         cleaned = Regex.Replace(cleaned, "```[a-zA-Z]*\\s*```", "").Trim();
+        return true;
+    }
+
+    private static bool TryExtractXmlToolCalls(string content, Dictionary<string, AgentTool> availableTools, out List<ToolCall> calls, out string cleaned)
+    {
+        calls = new List<ToolCall>();
+        cleaned = content;
+        
+        if (string.IsNullOrWhiteSpace(content) || !content.Contains("<tool_call>"))
+            return false;
+
+        var removals = new List<(int start, int length)>();
+        int index = 0;
+        int searchStart = 0;
+        while (true)
+        {
+            int startIdx = content.IndexOf("<tool_call>", searchStart);
+            if (startIdx < 0) break;
+            
+            int endIdx = content.IndexOf("</tool_call>", startIdx);
+            if (endIdx < 0)
+            {
+                endIdx = content.Length;
+            }
+            else
+            {
+                endIdx += "</tool_call>".Length;
+            }
+
+            int innerStart = startIdx + "<tool_call>".Length;
+            int innerLength = (endIdx == content.Length) ? (content.Length - innerStart) : (endIdx - "</tool_call>".Length - innerStart);
+            if (innerLength < 0) innerLength = 0;
+            string inner = content.Substring(innerStart, innerLength).Trim();
+            
+            if (TryParseXmlToolCall(inner, availableTools, index++, out var toolCall))
+            {
+                calls.Add(toolCall);
+                removals.Add((startIdx, endIdx - startIdx));
+            }
+            
+            searchStart = endIdx;
+            if (searchStart >= content.Length) break;
+        }
+
+        if (calls.Count == 0)
+            return false;
+
+        foreach (var (start, length) in removals.OrderByDescending(r => r.start))
+        {
+            cleaned = cleaned.Remove(start, length);
+        }
+        
+        cleaned = Regex.Replace(cleaned, @"```[a-zA-Z]*\s*```", "").Trim();
+        return true;
+    }
+
+    private static bool TryParseXmlToolCall(string inner, Dictionary<string, AgentTool> availableTools, int index, out ToolCall toolCall)
+    {
+        toolCall = default;
+        
+        int firstBracket = inner.IndexOf('<');
+        string toolName = firstBracket >= 0 ? inner.Substring(0, firstBracket).Trim() : inner.Trim();
+        
+        if (string.IsNullOrEmpty(toolName) || !availableTools.ContainsKey(toolName))
+            return false;
+
+        var argsObj = new System.Text.Json.Nodes.JsonObject();
+        int pos = firstBracket;
+        while (pos >= 0 && pos < inner.Length)
+        {
+            int keyStart = inner.IndexOf("<arg_key>", pos);
+            if (keyStart < 0) break;
+            
+            int keyEnd = inner.IndexOf("</arg_key>", keyStart);
+            string keyName;
+            string valStr = "";
+            int nextPos = -1;
+
+            if (keyEnd >= 0)
+            {
+                keyName = inner.Substring(keyStart + "<arg_key>".Length, keyEnd - (keyStart + "<arg_key>".Length)).Trim();
+                
+                int valStart = inner.IndexOf("<arg_value>", keyEnd);
+                if (valStart >= 0)
+                {
+                    int valEnd = inner.IndexOf("</arg_value>", valStart);
+                    if (valEnd >= 0)
+                    {
+                        valStr = inner.Substring(valStart + "<arg_value>".Length, valEnd - (valStart + "<arg_value>".Length));
+                        nextPos = valEnd + "</arg_value>".Length;
+                    }
+                    else
+                    {
+                        valStr = inner.Substring(valStart + "<arg_value>".Length);
+                        nextPos = inner.Length;
+                    }
+                }
+                else
+                {
+                    nextPos = keyEnd + "</arg_key>".Length;
+                }
+            }
+            else
+            {
+                int valEnd = inner.IndexOf("</arg_value>", keyStart);
+                string segment;
+                if (valEnd >= 0)
+                {
+                    segment = inner.Substring(keyStart + "<arg_key>".Length, valEnd - (keyStart + "<arg_key>".Length));
+                    nextPos = valEnd + "</arg_value>".Length;
+                }
+                else
+                {
+                    segment = inner.Substring(keyStart + "<arg_key>".Length);
+                    nextPos = inner.Length;
+                }
+
+                int arrowIdx = segment.IndexOf('→');
+                if (arrowIdx >= 0)
+                {
+                    keyName = segment.Substring(0, arrowIdx).Trim();
+                    valStr = segment.Substring(arrowIdx + 1);
+                }
+                else
+                {
+                    keyName = segment.Trim();
+                }
+            }
+
+            if (!string.IsNullOrEmpty(keyName))
+            {
+                argsObj[keyName] = valStr;
+            }
+            
+            pos = nextPos;
+        }
+
+        using var doc = JsonDocument.Parse(argsObj.ToJsonString());
+        toolCall = new ToolCall($"call_xml_{index}", toolName, doc.RootElement.Clone());
         return true;
     }
 
@@ -354,6 +587,58 @@ public sealed class SmartyAgent
 
             i = matchEnd; // continue scanning after this object
         }
+    }
+
+    private enum SupervisorDecision
+    {
+        Progress,
+        DeadEnd
+    }
+
+    private async Task<SupervisorDecision> RunSupervisorGuardAsync(AgentRun run, CancellationToken ct)
+    {
+        var toolHistory = string.Join("\n", run.ToolInvocations.Select((t, i) =>
+            $"- Call {i + 1}: {t.ToolName}({t.Arguments}) - {(t.IsError ? "failed: " + t.Result : "succeeded")}"));
+
+        if (string.IsNullOrWhiteSpace(toolHistory))
+        {
+            toolHistory = "(No tools called yet)";
+        }
+
+        var systemPrompt =
+            "You are a supervisor monitoring an AI coding agent. The agent is trying to solve a task but is approaching its turn limit. " +
+            "Analyze the tool invocation history below. Decide if the agent is stuck in an unproductive loop (e.g., repeating the same actions/commands, " +
+            "repeatedly failing on the same error without fixing it, or going in circles) or if it is making genuine progress toward the goal " +
+            "(e.g., solving issues, installing packages, trying new files, modifying code successfully, moving forward, or performing necessary sequential steps).\n\n" +
+            "Respond with exactly one of these two words:\n" +
+            "PROGRESS - if the agent is making active, genuine progress and should be allowed to continue.\n" +
+            "DEAD_END - if the agent is stuck in a loop, thrashing, repeating itself, or cannot proceed.";
+
+        var request = new ModelRequest
+        {
+            Model = (_input.SecondaryModel ?? _input.Model).Model,
+            SystemPrompt = systemPrompt,
+            Messages = new[] { Message.User($"Tool Invocation History:\n{toolHistory}\n\nIs the agent making PROGRESS or at a DEAD_END?") },
+            Think = false,
+            MaxOutputTokens = 100
+        };
+
+        ModelResponse? final = null;
+        await foreach (var ev in _secondaryProvider.StreamAsync(request, ct).WithCancellation(ct).ConfigureAwait(false))
+        {
+            if (ev is ModelStreamEvent.Completed completed)
+            {
+                final = completed.Response;
+            }
+        }
+
+        string resultText = final?.Content ?? "";
+        if (resultText.Contains("PROGRESS", StringComparison.OrdinalIgnoreCase))
+        {
+            return SupervisorDecision.Progress;
+        }
+
+        return SupervisorDecision.DeadEnd;
     }
 }
 

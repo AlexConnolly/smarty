@@ -11,7 +11,6 @@ import {
   sendFeedback,
   sendMessage,
   transcribe,
-  resolveGate,
   type ProjectDetail,
   type ProjectMemory,
   type ProjectRun,
@@ -19,10 +18,8 @@ import {
   type RunStep,
   type SessionHandlers,
   type WorkerQuestion,
-  type GateRequest,
 } from './api'
 import { formatDuration, toWav16k, type RecordedAudio } from './audio'
-import CommandCenter from './CommandCenter'
 
 interface AudioNote {
   peaks: number[]
@@ -31,15 +28,14 @@ interface AudioNote {
 }
 
 interface UiMessage {
-  id: number | string
-  role: 'user' | 'assistant' | 'progress_digest'
+  id: number
+  role: 'user' | 'assistant'
   content: string
   reasoning: string
   streaming: boolean
   audio?: AudioNote
   thinkStart?: number
   thinkMs?: number
-  digestItems?: { id: string; description: string; summary: string }[]
 }
 
 type Working = { id: string; task: string; startedAt: number }
@@ -93,10 +89,9 @@ function greetingText(): string {
   return h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening'
 }
 
-function initialView(): 'home' | 'chat' | 'settings' {
+function initialView(): 'home' | 'chat' {
   try {
-    const v = localStorage.getItem(VIEW_KEY)
-    return v === 'chat' ? 'chat' : v === 'settings' ? 'settings' : 'home'
+    return localStorage.getItem(VIEW_KEY) === 'chat' ? 'chat' : 'home'
   } catch {
     return 'home'
   }
@@ -104,13 +99,11 @@ function initialView(): 'home' | 'chat' | 'settings' {
 
 export default function App() {
   // Remember whether you were on the home or in the conversation, so a refresh lands you back where you were.
-  const [view, setView] = useState<'home' | 'chat' | 'settings'>(initialView)
+  const [view, setView] = useState<'home' | 'chat'>(initialView)
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [working, setWorking] = useState<Working[]>([])
   // Workers that paused to ask the user something. They sit "in your face" until answered.
   const [questions, setQuestions] = useState<WorkerQuestion[]>([])
-  // Permission gate requests from workers.
-  const [gates, setGates] = useState<GateRequest[]>([])
   const [tasksOpen, setTasksOpen] = useState(false)
   const [input, setInput] = useState('')
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -167,31 +160,12 @@ export default function App() {
           thinkMs: m.thinkMs ?? (m.thinkStart ? Date.now() - m.thinkStart : undefined),
         })),
       onWorking: (id, task) => {
-        // Resuming (or starting) clears any pending question or gate for this task.
+        // Resuming (or starting) clears any pending question for this task.
         setQuestions((q) => q.filter((x) => x.taskId !== id))
-        setGates((g) => g.filter((x) => x.taskId !== id))
         setWorking((w) => (w.some((x) => x.id === id) ? w : [...w, { id, task, startedAt: Date.now() }]))
       },
       onWorkingDone: (id) => setWorking((w) => w.filter((x) => x.id !== id)),
       onQuestion: (q) => setQuestions((prev) => (prev.some((x) => x.taskId === q.taskId) ? prev : [...prev, q])),
-      onGateRequest: (g) => setGates((prev) => (prev.some((x) => x.gateRequestId === g.gateRequestId) ? prev : [...prev, g])),
-      onGateResolved: (_, gateRequestId) => setGates((prev) => prev.filter((x) => x.gateRequestId !== gateRequestId)),
-      onTaskProgressDigest: (digest) => {
-        setMessages((prev) => {
-          if (prev.some((m) => m.id === digest.id)) return prev
-          return [
-            ...prev,
-            {
-              id: digest.id,
-              role: 'progress_digest',
-              content: digest.text,
-              reasoning: '',
-              streaming: false,
-              digestItems: digest.items,
-            }
-          ]
-        })
-      },
     }
     openSessionStream(sessionId.current, handlers, controller.signal)
     refreshProjects()
@@ -335,11 +309,6 @@ export default function App() {
     answerTask(sessionId.current, taskId, body).catch(() => {})
   }
 
-  function handleResolveGate(taskId: string, gateRequestId: string, approved: boolean, rememberForTask = false) {
-    setGates((g) => g.filter((x) => x.gateRequestId !== gateRequestId))
-    resolveGate(sessionId.current, taskId, gateRequestId, approved, rememberForTask).catch(() => {})
-  }
-
   // ---- recording ----
   async function startRecording() {
     if (recording) return
@@ -418,16 +387,6 @@ export default function App() {
         </button>
         <div className="ml-auto flex items-center gap-1.5">
           {working.length > 0 && <RunningPill count={working.length} onOpen={() => setTasksOpen(true)} />}
-          <button
-            onClick={() => setView('settings')}
-            className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition ${
-              view === 'settings'
-                ? 'bg-surface-mid text-ink font-semibold'
-                : 'text-ink-soft hover:bg-surface-mid hover:text-ink'
-            }`}
-          >
-            Command Centre
-          </button>
           <button onClick={newChat} className="rounded-md px-2.5 py-1.5 text-xs font-medium text-ink-soft transition hover:bg-surface-mid hover:text-ink">
             New chat
           </button>
@@ -435,29 +394,22 @@ export default function App() {
       </header>
 
       <main ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto">
-        {view === 'settings' ? (
-          <CommandCenter onClose={() => setView('home')} />
-        ) : view === 'home' ? (
+        {view === 'home' ? (
           <HomeView
             greeting={greeting.current}
             working={working}
             questions={questions}
-            gates={gates}
             projects={projects}
             onOpenTasks={() => setTasksOpen(true)}
             onOpenProject={openProject}
             onPick={(p) => send(p)}
             onAnswer={answerQuestion}
-            onResolveGate={handleResolveGate}
           />
         ) : (
           <div className="mx-auto max-w-reading px-4 py-6">
             <div className="space-y-6">
               {messages.map((m) => (
                 <MessageRow key={m.id} message={m} sessionId={sessionId.current} />
-              ))}
-              {gates.map((g) => (
-                <GateCard key={g.gateRequestId} g={g} onResolve={handleResolveGate} />
               ))}
               {questions.map((q) => (
                 <QuestionCard key={q.taskId} q={q} onAnswer={answerQuestion} />
@@ -467,57 +419,55 @@ export default function App() {
         )}
       </main>
 
-      {view !== 'settings' && (
-        <footer className="border-t border-line bg-bg/80 px-4 py-3 backdrop-blur">
-          <div className="mx-auto flex max-w-reading items-end gap-2">
-            {recording ? (
-              <div className="flex flex-1 items-center gap-3 rounded-xl border border-danger/30 bg-danger/[0.04] px-3 py-2.5">
-                <span className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-danger" />
-                <span className="shrink-0 font-mono text-xs text-danger">{formatDuration(recSeconds)}</span>
-                <div className="min-w-0 flex-1 overflow-hidden">
-                  <Waveform peaks={recPeaks} progress={1} idleClass="bg-danger/40" activeClass="bg-danger/60" />
-                </div>
-                <button onClick={cancelRecording} title="Cancel" className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-ink-soft hover:bg-surface-mid">
-                  <XIcon />
-                </button>
-                <button onClick={stopRecording} title="Send voice note" className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-on-accent hover:brightness-110">
-                  <ArrowUp />
-                </button>
+      <footer className="border-t border-line bg-bg/80 px-4 py-3 backdrop-blur">
+        <div className="mx-auto flex max-w-reading items-end gap-2">
+          {recording ? (
+            <div className="flex flex-1 items-center gap-3 rounded-xl border border-danger/30 bg-danger/[0.04] px-3 py-2.5">
+              <span className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-danger" />
+              <span className="shrink-0 font-mono text-xs text-danger">{formatDuration(recSeconds)}</span>
+              <div className="min-w-0 flex-1 overflow-hidden">
+                <Waveform peaks={recPeaks} progress={1} idleClass="bg-danger/40" activeClass="bg-danger/60" />
               </div>
-            ) : (
-              <>
-                <div className="flex flex-1 items-end gap-2 rounded-xl border border-line bg-surface px-2.5 py-2 shadow-card transition focus-within:border-accent">
-                  <button onClick={startRecording} title="Record a voice note" className="mb-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-full text-ink-mute transition hover:bg-surface-mid hover:text-ink">
-                    <MicIcon />
-                  </button>
-                  <textarea
-                    ref={taRef}
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault()
-                        send()
-                      }
-                    }}
-                    rows={1}
-                    placeholder="Message Smarty…"
-                    className="max-h-52 flex-1 resize-none bg-transparent py-1 text-[15px] leading-relaxed text-ink outline-none placeholder:text-ink-mute"
-                  />
-                </div>
-                <button
-                  onClick={() => send()}
-                  disabled={!input.trim()}
-                  title="Send"
-                  className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent text-on-accent shadow-ambient transition enabled:hover:brightness-110 disabled:opacity-30"
-                >
-                  <ArrowUp />
+              <button onClick={cancelRecording} title="Cancel" className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-ink-soft hover:bg-surface-mid">
+                <XIcon />
+              </button>
+              <button onClick={stopRecording} title="Send voice note" className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-accent text-on-accent hover:brightness-110">
+                <ArrowUp />
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="flex flex-1 items-end gap-2 rounded-xl border border-line bg-surface px-2.5 py-2 shadow-card transition focus-within:border-accent">
+                <button onClick={startRecording} title="Record a voice note" className="mb-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-full text-ink-mute transition hover:bg-surface-mid hover:text-ink">
+                  <MicIcon />
                 </button>
-              </>
-            )}
-          </div>
-        </footer>
-      )}
+                <textarea
+                  ref={taRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault()
+                      send()
+                    }
+                  }}
+                  rows={1}
+                  placeholder="Message Smarty…"
+                  className="max-h-52 flex-1 resize-none bg-transparent py-1 text-[15px] leading-relaxed text-ink outline-none placeholder:text-ink-mute"
+                />
+              </div>
+              <button
+                onClick={() => send()}
+                disabled={!input.trim()}
+                title="Send"
+                className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-accent text-on-accent shadow-ambient transition enabled:hover:brightness-110 disabled:opacity-30"
+              >
+                <ArrowUp />
+              </button>
+            </>
+          )}
+        </div>
+      </footer>
 
       <ProjectsDrawer open={drawerOpen} projects={projects} onClose={() => setDrawerOpen(false)} onPick={openProject} />
 
@@ -535,43 +485,28 @@ function HomeView({
   greeting,
   working,
   questions,
-  gates,
   projects,
   onOpenTasks,
   onOpenProject,
   onPick,
   onAnswer,
-  onResolveGate,
 }: {
   greeting: string
   working: Working[]
   questions: WorkerQuestion[]
-  gates: GateRequest[]
   projects: ProjectSummary[]
   onOpenTasks: () => void
   onOpenProject: (slug: string) => void
   onPick: (prompt: string) => void
   onAnswer: (taskId: string, text: string) => void
-  onResolveGate: (taskId: string, gateRequestId: string, approved: boolean, rememberForTask?: boolean) => void
 }) {
-  const nothing = working.length === 0 && projects.length === 0 && questions.length === 0 && gates.length === 0
+  const nothing = working.length === 0 && projects.length === 0 && questions.length === 0
   return (
     <div className="mx-auto max-w-reading px-4 py-10 sm:py-14">
       <h1 className="animate-fade-in-up text-[26px] font-semibold tracking-tight text-ink sm:text-[32px]">{greeting}</h1>
       <p className="animate-fade-in-up text-[15px] text-ink-soft" style={{ animationDelay: '40ms' }}>
         {nothing ? 'What can I help you with?' : "Here's what's going on."}
       </p>
-
-      {gates.length > 0 && (
-        <section className="mt-8 animate-fade-in-up" style={{ animationDelay: '50ms' }}>
-          <SectionLabel>Permission Required</SectionLabel>
-          <div className="mt-2.5 space-y-2.5">
-            {gates.map((g) => (
-              <GateCard key={g.gateRequestId} g={g} onResolve={onResolveGate} />
-            ))}
-          </div>
-        </section>
-      )}
 
       {questions.length > 0 && (
         <section className="mt-8 animate-fade-in-up" style={{ animationDelay: '60ms' }}>
@@ -783,7 +718,6 @@ function ProjectOverview({
   const [showAllRuns, setShowAllRuns] = useState(false)
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [questions, setQuestions] = useState<WorkerQuestion[]>([])
-  const [gates, setGates] = useState<GateRequest[]>([])
   const [input, setInput] = useState('')
   const runs = project?.runs ?? []
   const visibleRuns = showAllRuns ? runs : runs.slice(0, 3)
@@ -819,29 +753,8 @@ function ProjectOverview({
         onReasoning: (id, text) => upsert(id, (m) => ({ ...m, reasoning: m.reasoning + text, thinkStart: m.thinkStart ?? Date.now() })),
         onMsgEnd: (id, text) =>
           upsert(id, (m) => ({ ...m, streaming: false, content: text && text.length > 0 ? text : m.content, thinkMs: m.thinkMs ?? (m.thinkStart ? Date.now() - m.thinkStart : undefined) })),
-        onWorking: (id) => {
-          setQuestions((q) => q.filter((x) => x.taskId !== id))
-          setGates((g) => g.filter((x) => x.taskId !== id))
-        },
+        onWorking: (id) => setQuestions((q) => q.filter((x) => x.taskId !== id)),
         onQuestion: (q) => setQuestions((prev) => (prev.some((x) => x.taskId === q.taskId) ? prev : [...prev, q])),
-        onGateRequest: (g) => setGates((prev) => (prev.some((x) => x.gateRequestId === g.gateRequestId) ? prev : [...prev, g])),
-        onGateResolved: (_, gateRequestId) => setGates((prev) => prev.filter((x) => x.gateRequestId !== gateRequestId)),
-        onTaskProgressDigest: (digest) => {
-          setMessages((prev) => {
-            if (prev.some((m) => m.id === digest.id)) return prev
-            return [
-              ...prev,
-              {
-                id: digest.id,
-                role: 'progress_digest',
-                content: digest.text,
-                reasoning: '',
-                streaming: false,
-                digestItems: digest.items,
-              }
-            ]
-          })
-        },
       },
       controller.signal,
     )
@@ -854,13 +767,6 @@ function ProjectOverview({
     setQuestions((q) => q.filter((x) => x.taskId !== taskId))
     setTab('chat')
     answerTask(projSession, taskId, body).catch(() => {})
-  }
-
-  function handleResolveGate(taskId: string, gateRequestId: string, approved: boolean, rememberForTask = false) {
-    if (!projSession) return
-    setGates((g) => g.filter((x) => x.gateRequestId !== gateRequestId))
-    setTab('chat')
-    resolveGate(projSession, taskId, gateRequestId, approved, rememberForTask).catch(() => {})
   }
 
   useLayoutEffect(() => {
@@ -944,15 +850,12 @@ function ProjectOverview({
           </div>
         ) : (
           <div className="mx-auto max-w-reading px-4 py-6">
-            {messages.length === 0 && questions.length === 0 && gates.length === 0 ? (
+            {messages.length === 0 && questions.length === 0 ? (
               <div className="pt-16 text-center text-sm text-ink-mute">Ask me anything about {project.title} — I'll keep to this project.</div>
             ) : (
               <div className="space-y-6">
                 {messages.map((m) => (
                   <MessageRow key={m.id} message={m} sessionId={projSession ?? ''} />
-                ))}
-                {gates.map((g) => (
-                  <GateCard key={g.gateRequestId} g={g} onResolve={handleResolveGate} />
                 ))}
                 {questions.map((q) => (
                   <QuestionCard key={q.taskId} q={q} onAnswer={answerQuestion} />
@@ -1249,35 +1152,6 @@ function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: str
     return () => clearInterval(t)
   }, [thinking])
 
-  if (message.role === 'progress_digest') {
-    return (
-      <div className="flex gap-3 animate-fade-in-up items-start">
-        <div className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-accent/10 text-accent">
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent/10 opacity-75"></span>
-          <svg className="h-4 w-4 animate-spin text-accent" fill="none" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-          </svg>
-        </div>
-        <div className="min-w-0 flex-1 rounded-2xl bg-surface-low/60 backdrop-blur-sm border border-surface-mid/80 px-4 py-3.5 shadow-sm space-y-2">
-          <div className="flex items-center gap-2 text-xs font-semibold tracking-wider uppercase text-ink-soft/90">
-            <span>Still working</span>
-            <span className="h-1 w-1 rounded-full bg-accent animate-pulse"></span>
-            <span className="text-[10px] text-ink-mute font-normal normal-case ml-auto">Heartbeat Update</span>
-          </div>
-          <div className="space-y-1.5">
-            {message.digestItems?.map((item, idx) => (
-              <div key={idx} className="text-[14px] leading-relaxed text-ink-soft flex items-start gap-2">
-                <span className="text-accent/80 font-medium select-none mt-[3px] text-xs">Task #{item.id}:</span>
-                <span className="flex-1">{item.summary}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-    )
-  }
-
   if (message.role === 'user') {
     if (message.audio) return <VoiceBubble message={message} />
     return (
@@ -1313,7 +1187,7 @@ function MessageRow({ message, sessionId }: { message: UiMessage; sessionId: str
         {message.content && !message.streaming && (
           <div className="flex items-center gap-1 pt-1">
             <CopyButton text={message.content} />
-            <FeedbackButtons sessionId={sessionId} messageId={message.id as number} />
+            <FeedbackButtons sessionId={sessionId} messageId={message.id} />
           </div>
         )}
       </div>
@@ -1508,57 +1382,6 @@ function QuestionIcon() {
       <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
       <line x1="12" y1="17" x2="12.01" y2="17" />
     </svg>
-  )
-}
-function ShieldAlertIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-      <line x1="12" y1="8" x2="12" y2="12" />
-      <line x1="12" y1="16" x2="12.01" y2="16" />
-    </svg>
-  )
-}
-
-// ---- interactive worker gate ----
-function GateCard({ g, onResolve }: { g: GateRequest; onResolve: (taskId: string, gateRequestId: string, approved: boolean, rememberForTask?: boolean) => void }) {
-  return (
-    <div className="overflow-hidden rounded-xl border border-danger/30 bg-danger/[0.04] shadow-card animate-fade-in-up">
-      <div className="px-4 py-3.5">
-        <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-danger">
-          <ShieldAlertIcon />
-          Permission Required
-        </div>
-        <div className="mt-1.5 text-[15px] leading-relaxed text-ink">
-          Smarty needs permission to perform the following action in task *#{g.taskId}*:
-          <div className="mt-2.5 rounded-lg bg-surface/50 p-3 font-mono text-xs text-ink-soft border border-line overflow-x-auto whitespace-pre-wrap break-all">
-            <span className="font-semibold text-ink">Action:</span> {g.action}
-            <br />
-            <span className="font-semibold text-ink">Details:</span> {g.description}
-          </div>
-        </div>
-        <div className="mt-3.5 flex flex-wrap gap-2">
-          <button
-            onClick={() => onResolve(g.taskId, g.gateRequestId, true, true)}
-            className="rounded-lg bg-danger text-white px-4 py-2 text-sm font-medium transition hover:brightness-110"
-          >
-            Approve for task
-          </button>
-          <button
-            onClick={() => onResolve(g.taskId, g.gateRequestId, true, false)}
-            className="rounded-lg border border-danger/40 bg-surface px-4 py-2 text-sm font-medium text-danger transition hover:bg-danger/[0.06]"
-          >
-            Approve once
-          </button>
-          <button
-            onClick={() => onResolve(g.taskId, g.gateRequestId, false)}
-            className="rounded-lg border border-line bg-surface px-4 py-2 text-sm text-ink transition hover:bg-surface-low"
-          >
-            Deny
-          </button>
-        </div>
-      </div>
-    </div>
   )
 }
 function BurgerIcon() {

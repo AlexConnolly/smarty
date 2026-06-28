@@ -190,17 +190,14 @@ public static class FileTools
         string.Concat(Path.GetFileName(name.Trim()).Select(c =>
             Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
 
-    /// <summary>write_file(name, content): author a text file in this conversation's area (create/overwrite).
-    /// The file is part of the worker's OUTPUT; the orchestrator delivers it on completion — the worker itself
-    /// never sends. <paramref name="onWrite"/> is notified with the file name so the host can track artifacts.</summary>
-    public static AgentTool WriteFileTool(string rootDir, Action<string>? onWrite = null, string name = "write_file")
+    /// <summary>write_file(name, content): author a text file in this conversation's area (create/overwrite).</summary>
+    public static AgentTool WriteFileTool(string rootDir, string name = "write_file")
     {
         return new AgentTool(
             name,
             "Writes a text file into THIS conversation's file area (creating it, or overwriting one of the same " +
-            "name). Use it to produce a document, note, patch, or data file as your deliverable — anything you " +
-            "write here is part of your output and is delivered to the user automatically when you finish. " +
-            "Scoped to this conversation.",
+            "name). Use it to produce a document, note, or data file you can then send with send_file. The file " +
+            "stays scoped to this conversation.",
             new[]
             {
                 ToolParameter.String("name", "File name to write, e.g. \"summary.md\". Kept to this conversation.", required: true),
@@ -215,9 +212,8 @@ public static class FileTools
                 {
                     Directory.CreateDirectory(rootDir);
                     File.WriteAllText(Path.Combine(rootDir, fileName), content);
-                    onWrite?.Invoke(fileName);
                     return Task.FromResult(ToolOutput.Ok(
-                        $"Wrote {fileName} ({content.Length} chars). It's part of your output and will be delivered to the user automatically."));
+                        $"Wrote {fileName} ({content.Length} chars) to this conversation. Send it with send_file(\"{fileName}\")."));
                 }
                 catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't write {fileName}: {ex.Message}")); }
             });
@@ -242,15 +238,42 @@ public static class FileTools
                         return Task.FromResult(ToolOutput.Ok("No files in this conversation yet."));
                     var sb = new StringBuilder("Files in this conversation:\n");
                     foreach (var f in files) sb.Append($"- {f.Name} ({HumanSize(f.Length)})\n");
-                    sb.Append("Use read_file / file_summary to read one.");
+                    sb.Append("Use read_file / file_summary to read one, or send_file to send it to the user.");
                     return Task.FromResult(ToolOutput.Ok(sb.ToString().TrimEnd()));
                 }
                 catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't list files: {ex.Message}")); }
             });
     }
 
-    // (No send_file tool: a worker never delivers. It writes files as output; the orchestrator delivers them
-    // when it relays the worker's result — see Orchestrator.DriveWorker. This keeps the worker off the surface.)
+    /// <summary>send_file(name, caption): send one of THIS conversation's files back to the user. The
+    /// <paramref name="emit"/> callback hands the resolved path to the host (which uploads it into the
+    /// thread); it returns false if the file couldn't be queued.</summary>
+    public static AgentTool SendFileTool(string rootDir, Func<string, string?, bool> emit, string name = "send_file")
+    {
+        return new AgentTool(
+            name,
+            "Sends a file from THIS conversation back to the user (uploads it into the thread). Use the exact " +
+            "name shown by list_files. You can only send files that exist in this conversation — files the user " +
+            "shared here or that you wrote here.",
+            new[]
+            {
+                ToolParameter.String("name", "Name of the file to send, exactly as shown by list_files.", required: true),
+                ToolParameter.String("caption", "Optional short message to send alongside the file.", required: false),
+            },
+            (args, _) =>
+            {
+                string fileName = SafeFileName(args.GetString("name"));
+                string path = Path.Combine(rootDir, fileName);
+                if (fileName.Length == 0 || !File.Exists(path))
+                    return Task.FromResult(ToolOutput.DeadEnd(
+                        $"There's no file called '{fileName}' in this conversation. Use list_files to see what's here."));
+                string? caption = args.GetStringOrNull("caption")?.Trim();
+                bool ok = emit(path, string.IsNullOrWhiteSpace(caption) ? null : caption);
+                return Task.FromResult(ok
+                    ? ToolOutput.Ok($"Sent {fileName} to the user.")
+                    : ToolOutput.Error($"Couldn't send {fileName} just now."));
+            });
+    }
 
     private static string HumanSize(long bytes) => bytes switch
     {
