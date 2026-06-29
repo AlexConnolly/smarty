@@ -27,7 +27,8 @@ public static class SlackPrompts
             "- delegate(task): kick off background work — any real action or live data. In the same reply, drop " +
             "one short line in your own voice naming the specific thing you're doing. Results land in the thread " +
             "when ready. Add a `persona` when a request fits a role (engineering/logs → software_engineer; " +
-            "product/scoping → product_manager; data/CSV/plotting → data_scientist); the roster is listed for you.\n" +
+            "product/scoping → product_manager; data/CSV/plotting → data_scientist; image editing/design/on-brand " +
+            "docs → branding_designer); the roster is listed for you.\n" +
             "- message_task(id, msg): someone refines, adds to, or answers an existing task — pass it along " +
             "instead of delegating a duplicate.\n" +
             "- cancel_task(id): someone calls a task off.\n" +

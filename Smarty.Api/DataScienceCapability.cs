@@ -61,11 +61,11 @@ public sealed class DataScienceCapability : ICapability
         }
 
         // Verify imports
-        Console.WriteLine("[datascience] Verifying required libraries (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl)...");
+        Console.WriteLine("[datascience] Verifying required libraries (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl, pillow)...");
         bool needsInstall = false;
         try
         {
-            string output = RunSimpleCommand(_pythonCmd, "-c \"import pandas; import numpy; import scipy; import matplotlib; import seaborn; import reportlab; import openpyxl; print('ok')\"").Trim();
+            string output = RunSimpleCommand(_pythonCmd, "-c \"import pandas; import numpy; import scipy; import matplotlib; import seaborn; import reportlab; import openpyxl; from PIL import Image; print('ok')\"").Trim();
             if (output != "ok") needsInstall = true;
         }
         catch
@@ -78,21 +78,21 @@ public sealed class DataScienceCapability : ICapability
             Console.WriteLine("[datascience] Some required libraries are missing. Installing via pip...");
             try
             {
-                RunCommandAndShowOutput(_pythonCmd, "-m pip install pandas numpy scipy matplotlib seaborn reportlab openpyxl");
+                RunCommandAndShowOutput(_pythonCmd, "-m pip install pandas numpy scipy matplotlib seaborn reportlab openpyxl pillow");
                 Console.WriteLine("[datascience] Libraries successfully installed.");
             }
             catch (Exception ex)
             {
                 throw new InvalidOperationException(
-                    "Required Python packages (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl) are missing and automatic pip installation failed. " +
-                    "Please install them manually: pip install pandas numpy scipy matplotlib seaborn reportlab openpyxl. " +
+                    "Required Python packages (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl, pillow) are missing and automatic pip installation failed. " +
+                    "Please install them manually: pip install pandas numpy scipy matplotlib seaborn reportlab openpyxl pillow. " +
                     $"Error: {ex.Message}");
             }
 
             // Verify again
             try
             {
-                string output = RunSimpleCommand(_pythonCmd, "-c \"import pandas; import numpy; import scipy; import matplotlib; import seaborn; import reportlab; import openpyxl; print('ok')\"").Trim();
+                string output = RunSimpleCommand(_pythonCmd, "-c \"import pandas; import numpy; import scipy; import matplotlib; import seaborn; import reportlab; import openpyxl; from PIL import Image; print('ok')\"").Trim();
                 if (output != "ok")
                 {
                     throw new Exception("Prerequisites validation failed after installation.");

@@ -104,6 +104,22 @@ public sealed class SlackThreadSink : IEventSink
                 break;
             }
 
+            case "progress":
+            {
+                // A periodic "still on it" heartbeat for a long-running task (backs off exponentially in the
+                // orchestrator). Name the task — several can run at once — and add the current step/thought.
+                using var doc = JsonDocument.Parse(data);
+                var root = doc.RootElement;
+                string note = root.TryGetProperty("note", out var n) ? (n.GetString() ?? "") : "";
+                string task = root.TryGetProperty("task", out var te) ? (te.GetString() ?? "") : "";
+                string head = task.Length > 60 ? task[..60].TrimEnd() + "…" : task;
+                string line = string.IsNullOrWhiteSpace(note)
+                    ? $"⏳ still on it — _{head}_"
+                    : $"⏳ still on it — _{head}_: {note}";
+                Post(ToSlackMrkdwn(line));
+                break;
+            }
+
             case "file":
             {
                 // A worker is sending a file back into the thread. The path is a thread-scoped file the

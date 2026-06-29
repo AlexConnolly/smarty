@@ -1035,7 +1035,60 @@ public sealed class Orchestrator
 
     /// <summary>Run a freshly delegated task: start its worker from the task description.</summary>
     private Task RunWorkerAsync(Session session, TaskInfo task)
-        => DriveWorker(session, task, task.Description);
+        => DriveWithHeartbeat(session, task, task.Description);
+
+    // Drive a TOP-LEVEL task's leg with a background PROGRESS HEARTBEAT alongside it: while the task runs, post
+    // a short "still on it" line into the thread on an exponential backoff (≈1, 2, 4, 8, 16, 32 min, then steady)
+    // so a long task never feels dead but also never spams. Several tasks run their own heartbeats independently,
+    // so each reports its own progress. Only top-level tasks go through here (a plan's hidden child steps call
+    // DriveWorker directly), so the user sees one heartbeat per thing they asked for, not per sub-step.
+    private async Task DriveWithHeartbeat(Session session, TaskInfo task, string message)
+    {
+        using var hbCts = CancellationTokenSource.CreateLinkedTokenSource(task.Cts.Token);
+        var beat = HeartbeatAsync(session, task, hbCts.Token);
+        try { await DriveWorker(session, task, message).ConfigureAwait(false); }
+        finally
+        {
+            hbCts.Cancel();
+            try { await beat.ConfigureAwait(false); } catch { /* best-effort */ }
+        }
+    }
+
+    // Emit a "progress" event for a running task, backing off exponentially. Surface-agnostic: the Slack sink
+    // renders it; the web app (no sink) is skipped entirely — it already shows live progress in its task overlay.
+    private async Task HeartbeatAsync(Session session, TaskInfo task, CancellationToken ct)
+    {
+        if (session.Sink is null) return; // web app — it has the live overlay; don't post heartbeat chatter
+        double minutes = 1;
+        try
+        {
+            while (task.Status == "running")
+            {
+                try { await Task.Delay(TimeSpan.FromMinutes(minutes), ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                if (ct.IsCancellationRequested || task.Status != "running") return;
+                session.Append("progress", Json(new
+                {
+                    id = task.Id,
+                    task = task.Description,
+                    note = CleanThought(task.LatestThought),
+                }));
+                minutes = Math.Min(minutes * 2, 32); // 1,2,4,8,16,32 then steady — never fully silent, never spammy
+            }
+        }
+        catch { /* progress is best-effort — never disturb the task */ }
+    }
+
+    // A short, clean snippet of the worker's latest thought/activity for a heartbeat: strip any leaked <think>
+    // tags, collapse whitespace, truncate. Empty when there's nothing useful to say yet.
+    private static string CleanThought(string? thought)
+    {
+        if (string.IsNullOrWhiteSpace(thought)) return "";
+        var t = System.Text.RegularExpressions.Regex.Replace(thought, @"</?think>", "",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        t = System.Text.RegularExpressions.Regex.Replace(t, @"\s+", " ").Trim();
+        return t.Length > 160 ? t[..160].TrimEnd() + "…" : t;
+    }
 
     /// <summary>Resume a worker that paused to ask a question: feed the user's answer back in. The worker
     /// re-runs seeded with its prior transcript, so it continues with full context (a clean, stateless
@@ -1057,7 +1110,7 @@ public sealed class Orchestrator
         task.Pending = null;
         task.Status = "running";
         session.Append("working", Json(new { id = task.Id, task = task.Description }));
-        await DriveWorker(session, task, answer).ConfigureAwait(false);
+        await DriveWithHeartbeat(session, task, answer).ConfigureAwait(false);
     }
 
     /// <summary>Drive a worker for one leg of a (possibly multi-leg, interactive) task: stream its progress,
