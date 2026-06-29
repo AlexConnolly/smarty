@@ -31,7 +31,10 @@ public sealed class TaskInfo
     public required string Id { get; init; }
     public required string Description { get; init; }
     public string? Project { get; init; }            // slug of the project this task runs within, if any
-    public string? Persona { get; init; }            // id of the specialist persona handling it, if any
+    public string? Persona { get; set; }             // id of the specialist persona handling it (set by triage, if any)
+    public string? Brand { get; set; }               // for branding work: which brand kit (slug) this task uses; "house" = the agency's own
+    public string? ParentTaskId { get; init; }       // set on a plan's child STEP tasks; null for top-level tasks
+    public WorkPlan? Plan { get; set; }              // set on a COORDINATOR task that runs a multi-discipline plan
     public string? UserScope { get; init; }          // memory scope of the person who asked, e.g. "user:U123"
     public string? UserName { get; init; }            // their display name, for context
     public bool PersonalMemoryEnabled { get; init; } = true; // whether personal memory is enabled for this task

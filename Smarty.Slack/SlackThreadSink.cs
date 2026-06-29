@@ -57,6 +57,9 @@ public sealed class SlackThreadSink : IEventSink
 
                 string text = root.TryGetProperty("text", out var t) ? t.GetString() ?? "" : "";
                 text = StripThinking(text);
+                // "[ack]" is the model's "I acknowledge but have nothing to say" — post nothing (a turn that
+                // realises mid-flight the message wasn't for it can bail this way instead of forcing a reply).
+                if (text.Trim().Trim('`').Equals("[ack]", StringComparison.OrdinalIgnoreCase)) break;
                 if (!string.IsNullOrWhiteSpace(text)) Post(ToSlackMrkdwn(text));
                 break;
             }
@@ -68,14 +71,36 @@ public sealed class SlackThreadSink : IEventSink
                 string q = root.TryGetProperty("question", out var qe) ? qe.GetString() ?? "" : "";
                 if (string.IsNullOrWhiteSpace(q)) break;
 
-                var sb = new System.Text.StringBuilder(q);
+                var options = new List<string>();
                 if (root.TryGetProperty("options", out var opts) && opts.ValueKind == JsonValueKind.Array)
+                    options = opts.EnumerateArray().Select(o => o.GetString())
+                        .Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s!).ToList();
+
+                // With options, render them as real clickable buttons (Block Kit); the gateway routes a click
+                // back as the answer to the waiting task. Slack caps button text ~75 chars and an actions block
+                // at 5 elements — keep within that, falling back to a plain message if there's nothing to click.
+                if (options.Count > 0)
                 {
-                    var list = opts.EnumerateArray().Select(o => o.GetString()).Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
-                    if (list.Count > 0)
-                        sb.Append("\n\n").Append(string.Join("  ·  ", list.Select(o => $"_{o}_")));
+                    var elements = options.Take(5).Select((o, i) => new
+                    {
+                        type = "button",
+                        text = new { type = "plain_text", text = o.Length > 72 ? o[..72] : o },
+                        value = o.Length > 140 ? o[..140] : o,
+                        action_id = $"smarty_opt_{i}",
+                    }).ToArray();
+                    var blocks = new object[]
+                    {
+                        new { type = "section", text = new { type = "mrkdwn", text = ToSlackMrkdwn(q) } },
+                        new { type = "actions", elements },
+                    };
+                    string blocksJson = JsonSerializer.Serialize(blocks);
+                    string fallback = q + "\n\n" + string.Join("  ·  ", options.Select(o => $"_{o}_"));
+                    _ = _api.PostMessageBlocksAsync(_channel, _threadTs, fallback, blocksJson);
                 }
-                Post(ToSlackMrkdwn(sb.ToString()));
+                else
+                {
+                    Post(ToSlackMrkdwn(q));
+                }
                 break;
             }
 

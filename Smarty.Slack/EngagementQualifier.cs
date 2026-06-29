@@ -37,13 +37,28 @@ public sealed class EngagementQualifier
     };
 
     /// <summary>True if the new message is aimed at Smarty / wants it to act, vs. colleagues talking among
-    /// themselves. <paramref name="recent"/> is the last few thread lines (author: text) for context.</summary>
+    /// themselves. <paramref name="recent"/> is the last few thread lines (author: text) for context. When
+    /// <paramref name="pendingQuestion"/> is set, Smarty is waiting on an answer to THAT question — the bar
+    /// flips: only treat the message as for-Smarty if it's plausibly answering it, not if the user is turning
+    /// to a colleague ("what do you think, John?"). False here = the "[ack]" case: stay quiet, consume nothing.</summary>
     public async Task<bool> ShouldRespondAsync(
-        IReadOnlyList<string> recent, string author, string text, CancellationToken ct = default)
+        IReadOnlyList<string> recent, string author, string text, string? pendingQuestion = null, CancellationToken ct = default)
     {
         try
         {
             var sb = new StringBuilder();
+            if (!string.IsNullOrWhiteSpace(pendingQuestion))
+            {
+                sb.Append("You are \"Smarty\". You just asked the thread a question and are WAITING for an answer:\n");
+                sb.Append($"  \"{pendingQuestion}\"\n");
+                sb.Append("Decide if the LATEST message is YOUR answer, or not for you. respond=true ONLY if it's " +
+                          "plausibly answering your question (a choice, a preference, a 'yeah do that'). " +
+                          "respond=false if the speaker is turning to or asking SOMEONE ELSE (e.g. \"what do you " +
+                          "think, John?\"), thinking out loud to others, or otherwise not actually answering YOU — " +
+                          "then you stay silent and keep waiting.\n\n");
+            }
+            else
+            {
             sb.Append("You are \"Smarty\", a chatty teammate in a Slack thread. You were tagged earlier and " +
                       "you're part of this conversation now. Decide whether to reply to the LATEST message.\n");
             sb.Append("LEAN TOWARDS replying. Reply if the message is plausibly aimed at you in ANY way: a " +
@@ -52,6 +67,7 @@ public sealed class EngagementQualifier
                       "welcome — you don't have to be all business. ONLY stay silent when the message is clearly " +
                       "two OTHER people talking to each other, not to you. When it's ambiguous but could be for " +
                       "you, reply.\n\n");
+            }
             if (recent.Count > 0)
             {
                 sb.Append("Recent thread:\n");

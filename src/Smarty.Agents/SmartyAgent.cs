@@ -71,6 +71,13 @@ public sealed class SmartyAgent
                 }
             }
 
+            // A prior leg can be interrupted (cancel/timeout/watchdog abort) mid tool-call group, after the
+            // assistant message with N tool calls was appended but before every call's result was. The
+            // transcript is persisted and reused, so resending it would carry an assistant tool-call with no
+            // matching tool result — which providers reject ("incomplete parallel tool-call group"). Close any
+            // such gap before the model call so the group is always well-formed.
+            EnsureToolCallsAnswered(conversation);
+
             var request = new ModelRequest
             {
                 Model = _input.Model.Model,
@@ -328,6 +335,39 @@ public sealed class SmartyAgent
     /// <summary>Ask the agent a question and get the full drained result (answer + reasoning + tools).</summary>
     public Task<AgentAnswer> AnswerAll(string userMessage, CancellationToken ct = default)
         => AnswerStream(userMessage, ct).ReadAllAsync(ct);
+
+    // Guarantee every assistant tool call is followed by a tool result. An interrupted turn (cancellation,
+    // timeout, watchdog abort) can leave an assistant tool-call group only partially answered in the persisted
+    // transcript; replaying that to a provider fails with an "incomplete tool-call group" error. For each
+    // assistant message, the tool results are the contiguous Role.Tool messages immediately after it; any
+    // tool-call id not covered gets a synthetic failure result inserted at the end of that group. A well-formed
+    // conversation is left untouched.
+    private static void EnsureToolCallsAnswered(List<Message> conversation)
+    {
+        for (int i = 0; i < conversation.Count; i++)
+        {
+            if (conversation[i].Role != Role.Assistant || conversation[i].ToolCalls is not { Count: > 0 } calls)
+                continue;
+
+            var answered = new HashSet<string>(StringComparer.Ordinal);
+            int end = i + 1;
+            while (end < conversation.Count && conversation[end].Role == Role.Tool)
+            {
+                if (conversation[end].ToolCallId is { Length: > 0 } id) answered.Add(id);
+                end++;
+            }
+
+            foreach (var call in calls)
+            {
+                if (string.IsNullOrEmpty(call.Id) || answered.Contains(call.Id)) continue;
+                conversation.Insert(end++, Message.ToolResult(call.Id, call.Name,
+                    "Tool execution was interrupted before it returned a result. Treat this call as failed — " +
+                    "do not assume it ran; retry it or continue without it."));
+            }
+
+            i = end - 1;
+        }
+    }
 
     private async Task<ToolOutput> ExecuteToolAsync(ToolCall call, CancellationToken ct)
     {

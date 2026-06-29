@@ -38,7 +38,7 @@ var integrations = IntegrationConfig.Load(Path.Combine(config.DataDir, "integrat
 var capabilities = new CapabilityRegistry(new ICapability[]
 {
     new KibanaCapability(), new CodeCapability(), new GitHubCapability(), new JiraCapability(),
-    new DataScienceCapability(),
+    new DataScienceCapability(), new FigmaCapability(),
 });
 var personas = new PersonaStore();
 

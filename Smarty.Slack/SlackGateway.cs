@@ -78,6 +78,11 @@ public sealed class SlackGateway
     /// <summary>Handle one Events API payload (already acked by the socket layer).</summary>
     public async Task HandlePayloadAsync(JsonElement payload)
     {
+        // Interactive payloads (a button click) carry no "event" — route them separately, as the answer to a
+        // waiting task in that thread.
+        if (payload.GetPropertyOrNull("type") == "block_actions")
+        { await HandleBlockActionsAsync(payload).ConfigureAwait(false); return; }
+
         if (payload.GetPropertyOrNull("event_id") is { } eventId && !FirstTime(eventId))
         { Trace($"dup event_id {eventId} — skipped"); return; }
         if (!payload.TryGetProperty("event", out var ev)) return;
@@ -131,12 +136,30 @@ public sealed class SlackGateway
             string author = await _api.GetUserNameAsync(user).ConfigureAwait(false);
             string clean = CleanText(text);
 
-            // 1:1 (just this person + Smarty) → it's all addressed to Smarty, so engage with everything,
-            // banter and asides included. Only when other humans are in the thread do we classify, to avoid
-            // jumping into people talking to each other. Keep the message in context either way.
+            // Is Smarty waiting on a question in this thread? If so the bar flips: the message only counts if
+            // it's actually answering Smarty — not if the user is turning to a colleague.
+            var waitingTask = thread.Session.Tasks.Values
+                .Where(t => t.Status == "waiting").OrderByDescending(t => t.StartedAt).FirstOrDefault();
+
+            // respond=false is the "[ack]" outcome: keep the message in context, post nothing, consume nothing.
             bool respond;
-            if (thread.Humans.Count <= 1)
+            if (MentionsAnotherUser(text))
             {
+                // Explicitly tagging a specific colleague (and not Smarty) → it's for them. Defer.
+                respond = false;
+                Trace("[ack]: message tags another user, not Smarty");
+            }
+            else if (waitingTask is not null)
+            {
+                // Waiting for an answer — check it's FOR Smarty even in a 1:1 (they may defer to someone). A
+                // "no" keeps the task waiting and posts nothing, so a stray line never gets eaten as the answer.
+                var recent = RecentLines(thread.Session);
+                respond = await _qualifier.ShouldRespondAsync(recent, author, clean, waitingTask.Pending?.Question).ConfigureAwait(false);
+                Trace($"[ack?] waiting-aware respond={respond} for \"{Snip(clean, 60)}\"");
+            }
+            else if (thread.Humans.Count <= 1)
+            {
+                // 1:1 (just this person + Smarty) → it's all addressed to Smarty; engage with everything.
                 respond = true;
                 Trace("1:1 thread — engaging without classifier");
             }
@@ -156,6 +179,37 @@ public sealed class SlackGateway
         {
             thread.Gate.Release();
         }
+    }
+
+    // A button click from a question's options. We extract the clicked value + which thread it's in, then run
+    // it through EngageAsync exactly as if the user had typed that option — so it routes back to the task that's
+    // waiting on the question (the normal answer path), buttons or not.
+    private async Task HandleBlockActionsAsync(JsonElement payload)
+    {
+        if (!payload.TryGetProperty("actions", out var actions) || actions.ValueKind != JsonValueKind.Array
+            || actions.GetArrayLength() == 0)
+            return;
+        var action = actions[0];
+        string value = action.GetPropertyOrNull("value") ?? "";
+        string? user = payload.TryGetProperty("user", out var u) ? u.GetPropertyOrNull("id") : null;
+        string channel = payload.TryGetProperty("channel", out var ch) ? (ch.GetPropertyOrNull("id") ?? "") : "";
+        string threadTs = "";
+        if (payload.TryGetProperty("message", out var msg))
+            threadTs = msg.GetPropertyOrNull("thread_ts") ?? msg.GetPropertyOrNull("ts") ?? "";
+        if (threadTs.Length == 0 && payload.TryGetProperty("container", out var cont))
+            threadTs = cont.GetPropertyOrNull("thread_ts") ?? cont.GetPropertyOrNull("message_ts") ?? "";
+        if (string.IsNullOrWhiteSpace(value) || channel.Length == 0 || threadTs.Length == 0 || user is null)
+        { Trace("block_actions: missing context — ignored"); return; }
+
+        Trace($"block_actions: ch={channel} thread={threadTs} user={user} value=\"{Snip(value, 40)}\"");
+        var thread = GetThread(channel, threadTs);
+        await thread.Gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            thread.Humans.Add(user);
+            await EngageAsync(thread, user, value, Array.Empty<SlackFileRef>()).ConfigureAwait(false);
+        }
+        finally { thread.Gate.Release(); }
     }
 
     /// <summary>Fire a scheduled task into its thread (called by the <see cref="Scheduler"/>). Attaches or
@@ -367,6 +421,19 @@ public sealed class SlackGateway
     // Strip Slack mention tokens (<@U123>) and tidy whitespace, so the model sees plain text.
     private string CleanText(string text) =>
         Regex.Replace(_mentionRegex.Replace(text, ""), @"\s+", " ").Trim();
+
+    // True if the text @mentions a real Slack user OTHER than Smarty — a strong signal the message is aimed at
+    // that colleague, not the bot. (Channel/here/everyone broadcasts aren't user ids, so they don't count.)
+    private bool MentionsAnotherUser(string text)
+    {
+        foreach (Match m in _mentionRegex.Matches(text))
+        {
+            var id = m.Value.Trim('<', '@', '>');
+            if (id.Length > 0 && !string.Equals(id, _botUserId, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
 
     /// <summary>A file Slack reported on a message, before we've downloaded it.</summary>
     private sealed record SlackFileRef(string Id, string Name, string? Mime, long Size, string UrlDownload);

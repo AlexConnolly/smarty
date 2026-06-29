@@ -219,26 +219,54 @@ public static class FileTools
             });
     }
 
-    /// <summary>list_files(): the files available in THIS conversation (shared in OR written here) — and nothing else.</summary>
-    public static AgentTool ListFilesTool(string rootDir, string name = "list_files")
+    /// <summary>A read-only file bucket mounted alongside a conversation's own files — e.g. a global company
+    /// area or a persona's brand kit. Its files are listed (with their real on-disk path) so a worker can read
+    /// them with read_file or reference them by path inside run_python; they are never writable or sendable
+    /// from here (writes always land in the conversation).</summary>
+    public sealed record FileMount(string Label, string Dir);
+
+    /// <summary>list_files(): the files in THIS conversation (shared in OR written here), plus any read-only
+    /// buckets mounted for this worker (a global area, the persona's brand kit). Conversation files are shown by
+    /// bare name (use them with write/send); bucket files are shown with their full path (read-only — reference
+    /// that path in read_file or run_python).</summary>
+    public static AgentTool ListFilesTool(string rootDir, IReadOnlyList<FileMount>? mounts = null, string name = "list_files")
     {
+        bool hasMounts = mounts is { Count: > 0 };
+        string desc = hasMounts
+            ? "Lists the files available to you: THIS conversation's files (shared here or written here), plus " +
+              "read-only reference buckets (e.g. a brand kit). Conversation files are referred to by bare name; " +
+              "bucket files are read-only and shown with their full path — use that path with read_file or inside " +
+              "run_python (e.g. to place a logo). You cannot write to or send a bucket file."
+            : "Lists the files available in THIS conversation — files the user shared here and files you've " +
+              "written here. Only this conversation's files are ever visible; nothing from any other thread.";
         return new AgentTool(
             name,
-            "Lists the files available in THIS conversation — files the user shared here and files you've " +
-            "written here. Only this conversation's files are ever visible; nothing from any other thread.",
+            desc,
             Array.Empty<ToolParameter>(),
             (_, __) =>
             {
                 try
                 {
-                    if (!Directory.Exists(rootDir))
-                        return Task.FromResult(ToolOutput.Ok("No files in this conversation yet."));
-                    var files = new DirectoryInfo(rootDir).GetFiles().OrderBy(f => f.Name).ToList();
-                    if (files.Count == 0)
-                        return Task.FromResult(ToolOutput.Ok("No files in this conversation yet."));
-                    var sb = new StringBuilder("Files in this conversation:\n");
-                    foreach (var f in files) sb.Append($"- {f.Name} ({HumanSize(f.Length)})\n");
-                    sb.Append("Use read_file / file_summary to read one, or send_file to send it to the user.");
+                    var sb = new StringBuilder();
+                    var convo = Directory.Exists(rootDir)
+                        ? new DirectoryInfo(rootDir).GetFiles().OrderBy(f => f.Name).ToList()
+                        : new List<FileInfo>();
+                    sb.Append("Files in this conversation:\n");
+                    if (convo.Count == 0) sb.Append("- (none yet)\n");
+                    else foreach (var f in convo) sb.Append($"- {f.Name} ({HumanSize(f.Length)})\n");
+
+                    if (hasMounts)
+                        foreach (var m in mounts!)
+                        {
+                            if (!Directory.Exists(m.Dir)) continue;
+                            var files = new DirectoryInfo(m.Dir).GetFiles("*", SearchOption.AllDirectories)
+                                .OrderBy(f => f.FullName).ToList();
+                            if (files.Count == 0) continue;
+                            sb.Append($"\n{m.Label} (read-only — reference by full path):\n");
+                            foreach (var f in files) sb.Append($"- {f.FullName} ({HumanSize(f.Length)})\n");
+                        }
+
+                    sb.Append("\nUse read_file / file_summary to read one, or send_file to send a conversation file to the user.");
                     return Task.FromResult(ToolOutput.Ok(sb.ToString().TrimEnd()));
                 }
                 catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't list files: {ex.Message}")); }

@@ -207,8 +207,11 @@ public sealed class Orchestrator
         "if one already covers this, do NOT start an overlapping task that repeats it. When the user asks for an " +
         "EXTRA thing on top of work already running (\"also do X\"), delegate JUST that extra thing — never " +
         "re-describe the whole job again. The new task's description must contain only the new part.\n" +
-        "- message_task(id, msg): user refines or adds to something ALREADY running, OR answers a task that's " +
-        "WAITING on a question from you — pass it to that task; do NOT also delegate (that duplicates the work).\n" +
+        "- message_task(id, msg): user refines or adds to something ALREADY running, answers a task that's " +
+        "WAITING on a question from you, OR iterates on a FINISHED task's result (\"make it cleaner\", \"more " +
+        "pink\", \"add a chart\", \"try that again\") — pass the change to that task's id; do NOT delegate afresh. " +
+        "A finished task re-opens and resumes with all its prior context, so it adjusts what it built instead of " +
+        "redoing it from scratch. Finished tasks you can re-open are listed for you with their ids.\n" +
         "- cancel_task(id): user backs off (\"never mind\", \"stop\", \"forget it\").\n" +
         "- list_tasks() / task_status(id): what's running / how it's going (use the ids you're shown).\n" +
         "- search_memory(query): recall what you know about the USER — keywords, not sentences. Only when " +
@@ -357,7 +360,7 @@ public sealed class Orchestrator
             profile = await ProfileNote(session, message, session.CurrentUserScope, ct).ConfigureAwait(false);
             focus = await ProjectFocusNote(session, message, ct).ConfigureAwait(false);
         }
-        var dynamicContext = (DateContext() + profile + focus + RunningTasksNote(session) + ScheduledNote(session) + FilesNote(session) + PersonaNote()).TrimStart();
+        var dynamicContext = (DateContext() + profile + focus + RunningTasksNote(session) + FinishedTasksNote(session) + ScheduledNote(session) + FilesNote(session) + PersonaNote() + BrandsNote()).TrimStart();
         if (dynamicContext.Length > 0)
             convo.Insert(Math.Max(0, convo.Count - 1), Message.System(dynamicContext));
 
@@ -568,24 +571,25 @@ public sealed class Orchestrator
                 break; // the spoken text (ack / answer) stands; no tool data to relay
         }
 
-        // The model often delegates with everything in its reasoning and NO spoken line, leaving the user
-        // staring at a blank (or a generic filler). Rather than a fixed "On it.", generate one short,
-        // CONTEXTUAL ack from the task it just kicked off, so the user is told what's actually happening.
-        if (delegatedSomething && spoken.Length == 0)
+        // The model often ACTS (delegates, or resumes/steers an existing task) with everything in its
+        // reasoning and NO spoken line, leaving the user staring at a blank. Rather than a fixed "On it.",
+        // generate one short CONTEXTUAL ack so they're told what's actually happening. The apology is the
+        // LAST resort — only when the turn took no action at all (the model just reasoned and the nudge
+        // didn't recover it). NEVER apologise for work that actually happened (e.g. a message_task that
+        // re-opened a task to refine it — that's a tool call, not a delegate, so it isn't caught above).
+        if (spoken.Length == 0)
         {
-            string ack = delegatedTask is not null
-                ? await GenerateDelegateAckAsync(message, delegatedTask, ct).ConfigureAwait(false)
-                : "On the case 🔍";
+            string ack;
+            if (delegatedSomething)
+                ack = delegatedTask is not null
+                    ? await GenerateDelegateAckAsync(message, delegatedTask, ct).ConfigureAwait(false)
+                    : "On the case 🔍";
+            else if (anyToolCalled)
+                ack = await GenerateDelegateAckAsync(message, message, ct).ConfigureAwait(false);
+            else
+                ack = "Sorry — I trailed off there. Could you say that again?";
             spoken.Append(ack);
             session.Append("content", Json(new { id = msgId, text = ack }));
-        }
-        // Last-resort: the turn produced no message and no delegated work (e.g. the model only reasoned and
-        // the nudge didn't recover it). Never leave the user staring at an empty reply.
-        else if (spoken.Length == 0)
-        {
-            const string fallback = "Sorry — I trailed off there. Could you say that again?";
-            spoken.Append(fallback);
-            session.Append("content", Json(new { id = msgId, text = fallback }));
         }
 
         // Persist this turn's REAL exchange to history — the assistant's tool calls and their results, not
@@ -803,18 +807,88 @@ public sealed class Orchestrator
                 if (!TryResolve(session, call, out var t, out var miss)) return Data(miss);
                 var msg = call.Arguments.GetStringOrNull("message");
                 if (string.IsNullOrWhiteSpace(msg)) return Data("No message text was provided.");
-                // A task that's WAITING on a question: this message is the answer — feed it back so the
-                // worker resumes from where it paused (don't just queue it for a running loop).
-                if (t.Status == "waiting")
+                // Resume from a stateless replay of the task's transcript when it isn't mid-flight:
+                //  • WAITING — paused on a question; this message is the answer.
+                //  • DONE / FAILED — finished, but the user is refining or retrying ("make it cleaner",
+                //    "try again"). Re-open it so the worker continues with ALL its prior context (the data it
+                //    loaded, the files it produced, the code it wrote) and just adjusts — instead of redoing
+                //    the whole job from scratch. The planning gate is skipped on a resume (transcript is
+                //    non-empty), so it picks up, not restarts.
+                // A multi-discipline plan re-enters through its coordinator: the refine is routed to the step it
+                // touches (or appended as a new step) and cascades forward — keeping the whole change on one task
+                // and resuming the relevant step with full context, never starting the plan over.
+                if (t.Plan is not null && t.Status is "waiting" or "done" or "failed")
                 {
-                    _ = Task.Run(() => AnswerTaskAsync(session, t, msg!.Trim()));
+                    _ = Task.Run(() => RefinePlanAsync(session, t, msg!.Trim()));
                     return new ToolResultInfo(
-                        $"Answer passed back to task #{t.Id}; it's picking up where it left off.",
+                        $"Re-opened plan #{t.Id} with your change; it's picking up at the step that affects and carrying it forward.",
                         DataReturning: false, WasDelegate: false);
                 }
-                if (!t.IsRunning) return Data($"Task #{t.Id} is already {t.Status}; it can't take a message.");
+                if (t.Status is "waiting" or "done" or "failed")
+                {
+                    bool reopen = t.Status is "done" or "failed";
+                    _ = Task.Run(() => AnswerTaskAsync(session, t, msg!.Trim()));
+                    return new ToolResultInfo(
+                        reopen
+                            ? $"Re-opened task #{t.Id} with your note; it's resuming from where it left off with full context (not starting over)."
+                            : $"Answer passed back to task #{t.Id}; it's picking up where it left off.",
+                        DataReturning: false, WasDelegate: false);
+                }
+                if (!t.IsRunning) return Data($"Task #{t.Id} is {t.Status}; it can't take a message.");
                 t.Inbox.Enqueue(msg!.Trim());
                 return Data($"Message passed along to task #{t.Id}; it'll pick it up shortly.");
+            }
+
+            case "promote_file":
+            {
+                if (ThreadFilesDir(session) is not { } filesDir)
+                    return Data("Files aren't available in this context, so there's nothing to save.");
+                var fileName = call.Arguments.GetStringOrNull("name")?.Trim();
+                var scope = call.Arguments.GetStringOrNull("scope")?.Trim();
+                if (string.IsNullOrWhiteSpace(fileName)) return Data("Which file? Use the name shown by list_files.");
+                if (string.IsNullOrWhiteSpace(scope)) return Data("Where to? Give a specialist id (e.g. branding_designer) or \"global\".");
+
+                var safe = string.Concat(Path.GetFileName(fileName).Select(c =>
+                    Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+                var source = Path.Combine(filesDir, safe);
+                if (safe.Length == 0 || !File.Exists(source))
+                    return Data($"There's no file called \"{fileName}\" in this conversation. Check list_files for the exact name.");
+
+                string? targetDir; string where;
+                if (string.Equals(scope, "global", StringComparison.OrdinalIgnoreCase))
+                {
+                    targetDir = GlobalBucketDir();
+                    where = "the shared company files";
+                }
+                else if (scope!.StartsWith("brand:", StringComparison.OrdinalIgnoreCase))
+                {
+                    // brand:<slug> — save into a brand kit, creating that brand if it's new (e.g. a new client).
+                    var slug = scope.Substring("brand:".Length).Trim();
+                    if (string.IsNullOrEmpty(slug)) return Data("Give a brand slug, e.g. scope \"brand:adidas\" (or \"brand:house\").");
+                    targetDir = BrandBucketDir(slug);
+                    bool isNew = BrandBucketDir(slug) is { } d && !Directory.Exists(d);
+                    where = $"the {slug} brand kit{(isNew ? " (new brand)" : "")}";
+                }
+                else if (_personas?.Get(scope) is { } persona)
+                {
+                    targetDir = PersonaBucketDir(persona.Id);
+                    where = $"the {persona.Name} kit";
+                }
+                else
+                {
+                    var ids = _personas is null ? "" : string.Join(", ", _personas.All.Select(p => p.Id));
+                    return Data($"Unknown scope \"{scope}\". Use \"global\", \"brand:<slug>\" (e.g. brand:adidas), or one of: {ids}.");
+                }
+                if (targetDir is null) return Data("Durable storage isn't available in this context.");
+
+                try
+                {
+                    Directory.CreateDirectory(targetDir);
+                    File.Copy(source, Path.Combine(targetDir, safe), overwrite: true);
+                    return Data($"Saved {safe} to {where} — it'll be available in future conversations. " +
+                                "Tell the user briefly it's saved; don't mention buckets or internals.");
+                }
+                catch (Exception ex) { return Data($"Couldn't save {safe}: {ex.Message}"); }
             }
 
             case "schedule_task":
@@ -1018,10 +1092,44 @@ public sealed class Orchestrator
         Trace($"[worker #{task.Id}] drive: {Snip(message, 120)}");
         try
         {
+            // MULTI-DISCIPLINE TRIAGE — top-level first leg only, when no persona was explicitly chosen and this
+            // isn't already a plan. A quick gate names the disciplines the task needs. ONE (or none) → route to
+            // that persona (or general) and carry on as a single worker. MORE than one → no single persona can
+            // do it, so build a plan and hand off to the coordinator, which runs the steps and never returns here.
+            if (_planner is not null && firstLeg && task.ParentTaskId is null && task.Plan is null
+                && task.Persona is null && _personas is not null)
+            {
+                task.LatestThought = "sizing up the task…";
+                var roster = PersonaRoster();
+                var disciplines = (await _planner.TriageDisciplinesAsync(task.Description, roster, task.Cts.Token).ConfigureAwait(false))
+                    .Where(id => _personas.Get(id) is not null)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                if (disciplines.Count > 1)
+                {
+                    task.LatestThought = "planning the approach…";
+                    Trace($"[worker #{task.Id}] triage → multi-discipline: {string.Join(", ", disciplines)}");
+                    var plan = await _planner.PlanStepsAsync(task.Description, roster, task.Cts.Token).ConfigureAwait(false);
+                    plan?.Steps.RemoveAll(s => _personas.Get(s.Persona) is null);
+                    if (plan is { Steps.Count: > 1 })
+                    {
+                        task.Plan = plan;
+                        await DrivePlanAsync(session, task, plan, null).ConfigureAwait(false);
+                        return;
+                    }
+                    Trace($"[worker #{task.Id}] triage → plan unusable; falling back to single worker");
+                }
+                else if (disciplines.Count == 1)
+                {
+                    task.Persona = disciplines[0];
+                    Trace($"[worker #{task.Id}] triage → single discipline: {task.Persona}");
+                }
+            }
+
             // PLANNING GATE — runs HERE, inside the background task (never on the orchestrator's chat turn, so
             // it can't slow or hang the conversation). First leg only: size the task up, and if it's complex,
             // build a plan and seed it so the executor follows a structured approach on long-horizon work.
-            if (_planner is not null && firstLeg)
+            // Skipped for a plan's child STEP — its instruction is already the plan's.
+            if (_planner is not null && firstLeg && task.ParentTaskId is null)
             {
                 task.LatestThought = "sizing up the task…";
                 if (await _planner.IsComplexAsync(task.Description, task.Cts.Token).ConfigureAwait(false))
@@ -1061,6 +1169,15 @@ public sealed class Orchestrator
                 Trace($"[worker #{task.Id}] workspace seeded: {ws}");
             }
 
+            // BRAND RESOLUTION — the branding designer works at an agency with many brands; pick which one this
+            // task is for (a client, or the house brand) so the right kit gets mounted below. First leg only;
+            // persists on the task so a refine stays on the same brand. Defaults to "house" so it never blocks.
+            if (task.Persona == "branding_designer" && string.IsNullOrEmpty(task.Brand) && _planner is not null)
+            {
+                task.Brand = await _planner.ResolveBrandAsync(task.Description, BrandSlugs(), task.Cts.Token).ConfigureAwait(false);
+                Trace($"[worker #{task.Id}] brand → {task.Brand}");
+            }
+
             string workerApiKey = Environment.GetEnvironmentVariable("TOGETHER_API_KEY") 
                 ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY") 
                 ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY") ?? "";
@@ -1091,7 +1208,10 @@ public sealed class Orchestrator
             {
                 Directory.CreateDirectory(threadFiles);
                 tools.Add(FileTools.WriteFileTool(threadFiles));
-                tools.Add(FileTools.ListFilesTool(threadFiles));
+                // Mount read-only buckets the worker can draw on: a global company area, plus the active
+                // persona's own kit (e.g. branding_designer's brand assets). list_files surfaces them with their
+                // real paths so run_python can use them; writes/sends still land in the conversation.
+                tools.Add(FileTools.ListFilesTool(threadFiles, BucketMounts(task)));
                 tools.Add(FileTools.SendFileTool(threadFiles, (path, caption) =>
                 {
                     session.Append("file", Json(new { path, name = Path.GetFileName(path), caption }));
@@ -1126,9 +1246,16 @@ public sealed class Orchestrator
                 // bolting model-specific crutches into this (deliberately model-agnostic) system.
                 Think = true,
             };
-            if (task.Persona == "data_scientist")
+            if (task.Persona is "data_scientist" or "branding_designer")
             {
+                // run_python IS these personas' workhorse — it iterates: the data_scientist profiles data, computes
+                // stats and renders charts; the branding_designer assembles a multi-element designed document
+                // (reportlab/HTML, embedding logo + charts). The default per-tool budget (5) chokes that mid-build
+                // and the watchdog then forces a half-finished fallback. Give run_python real headroom and tolerate
+                // the odd failed call (e.g. a missing optional import) without aborting the deliverable.
                 input.MaxIterations = 15;
+                input.MaxCallsPerTool = 25;
+                input.MaxToolFailures = 8;
             }
             var worker = new SmartyAgent(input);
 
@@ -1208,7 +1335,9 @@ public sealed class Orchestrator
         // real question object or nothing. Only run it when the worker finished cleanly (not cancelled/
         // failed). If it asked, park the task as "waiting": its transcript is already on task.Conversation,
         // the question is surfaced to the user, and we neither log a run nor re-voice — the run is paused.
-        var question = (!cancelled && task.Status == "running")
+        // A plan's child STEP never pauses to ask the user — the coordinator decides pass/retry/pause for it —
+        // so the question-finalize is top-level only.
+        var question = (!cancelled && task.Status == "running" && task.ParentTaskId is null)
             ? await FinalizeOutcomeAsync(task, task.Cts.Token).ConfigureAwait(false)
             : null;
         if (question is not null)
@@ -1231,7 +1360,10 @@ public sealed class Orchestrator
         task.Result = result;
         if (task.Status == "running") task.Status = "done";
 
-        session.Append("working_done", Json(new { id = task.Id, status = task.Status }));
+        // A child step's lifecycle is internal — only the coordinator's own working/working_done are surfaced,
+        // so the user sees one task progressing, not a flurry of sub-tasks.
+        if (task.ParentTaskId is null)
+            session.Append("working_done", Json(new { id = task.Id, status = task.Status }));
         Trace($"[worker #{task.Id}] RESULT >>> {Snip(result, 500)}");
 
         // Record what the sub-agent did, scoped to its project (work with no project isn't logged here —
@@ -1260,10 +1392,18 @@ public sealed class Orchestrator
         // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
         if (cancelled) return;
 
-        // Did the task come back with nothing usable? Then we must NOT relay it as if it had data — the
-        // re-voice would otherwise invent a plausible answer (it once fabricated a whole "latest news"
-        // rundown from a blank result). We still let the MODEL phrase the reply (so it matches the user's
-        // language — no hard-coded line), but on a strict "it failed, invent nothing" instruction.
+        // A plan's child STEP doesn't speak to the user — its coordinator relays the whole plan once at the
+        // end. Only a top-level task re-voices its own result here.
+        if (task.ParentTaskId is null)
+            await ReVoiceAsync(session, task, result).ConfigureAwait(false);
+    }
+
+    /// <summary>Relay a finished task's result to the user in the orchestrator's voice. The MODEL phrases it
+    /// (so it matches the user's language), but on a strict instruction: a blank/"(no result)" result must be
+    /// reported as a failure with nothing invented — the re-voice once fabricated a whole "latest news" rundown
+    /// from an empty result. Shared by single workers and the plan coordinator.</summary>
+    private async Task ReVoiceAsync(Session session, TaskInfo task, string result)
+    {
         bool failed = string.IsNullOrWhiteSpace(result)
             || string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase);
 
@@ -1299,6 +1439,171 @@ public sealed class Orchestrator
         {
             session.TurnLock.Release();
         }
+    }
+
+    /// <summary>Run a multi-discipline plan to completion: each step is a hidden child worker of <paramref
+    /// name="parent"/>, run in order over the shared thread file area, with each step's output threaded into the
+    /// next step's brief. On a step that can't deliver (after one retry) the plan PAUSES at that step and the
+    /// coordinator relays honestly what it has — the partial artifacts and transcripts are all preserved, so a
+    /// follow-up resumes from there. When <paramref name="refineForCurrent"/> is set, the step at
+    /// <see cref="WorkPlan.CurrentStep"/> resumes its existing child with that note (a user refinement) instead
+    /// of starting fresh; later steps re-run to cascade the change forward.</summary>
+    private async Task DrivePlanAsync(Session session, TaskInfo parent, WorkPlan plan, string? refineForCurrent)
+    {
+        var prior = new System.Text.StringBuilder();
+        int resumeAt = plan.CurrentStep; // the step the refine (if any) targets — captured before the loop moves it
+        // Re-establish context from any steps already done (so a resume threads their outputs forward too).
+        for (int j = 0; j < resumeAt && j < plan.Steps.Count; j++)
+            if (plan.Steps[j].Result is { Length: > 0 } r)
+                prior.Append($"\n### Output of step {j + 1} ({plan.Steps[j].Persona}):\n{r}\n");
+
+        for (int i = resumeAt; i < plan.Steps.Count; i++)
+        {
+            if (parent.Cts.IsCancellationRequested) { parent.Status = "cancelled"; return; }
+            var step = plan.Steps[i];
+            plan.CurrentStep = i;
+            step.Status = "running";
+            parent.Status = "running";
+            parent.LatestThought = $"step {i + 1}/{plan.Steps.Count} ({step.Persona}): {Head(step.Instruction, 80)}";
+            session.Append("working", Json(new
+            {
+                id = parent.Id,
+                task = $"Step {i + 1}/{plan.Steps.Count} — {step.Persona}: {Head(step.Instruction, 120)}",
+            }));
+            Trace($"[plan #{parent.Id}] step {i + 1}/{plan.Steps.Count} [{step.Persona}]");
+
+            // The first step at the resume point may carry a user refinement; downstream steps just refresh
+            // against the now-updated upstream artifacts.
+            string? note = i == resumeAt ? refineForCurrent : null;
+            var (ok, reason) = await RunPlanStepAsync(session, parent, step, prior.ToString(), note).ConfigureAwait(false);
+            if (!ok)
+            {
+                step.Status = "failed";
+                parent.Status = "waiting"; // paused, not dead: resumable from here
+                parent.LatestThought = $"stuck on step {i + 1}: {Head(reason, 80)}";
+                session.Append("working_done", Json(new { id = parent.Id, status = "waiting" }));
+                var done = plan.Steps.Take(i).Select((s, k) => $"step {k + 1} ({s.Persona})").ToList();
+                var summary =
+                    $"The plan got through {(done.Count == 0 ? "no steps" : string.Join(", ", done))}, " +
+                    $"then stalled on step {i + 1} ({step.Persona}): {step.Instruction}. " +
+                    $"What blocked it: {reason}. The work so far is saved.";
+                parent.Result = summary;
+                Trace($"[plan #{parent.Id}] PAUSED at step {i + 1}: {Snip(reason, 160)}");
+                await ReVoiceAsync(session, parent, summary).ConfigureAwait(false);
+                return;
+            }
+
+            step.Status = "done";
+            prior.Append($"\n### Output of step {i + 1} ({step.Persona}):\n{step.Result}\n");
+        }
+
+        plan.CurrentStep = plan.Steps.Count;
+        parent.Status = "done";
+        var last = plan.Steps[^1];
+        parent.Result = string.IsNullOrWhiteSpace(last.Result) ? "(no result)" : last.Result;
+        session.Append("working_done", Json(new { id = parent.Id, status = "done" }));
+        Trace($"[plan #{parent.Id}] DONE ({plan.Steps.Count} steps)");
+        await ReVoiceAsync(session, parent, parent.Result!).ConfigureAwait(false);
+    }
+
+    /// <summary>Run one plan step as a hidden child worker, with one retry on a verified failure. Returns
+    /// (true, "") once the step's output satisfies what it was meant to produce, or (false, reason) when it
+    /// still can't after the retry — at which point the coordinator pauses the plan. Records the child id on the
+    /// step so a later refine can resume it. Reuses an existing child (resume) when one is already attached.</summary>
+    private async Task<(bool Ok, string Reason)> RunPlanStepAsync(
+        Session session, TaskInfo parent, PlanStep step, string priorContext, string? note)
+    {
+        string lastReason = "the step produced no usable result";
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            if (parent.Cts.IsCancellationRequested) return (false, "cancelled");
+
+            // Resume an existing child (a refine, or this step ran before) so it ADJUSTS rather than redoes;
+            // otherwise spin up a fresh child for this step. Either way it shares the thread file area, so it
+            // sees what earlier steps produced.
+            TaskInfo child;
+            string message;
+            if (step.ChildTaskId is { } cid && session.Tasks.TryGetValue(cid, out var existing) && existing.Conversation.Count > 0)
+            {
+                child = existing;
+                child.Status = "running";
+                child.Plan = null;
+                message = note is { Length: > 0 }
+                    ? note
+                    : "An earlier step in the plan was revised. Refresh your output to match the updated files " +
+                      "in this conversation's files area, keeping everything else as-is.";
+                if (attempt > 0) message += $"\n\n(Your previous attempt didn't satisfy the step: {lastReason}. Try again.)";
+            }
+            else
+            {
+                child = new TaskInfo
+                {
+                    Id = session.NextTaskId(),
+                    Description = step.Instruction,
+                    Persona = step.Persona,
+                    ParentTaskId = parent.Id,
+                    UserScope = parent.UserScope,
+                    UserName = parent.UserName,
+                    PersonalMemoryEnabled = parent.PersonalMemoryEnabled,
+                };
+                child.WorkspaceDir = CreateWorkspace(session, child, null);
+                session.Tasks[child.Id] = child;
+                step.ChildTaskId = child.Id;
+                var sb = new System.Text.StringBuilder(step.Instruction);
+                sb.Append("\n\nThis is one step of a larger plan. Expected output: ").Append(step.Produces).Append('.');
+                if (priorContext.Length > 0)
+                    sb.Append("\n\nWhat earlier steps produced (their files are in this conversation's files area):\n")
+                      .Append(priorContext);
+                if (attempt > 0)
+                    sb.Append($"\n\n(Your previous attempt didn't satisfy the step: {lastReason}. Try again.)");
+                message = sb.ToString();
+            }
+
+            await DriveWorker(session, child, message).ConfigureAwait(false);
+            if (child.Status == "cancelled") return (false, "cancelled");
+
+            var result = child.Result ?? "";
+            var (verdictOk, verdictReason) = await _planner!.VerifyStepAsync(
+                step.Instruction, step.Produces, result, parent.Cts.Token).ConfigureAwait(false);
+            if (verdictOk)
+            {
+                step.Result = result;
+                return (true, "");
+            }
+            lastReason = string.IsNullOrWhiteSpace(verdictReason) ? "the output didn't meet the step's goal" : verdictReason;
+            Trace($"[plan #{parent.Id}] step retry — {Snip(lastReason, 140)}");
+        }
+        return (false, lastReason);
+    }
+
+    /// <summary>Re-enter a finished/paused plan with a user refinement: route it to the step it touches (or
+    /// append a new step), rewind the plan to there, and resume — the targeted step adjusts and the rest cascade
+    /// forward. Keeps the whole change attached to the one plan task. Fire-and-forget.</summary>
+    private async Task RefinePlanAsync(Session session, TaskInfo parent, string message)
+    {
+        var plan = parent.Plan!;
+        EmitMessage(session, "user", message);
+        var roster = PersonaRoster();
+        var (idx, newPersona) = await _planner!.RouteRefineAsync(plan, roster, message, parent.Cts.Token).ConfigureAwait(false);
+
+        if (idx < 0)
+        {
+            // A genuinely new discipline — append it as a new step the plan runs next.
+            var persona = newPersona is { Length: > 0 } && _personas?.Get(newPersona) is not null
+                ? newPersona!
+                : plan.Steps[^1].Persona;
+            plan.Steps.Add(new PlanStep(persona, message, "the change the user just asked for"));
+            plan.CurrentStep = plan.Steps.Count - 1;
+            Trace($"[plan #{parent.Id}] refine → new step [{persona}]");
+            await DrivePlanAsync(session, parent, plan, message).ConfigureAwait(false);
+            return;
+        }
+
+        // Rewind to the targeted step; downstream steps re-run to cascade the change.
+        plan.CurrentStep = idx;
+        for (int i = idx; i < plan.Steps.Count; i++) plan.Steps[i].Status = "pending";
+        Trace($"[plan #{parent.Id}] refine → step {idx + 1} ([{plan.Steps[idx].Persona}])");
+        await DrivePlanAsync(session, parent, plan, message).ConfigureAwait(false);
     }
 
     private static string Head(string s, int max) =>
@@ -1634,18 +1939,50 @@ public sealed class Orchestrator
         return sb.ToString();
     }
 
-    // The persona roster, surfaced to the orchestrator so it can route a fitting task to a specialist (by
-    // passing `persona` to delegate) — explicitly ("ask the software engineer…") or by recognising the fit.
-    // Empty when no personas are configured.
+    // The persona roster surfaced to the orchestrator. Routing is now delegate's job — a background triage
+    // picks the right specialist(s) and, for a cross-discipline job, plans a sequence of them. So the
+    // orchestrator should NOT hand-pick: it just delegates the work. The only time it passes `persona` is when
+    // the user explicitly names a role ("ask the software engineer…"). Empty when no personas are configured.
     private string PersonaNote()
     {
         if (_personas is null) return "";
         var all = _personas.All;
         if (all.Count == 0) return "";
-        var sb = new StringBuilder("\n\nSpecialist personas you can delegate to (pass `persona` to delegate when " +
-                                   "the task fits one — otherwise delegate normally):\n");
+        var sb = new StringBuilder("\n\nWhen you delegate, the work is automatically routed to the right " +
+                                   "specialist — and a task that spans several disciplines is planned as a " +
+                                   "sequence of them. So just delegate the work plainly; do NOT pick a specialist " +
+                                   "yourself. Only pass `persona` when the user explicitly names a role. The " +
+                                   "available specialists (for your awareness only):\n");
         foreach (var p in all)
             sb.Append($"- {p.Id} ({p.Name}): {p.Description}\n");
+        return sb.ToString();
+    }
+
+    // The brands managed here (house + any client brand kits), surfaced so the orchestrator can talk about them
+    // and knows new branding work can either use an existing brand or become a new one (promote_file brand:<slug>).
+    // Empty when no workspace root (no buckets) — and quietly omitted when only the house brand exists yet.
+    private string BrandsNote()
+    {
+        if (BrandsRootDir() is null) return "";
+        var slugs = BrandSlugs();
+        var clients = slugs.Where(s => !string.Equals(s, "house", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (clients.Count == 0) return "";
+        var sb = new StringBuilder("\n\nBrand kits available for branding work (the agency's own is \"house\"):\n");
+        sb.Append("- house (your own brand)\n");
+        foreach (var c in clients) sb.Append($"- {c}\n");
+        sb.Append("Branding work is automatically matched to the right brand. To save an approved new brand (or " +
+                  "update one), use promote_file with scope \"brand:<slug>\".\n");
+        return sb.ToString();
+    }
+
+    // A compact roster (id: one-liner) handed to the planner's triage/step/route calls. Kept lean on purpose —
+    // routing reads ids and a short description, never the full system prompts, so the gate stays cheap.
+    private string PersonaRoster()
+    {
+        if (_personas is null) return "";
+        var sb = new StringBuilder();
+        foreach (var p in _personas.All)
+            sb.Append($"- {p.Id}: {p.Description}\n");
         return sb.ToString();
     }
 
@@ -1653,14 +1990,37 @@ public sealed class Orchestrator
     // what it has running (and their ids) — even across turns, so "cancel that" / "how's it going" work.
     private static string RunningTasksNote(Session session)
     {
-        var running = session.Tasks.Values.Where(t => t.IsRunning)
+        var running = session.Tasks.Values.Where(t => t.IsRunning && t.ParentTaskId is null)
             .OrderBy(t => int.TryParse(t.Id, out var n) ? n : 0).ToList();
         if (running.Count == 0) return "";
         var sb = new StringBuilder("\n\nTasks ALREADY running in the background (refer to them by id):\n");
         foreach (var t in running)
             sb.Append($"- #{t.Id}: {t.Description}\n");
         sb.Append("Don't delegate anything that overlaps one of these — it's already being done. If the user " +
-                  "is adding to one, delegate ONLY the genuinely new part (or steer it with message_task).\n");
+                  "is adding to one, delegate ONLY the genuinely new part (or steer it with message_task).\n" +
+                  "If the user is just CHASING a running task — \"hurry up\", \"ship it\", \"you done?\", \"any " +
+                  "progress?\" — do NOT start another task and do NOT re-delegate the same work (that spawns a " +
+                  "confusing duplicate and wastes the in-flight one). Either pass the nudge to it with " +
+                  "message_task, or simply reassure them it's still going. Starting over is almost never right.\n");
+        return sb.ToString();
+    }
+
+    // Tasks in this thread that have FINISHED but can be re-opened. A worker resumes from its own saved
+    // transcript, so reopening keeps everything it already did (data loaded, files produced, code written) and
+    // just adjusts — far cheaper and better than redoing the job. Surfaced so the model refines instead of
+    // re-delegating when the user iterates on a result.
+    private static string FinishedTasksNote(Session session)
+    {
+        var finished = session.Tasks.Values.Where(t => t.Status is "done" or "failed" && t.ParentTaskId is null)
+            .OrderBy(t => int.TryParse(t.Id, out var n) ? n : 0).ToList();
+        if (finished.Count == 0) return "";
+        var sb = new StringBuilder("\n\nFinished tasks in this thread (re-open one with message_task — DON'T start over):\n");
+        foreach (var t in finished)
+            sb.Append($"- #{t.Id} [{t.Status}]: {Snip(t.Description, 140)}\n");
+        sb.Append("When the user iterates on what one of these produced — \"make it cleaner\", \"more pink\", " +
+                  "\"add a chart\", \"try again\" — message_task that id with just the change. The worker picks up " +
+                  "with all its prior context and adjusts (e.g. tweaks and re-renders the report) instead of " +
+                  "rebuilding from scratch. Only delegate a NEW task for genuinely new work.\n");
         return sb.ToString();
     }
 
@@ -1679,7 +2039,8 @@ public sealed class Orchestrator
     }
 
     private static List<TaskInfo> OrderedTasks(Session session) =>
-        session.Tasks.Values.OrderBy(t => int.TryParse(t.Id, out var n) ? n : 0).ToList();
+        session.Tasks.Values.Where(t => t.ParentTaskId is null)
+            .OrderBy(t => int.TryParse(t.Id, out var n) ? n : 0).ToList();
 
     private static bool TryResolve(Session session, ToolCall call, out TaskInfo task, out string miss)
     {
@@ -1830,6 +2191,74 @@ public sealed class Orchestrator
         return Path.Combine(_workspaceRoot, SafeSession(session.Id), "files");
     }
 
+    // File buckets: read-only areas mounted alongside a conversation's own files, so persistent assets live in
+    // ONE managed place instead of being re-uploaded every thread. Two scopes:
+    //  • global  — <root>/_buckets/global         (every worker, every thread)
+    //  • persona — <root>/_buckets/persona/<id>   (only when that persona runs — e.g. the brand kit)
+    // The dirs are created so a human can drop files in; an empty bucket simply contributes nothing.
+    private string? GlobalBucketDir() =>
+        string.IsNullOrEmpty(_workspaceRoot) ? null : Path.Combine(_workspaceRoot, "_buckets", "global");
+
+    private string? PersonaBucketDir(string personaId) =>
+        string.IsNullOrEmpty(_workspaceRoot) ? null
+            : Path.Combine(_workspaceRoot, "_buckets", "persona", SafeSession(personaId));
+
+    // Brand buckets: one named kit per brand this (agency) manages — the house brand plus one per client.
+    // <root>/_buckets/brand/<slug>/ holds that brand's tokens, logo, assets and optional template. The set of
+    // folders IS the registry of brands; creating a brand = promoting an approved tokenset into a new slug.
+    private string? BrandsRootDir() =>
+        string.IsNullOrEmpty(_workspaceRoot) ? null : Path.Combine(_workspaceRoot, "_buckets", "brand");
+
+    private string? BrandBucketDir(string slug) =>
+        BrandsRootDir() is { } root ? Path.Combine(root, SafeSession(slug)) : null;
+
+    /// <summary>The brands currently managed (the slugs of existing brand buckets). The filesystem is the
+    /// registry — no separate store to drift. "house" is implied even before its folder exists.</summary>
+    private IReadOnlyList<string> BrandSlugs()
+    {
+        var slugs = new List<string> { "house" };
+        if (BrandsRootDir() is { } root && Directory.Exists(root))
+            foreach (var d in Directory.GetDirectories(root))
+            {
+                var name = Path.GetFileName(d);
+                if (!string.IsNullOrEmpty(name) && !slugs.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    slugs.Add(name);
+            }
+        return slugs;
+    }
+
+    /// <summary>The read-only buckets a given task's worker can see: the global area always, plus a persona kit.
+    /// For the branding designer the "kit" is the resolved BRAND bucket (house or a client), so it designs in the
+    /// right brand. Dirs are ensured so they're discoverable; empty ones list nothing.</summary>
+    private IReadOnlyList<FileTools.FileMount> BucketMounts(TaskInfo task)
+    {
+        var mounts = new List<FileTools.FileMount>();
+        if (GlobalBucketDir() is { } g)
+        {
+            try { Directory.CreateDirectory(g); } catch { /* best-effort */ }
+            mounts.Add(new FileTools.FileMount("Shared company files", g));
+        }
+
+        if (task.Persona == "branding_designer")
+        {
+            var slug = string.IsNullOrWhiteSpace(task.Brand) ? "house" : task.Brand!;
+            if (BrandBucketDir(slug) is { } bdir)
+            {
+                try { Directory.CreateDirectory(bdir); } catch { /* best-effort */ }
+                var label = string.Equals(slug, "house", StringComparison.OrdinalIgnoreCase)
+                    ? "House brand kit" : $"{slug} brand kit";
+                mounts.Add(new FileTools.FileMount(label, bdir));
+            }
+        }
+        else if (task.Persona is { Length: > 0 } pid && PersonaBucketDir(pid) is { } pdir)
+        {
+            try { Directory.CreateDirectory(pdir); } catch { /* best-effort */ }
+            var label = _personas?.Get(pid)?.Name is { Length: > 0 } n ? $"{n} kit" : $"{pid} kit";
+            mounts.Add(new FileTools.FileMount(label, pdir));
+        }
+        return mounts;
+    }
+
     private string? CreateWorkspace(Session session, TaskInfo task, IReadOnlyList<Attachment>? attachments)
     {
         if (string.IsNullOrEmpty(_workspaceRoot)) return null;
@@ -1898,14 +2327,15 @@ public sealed class Orchestrator
     {
         new("delegate",
             "Hand a task to a capable background worker that has real tools (shell, internet, files). Provide " +
-            "a clear, self-contained description of the work. Optionally tag it to a project (by slug) so the " +
-            "worker has that project's context, and/or route it to a specialist persona (by id) so it runs with " +
-            "that role's expertise and tools — leave both blank for ordinary one-off tasks.",
+            "a clear, self-contained description of the work — the work is automatically routed to the right " +
+            "specialist, and a job that spans several disciplines is planned and run as a sequence of them, so " +
+            "you do NOT need to pick a specialist. Optionally tag it to a project (by slug) so the worker has " +
+            "that project's context. Only set `persona` when the user explicitly names a role to use.",
             new[]
             {
                 ToolParameter.String("task", "A clear, self-contained description of the work to do.", required: true),
                 ToolParameter.String("project", "Optional project slug to run the task within.", required: false),
-                ToolParameter.String("persona", "Optional specialist persona id to handle it (e.g. software_engineer, product_manager, data_scientist).", required: false),
+                ToolParameter.String("persona", "Optional — only when the user explicitly names a role. A specialist persona id (e.g. software_engineer, product_manager, data_scientist). Leave blank to auto-route.", required: false),
             },
             NoOp),
         new("find_project",
@@ -1934,11 +2364,28 @@ public sealed class Orchestrator
             new[] { ToolParameter.String("id", "The id of the task to cancel.", required: true) },
             NoOp),
         new("message_task",
-            "Send a follow-up message to a background task that is already running, by its id.",
+            "Send a follow-up to a background task by its id — to steer one that's running, answer one that's " +
+            "waiting on a question, or RE-OPEN a finished (done/failed) one to refine, extend, or retry it. A " +
+            "reopened task resumes from its own saved context (data, files, code it already produced) and just " +
+            "adjusts, so prefer this over delegating a fresh task when the user iterates on a prior result.",
             new[]
             {
                 ToolParameter.String("id", "The id of the running task to message.", required: true),
                 ToolParameter.String("message", "The follow-up to pass along to the task.", required: true),
+            },
+            NoOp),
+        new("promote_file",
+            "Save a file from THIS conversation into a DURABLE bucket so it's available in every future " +
+            "conversation (it otherwise lives only here). Use when the user wants to keep something as a reusable " +
+            "asset — e.g. a brand's tokens, logo, or template. scope is one of: \"brand:<slug>\" to save into a " +
+            "brand kit (use the client's slug, or \"house\" for your own brand; a NEW slug creates that brand — " +
+            "this is how an approved branding set becomes a stored brand); \"global\" (shared with everyone); or " +
+            "a specialist id. Only do this on a clear request to save/keep an asset; ordinary working files stay " +
+            "in the conversation.",
+            new[]
+            {
+                ToolParameter.String("name", "Name of the file in this conversation to save, as shown by list_files.", required: true),
+                ToolParameter.String("scope", "Where to save it: \"brand:<slug>\" (e.g. brand:adidas, brand:house), \"global\", or a specialist id.", required: true),
             },
             NoOp),
         new("schedule_task",
