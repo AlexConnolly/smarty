@@ -70,6 +70,10 @@ public sealed class SlackGateway
     // we were restarting, or someone double-tapping) get batched into one reply instead of racing into two.
     private static readonly TimeSpan CoalesceDelay = TimeSpan.FromMilliseconds(500);
 
+    // Hard cap on how long the debounce will keep waiting for a thread to go quiet — so a relentlessly chatty
+    // thread still gets a reply rather than the turn being deferred forever.
+    private static readonly TimeSpan MaxCoalesceWait = TimeSpan.FromSeconds(10);
+
     // Set SMARTY_TRACE=1 to log the full intake decision path to stderr (same switch the orchestrator uses).
     private static readonly bool TraceOn = Environment.GetEnvironmentVariable("SMARTY_TRACE") == "1";
     private static void Trace(string msg) { if (TraceOn) Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} [gw] {msg}"); }
@@ -284,15 +288,28 @@ public sealed class SlackGateway
             _ = Task.Run(() => DrainThreadAsync(thread));
     }
 
-    // One drain loop per thread. Each pass waits a beat (to let a burst settle), then takes EVERYTHING
-    // pending and runs it as a single turn — so piled-up messages yield one reply. Anything that arrives
-    // while a turn is running is picked up by the next pass, never a parallel reply. Exits when the queue
-    // is empty, atomically clearing Draining so the next message restarts it.
+    // One drain loop per thread. Each pass DEBOUNCES — it waits for the thread to fall quiet for CoalesceDelay
+    // (resetting whenever a new message lands, up to MaxCoalesceWait) — then takes EVERYTHING pending and runs
+    // it as ONE turn. So a burst spread over a few seconds (one person bumps with info, another chimes in)
+    // collapses into a single adapted reply instead of stacking "answer, then answer". Anything that arrives
+    // while a turn is running is picked up by the next pass as one combined turn, never a parallel reply. Exits
+    // when the queue is empty, atomically clearing Draining so the next message restarts it.
     private async Task DrainThreadAsync(SlackThread thread)
     {
         while (true)
         {
-            await Task.Delay(CoalesceDelay).ConfigureAwait(false);
+            // Debounce: settle until no new message has arrived for a full CoalesceDelay (capped).
+            int waited = 0, lastCount = -1;
+            while (true)
+            {
+                int count;
+                lock (thread.DrainLock) count = thread.Pending.Count;
+                if (count == lastCount) break;                 // quiet for a full window → settled
+                lastCount = count;
+                await Task.Delay(CoalesceDelay).ConfigureAwait(false);
+                waited += (int)CoalesceDelay.TotalMilliseconds;
+                if (waited >= MaxCoalesceWait.TotalMilliseconds) break; // chatty thread — stop waiting, reply now
+            }
 
             List<(string Line, string UserId, string UserName, IReadOnlyList<Attachment>? Attachments)> batch;
             lock (thread.DrainLock)

@@ -14,9 +14,8 @@ public sealed class DataScienceCapability : ICapability
     public IReadOnlyList<string> RequiredConfig => Array.Empty<string>();
 
     public string? PromptHint =>
-        "Use run_python to execute Python code, read/process CSVs/data, and generate graphs or PDF reports. " +
-        "When you generate files (like reports or graphs), they are automatically saved to the conversation. " +
-        "Send them to the user using send_file.";
+        "Use run_python to execute Python code, read/process CSVs/data, and generate charts (PNG). Files you " +
+        "generate are saved to the conversation automatically; send them to the user with send_file.";
 
     public IReadOnlyList<AgentTool> BuildTools(IntegrationConfig config, TaskInfo task)
     {

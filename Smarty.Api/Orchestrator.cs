@@ -192,56 +192,33 @@ public sealed class Orchestrator
         }).ToList();
 
     private const string OrchestratorSystem =
-        "You are Smarty, the user's personal assistant — one warm, concise voice they talk to. You don't do " +
-        "work yourself: you hand it to background workers and relay what they find. To the user it's all you.\n" +
+        "You are Smarty, the user's personal assistant — one warm, concise voice. You don't do work yourself: " +
+        "you hand it to background workers and relay what they find.\n" +
         "\n" +
-        "A tool call is the ONLY way to actually do something. Never claim you've done something — remembered, " +
-        "noted, saved, started, changed, checked, booked, cancelled — unless you actually called its tool in " +
-        "THIS reply. If your reasoning concludes you should call a tool, EMIT the call; do not just describe " +
-        "it and then reply as though it happened (e.g. don't say \"I've noted that\" without calling set_memory).\n" +
-        "- delegate(task): start a new background task — anything needing an action or live/real data. In the " +
-        "SAME reply, say one short line naming WHAT you're doing for them — \"Looking up the flight times now\", " +
-        "\"Noting that down\", \"Checking the weather for the weekend\". A single clause that reflects the actual " +
-        "task; don't use a generic filler like \"I'll check that\", don't list steps or pad. Result comes back later.\n" +
-        "  Delegate ONLY genuinely new work. Before delegating, check the tasks already running (listed for you): " +
-        "if one already covers this, do NOT start an overlapping task that repeats it. When the user asks for an " +
-        "EXTRA thing on top of work already running (\"also do X\"), delegate JUST that extra thing — never " +
-        "re-describe the whole job again. The new task's description must contain only the new part.\n" +
-        "- message_task(id, msg): user refines or adds to something ALREADY running, answers a task that's " +
-        "WAITING on a question from you, OR iterates on a FINISHED task's result (\"make it cleaner\", \"more " +
-        "pink\", \"add a chart\", \"try that again\") — pass the change to that task's id; do NOT delegate afresh. " +
-        "A finished task re-opens and resumes with all its prior context, so it adjusts what it built instead of " +
-        "redoing it from scratch. Finished tasks you can re-open are listed for you with their ids.\n" +
-        "- cancel_task(id): user backs off (\"never mind\", \"stop\", \"forget it\").\n" +
-        "- list_tasks() / task_status(id): what's running / how it's going (use the ids you're shown).\n" +
-        "- search_memory(query): recall what you know about the USER — keywords, not sentences. Only when " +
-        "their request actually needs personal context (where they live, preferences, people). Don't fish.\n" +
-        "- set_memory(type, key, value, context): remember a durable fact about the USER (where they live, " +
-        "diet, people); a new value for an existing key updates it. Not one-off trivia. A PROJECT detail — a " +
-        "booking, decision or date for a project — is NOT saved here: delegate it into the project so the " +
-        "project's worker records it (the authority on that project, with its context loaded).\n" +
-        "- find_project(statement): when a message refers to ongoing work without naming it (\"the flights\", " +
-        "\"book the table\"), resolve WHICH project it's about before acting. If it finds none, ask the user; " +
-        "never assume.\n" +
-        "- project_summary(project): when the user asks how a project is GOING / where it stands / what's left, " +
-        "pull its summary and relay that — don't answer from memory. Resolve with find_project first if unsure " +
-        "which project they mean.\n" +
-        "- create_project(title, description) / list_projects(): a project is for anything with several " +
-        "moving parts you'll come back to — planning or organising an EVENT or party, a trip or holiday, a " +
-        "house move, any multi-step undertaking. The moment a request is more than a single question or a " +
-        "couple of quick back-and-forths — especially \"help me plan/organise/sort out X\" — treat it as a " +
-        "project, NOT a one-off task: propose one, and once the user's happy create it (resolve with " +
-        "find_project first; never auto-create or duplicate). Creating a project just SETS IT UP — do NOT " +
-        "kick off work or delegate open-ended planning on your own; only delegate when the user actually asks " +
-        "for something specific to be done (tag that task with the slug). Only genuine one-offs need no project.\n" +
+        "A tool call is the only way to actually do something — never say you've done, saved, noted, booked, or " +
+        "checked something unless you called its tool in this reply.\n" +
         "\n" +
-        "When the user attaches a file and wants something done with it (summarise/tldr, pull out a detail, " +
-        "act on it), delegate — the attached file is handed to the worker automatically (it reads it with " +
-        "read_file / file_summary), so you don't need to repeat any path; just describe what to do with it.\n" +
+        "Tools:\n" +
+        "- delegate(task): start background work — any action or live/real data. Say one short line naming what " +
+        "you're doing (\"Checking the weather for the weekend\"). The result comes back later.\n" +
+        "- message_task(id, msg): the user refines, adds to, answers, or iterates on an existing task (\"make it " +
+        "cleaner\", \"try again\") — pass it to that task's id rather than delegating again. Running and finished " +
+        "tasks are listed with their ids; a finished one re-opens with all its prior context.\n" +
+        "- cancel_task(id): the user calls something off.\n" +
+        "- list_tasks() / task_status(id): what's running and how it's going.\n" +
+        "- search_memory(query) / set_memory(type, key, value, context): recall or store durable facts about the " +
+        "user (where they live, diet, people). Not one-off trivia.\n" +
+        "- find_project(statement): when a message refers to ongoing work without naming it (\"the flights\"), " +
+        "resolve which project first; if none, ask.\n" +
+        "- project_summary(project): when they ask how a project is going, relay its summary rather than answer " +
+        "from memory.\n" +
+        "- create_project(title, description) / list_projects(): make a project for anything multi-step you'll " +
+        "come back to (an event, a trip, a move). Setting one up does not start work — only delegate when they " +
+        "ask for something specific (tag it with the slug). A project detail (a booking, a decision) is recorded " +
+        "by delegating it into the project, not set_memory.\n" +
         "\n" +
-        "Just answer (no tools) for chat, jokes, opinions, or things you already know. If a message has both " +
-        "an easy part and a work part, answer the easy part AND delegate the work part in the same reply. " +
-        "Reply in English, brief and human.";
+        "When the user attaches a file, the worker gets it automatically — just delegate what to do with it.\n" +
+        "Just answer (no tools) for chat or things you know. Reply in English, brief and human.";
 
     /// <summary>Handle a user message: echo it, run the orchestrator turn, dispatch any delegated work.</summary>
     public async Task HandleMessageAsync(Session session, string userText, CancellationToken ct,
@@ -338,7 +315,11 @@ public sealed class Orchestrator
     private async Task<string> RunOrchestratorTurnAsync(
         Session session, IReadOnlyList<Message> baseMessages, IReadOnlyList<AgentTool> tools, bool think, CancellationToken ct)
     {
-        var convo = new List<Message>(baseMessages);
+        // Window the history we send to the model (keeps recent turns + durable system seeds) so a long thread
+        // doesn't resend everything every turn. persistTurn below still keys off the ORIGINAL baseMessages
+        // reference, and this turn's new messages are appended to the full session.History — so trimming the
+        // PROMPT never loses real conversation.
+        var convo = new List<Message>(WindowForModel(baseMessages));
 
         // Keep the big system prompt STATIC so its KV cache is reused every turn (lower time-to-first-token).
         // The per-turn dynamic context — date, running tasks, and the user's profile — goes in a late block
@@ -797,8 +778,7 @@ public sealed class Orchestrator
             {
                 if (!TryResolve(session, call, out var t, out var miss)) return Data(miss);
                 if (!t.IsRunning) return Data($"Task #{t.Id} is already {t.Status}.");
-                t.Status = "cancelled";
-                t.Cts.Cancel();
+                CancelTaskTree(session, t);
                 return Data($"Task #{t.Id} ({t.Description}) has been cancelled.");
             }
 
@@ -1092,50 +1072,49 @@ public sealed class Orchestrator
         Trace($"[worker #{task.Id}] drive: {Snip(message, 120)}");
         try
         {
-            // MULTI-DISCIPLINE TRIAGE — top-level first leg only, when no persona was explicitly chosen and this
-            // isn't already a plan. A quick gate names the disciplines the task needs. ONE (or none) → route to
-            // that persona (or general) and carry on as a single worker. MORE than one → no single persona can
-            // do it, so build a plan and hand off to the coordinator, which runs the steps and never returns here.
-            if (_planner is not null && firstLeg && task.ParentTaskId is null && task.Plan is null
-                && task.Persona is null && _personas is not null)
+            // ASSESS — top-level first leg only (a plan's child STEP already has its instruction). ONE sizing call
+            // answers both routing questions at once (was two): which disciplines the task needs, and whether it's
+            // complex enough to plan. MULTI-discipline → build a step plan and hand to the coordinator (never
+            // returns here). SINGLE → set that persona. Then, complex single-discipline work also gets a textual
+            // plan seeded so the executor follows a structured approach. Runs inside the background task, so it
+            // never slows the chat turn. Fails open (no disciplines, simple) so it can't block the work.
+            if (_planner is not null && firstLeg && task.ParentTaskId is null && task.Plan is null)
             {
                 task.LatestThought = "sizing up the task…";
-                var roster = PersonaRoster();
-                var disciplines = (await _planner.TriageDisciplinesAsync(task.Description, roster, task.Cts.Token).ConfigureAwait(false))
-                    .Where(id => _personas.Get(id) is not null)
-                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                if (disciplines.Count > 1)
+                bool complex;
+                if (_personas is not null && task.Persona is null)
                 {
-                    task.LatestThought = "planning the approach…";
-                    Trace($"[worker #{task.Id}] triage → multi-discipline: {string.Join(", ", disciplines)}");
-                    var plan = await _planner.PlanStepsAsync(task.Description, roster, task.Cts.Token).ConfigureAwait(false);
-                    plan?.Steps.RemoveAll(s => _personas.Get(s.Persona) is null);
-                    if (plan is { Steps.Count: > 1 })
+                    var roster = PersonaRoster();
+                    var (rawDisciplines, isComplex) = await _planner.AssessTaskAsync(task.Description, roster, task.Cts.Token).ConfigureAwait(false);
+                    complex = isComplex;
+                    var disciplines = rawDisciplines.Where(id => _personas.Get(id) is not null)
+                        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    if (disciplines.Count > 1)
                     {
-                        task.Plan = plan;
-                        await DrivePlanAsync(session, task, plan, null).ConfigureAwait(false);
-                        return;
+                        task.LatestThought = "planning the approach…";
+                        Trace($"[worker #{task.Id}] assess → multi-discipline: {string.Join(", ", disciplines)}");
+                        var plan = await _planner.PlanStepsAsync(task.Description, roster, task.Cts.Token).ConfigureAwait(false);
+                        plan?.Steps.RemoveAll(s => _personas.Get(s.Persona) is null);
+                        if (plan is { Steps.Count: > 1 })
+                        {
+                            task.Plan = plan;
+                            await DrivePlanAsync(session, task, plan, null).ConfigureAwait(false);
+                            return;
+                        }
+                        Trace($"[worker #{task.Id}] assess → plan unusable; falling back to single worker");
                     }
-                    Trace($"[worker #{task.Id}] triage → plan unusable; falling back to single worker");
+                    else if (disciplines.Count == 1)
+                    {
+                        task.Persona = disciplines[0];
+                        Trace($"[worker #{task.Id}] assess → single discipline: {task.Persona}");
+                    }
                 }
-                else if (disciplines.Count == 1)
-                {
-                    task.Persona = disciplines[0];
-                    Trace($"[worker #{task.Id}] triage → single discipline: {task.Persona}");
-                }
-            }
+                else complex = await _planner.IsComplexAsync(task.Description, task.Cts.Token).ConfigureAwait(false);
 
-            // PLANNING GATE — runs HERE, inside the background task (never on the orchestrator's chat turn, so
-            // it can't slow or hang the conversation). First leg only: size the task up, and if it's complex,
-            // build a plan and seed it so the executor follows a structured approach on long-horizon work.
-            // Skipped for a plan's child STEP — its instruction is already the plan's.
-            if (_planner is not null && firstLeg && task.ParentTaskId is null)
-            {
-                task.LatestThought = "sizing up the task…";
-                if (await _planner.IsComplexAsync(task.Description, task.Cts.Token).ConfigureAwait(false))
+                if (complex)
                 {
                     task.LatestThought = "planning the approach…";
-                    Trace($"[worker #{task.Id}] gate → complex; planning");
+                    Trace($"[worker #{task.Id}] assess → complex; planning");
                     var plan = await _planner.PlanAsync(task.Description, task.Cts.Token).ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(plan))
                     {
@@ -1144,7 +1123,18 @@ public sealed class Orchestrator
                         Trace($"[worker #{task.Id}] plan:\n{Snip(plan, 600)}");
                     }
                 }
-                else Trace($"[worker #{task.Id}] gate → simple; no plan");
+                else Trace($"[worker #{task.Id}] assess → simple; no single-worker plan");
+            }
+
+            // CLOCK — first leg only. The worker's system prompt is STATIC (so its prefix caches across every
+            // task); the current time, which would otherwise break that cache every minute, rides here as a late
+            // seed instead. Seeded into the transcript so it persists across any Q&A legs.
+            if (firstLeg)
+            {
+                var now = DateTime.Now;
+                task.Conversation.Add(Message.System(
+                    $"It is {now:dddd, d MMMM yyyy, HH:mm} ({TimeZoneInfo.Local.StandardName}), year {now.Year} — " +
+                    "the real present from the system clock, not the future; never call this date impossible or fictional."));
             }
 
             // WORKSPACE — first leg only: point the worker at its working directory (the brief in task.md and
@@ -1390,7 +1380,9 @@ public sealed class Orchestrator
         }
 
         // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
-        if (cancelled) return;
+        // Re-checked LIVE (not just the latched flag): a cancel can land during the finalize/result window
+        // above, and we must not speak a result the user already told us to drop.
+        if (cancelled || task.Cts.IsCancellationRequested || task.Status == "cancelled") return;
 
         // A plan's child STEP doesn't speak to the user — its coordinator relays the whole plan once at the
         // end. Only a top-level task re-voices its own result here.
@@ -1451,53 +1443,83 @@ public sealed class Orchestrator
     private async Task DrivePlanAsync(Session session, TaskInfo parent, WorkPlan plan, string? refineForCurrent)
     {
         var prior = new System.Text.StringBuilder();
-        int resumeAt = plan.CurrentStep; // the step the refine (if any) targets — captured before the loop moves it
-        // Re-establish context from any steps already done (so a resume threads their outputs forward too).
+        int resumeAt = plan.CurrentStep; // the step the refine (if any) targets — captured before we advance
+        // Re-establish context from steps already done before the resume point (so a resume threads them forward).
         for (int j = 0; j < resumeAt && j < plan.Steps.Count; j++)
             if (plan.Steps[j].Result is { Length: > 0 } r)
                 prior.Append($"\n### Output of step {j + 1} ({plan.Steps[j].Persona}):\n{r}\n");
 
-        for (int i = resumeAt; i < plan.Steps.Count; i++)
+        // Steps still to run (resume point onward), grouped into WAVES: steps sharing a wave are independent and
+        // run concurrently; ascending waves run in turn, each seeing every earlier wave's output. The common case
+        // (one step per wave) is exactly the old sequential behaviour.
+        var waves = Enumerable.Range(resumeAt, plan.Steps.Count - resumeAt)
+            .Select(i => (Step: plan.Steps[i], Index: i))
+            .GroupBy(x => x.Step.Wave)
+            .OrderBy(g => g.Key)
+            .ToList();
+
+        foreach (var wave in waves)
         {
             if (parent.Cts.IsCancellationRequested) { parent.Status = "cancelled"; return; }
-            var step = plan.Steps[i];
-            plan.CurrentStep = i;
-            step.Status = "running";
+            var members = wave.OrderBy(m => m.Index).ToList();
+            plan.CurrentStep = members[0].Index;
             parent.Status = "running";
-            parent.LatestThought = $"step {i + 1}/{plan.Steps.Count} ({step.Persona}): {Head(step.Instruction, 80)}";
-            session.Append("working", Json(new
-            {
-                id = parent.Id,
-                task = $"Step {i + 1}/{plan.Steps.Count} — {step.Persona}: {Head(step.Instruction, 120)}",
-            }));
-            Trace($"[plan #{parent.Id}] step {i + 1}/{plan.Steps.Count} [{step.Persona}]");
+            foreach (var m in members) m.Step.Status = "running";
 
-            // The first step at the resume point may carry a user refinement; downstream steps just refresh
-            // against the now-updated upstream artifacts.
-            string? note = i == resumeAt ? refineForCurrent : null;
-            var (ok, reason) = await RunPlanStepAsync(session, parent, step, prior.ToString(), note).ConfigureAwait(false);
-            if (!ok)
+            string label = members.Count == 1
+                ? $"step {members[0].Index + 1}/{plan.Steps.Count} ({members[0].Step.Persona}): {Head(members[0].Step.Instruction, 70)}"
+                : $"{members.Count} steps in parallel — {string.Join(", ", members.Select(m => m.Step.Persona))}";
+            parent.LatestThought = label;
+            session.Append("working", Json(new { id = parent.Id, task = label }));
+            Trace($"[plan #{parent.Id}] wave {wave.Key}: {string.Join(", ", members.Select(m => $"#{m.Index + 1}[{m.Step.Persona}]"))}");
+
+            // Run the whole wave concurrently over one frozen prior-context snapshot. The refine note (if any)
+            // only goes to the step the user's change actually targets; the rest just (re)run normally.
+            string priorSnapshot = prior.ToString();
+            async Task<(int Index, PlanStep Step, bool Ok, string Reason)> RunMember((PlanStep Step, int Index) m)
             {
-                step.Status = "failed";
+                var (ok, reason) = await RunPlanStepAsync(
+                    session, parent, m.Step, priorSnapshot, m.Index == resumeAt ? refineForCurrent : null).ConfigureAwait(false);
+                return (m.Index, m.Step, ok, reason);
+            }
+            var runs = await Task.WhenAll(members.Select(RunMember)).ConfigureAwait(false);
+
+            // Cancelled anywhere in the wave → stop silently (the stop was already acknowledged to the user).
+            if (parent.Cts.IsCancellationRequested || runs.Any(r => r.Reason == "cancelled"))
+            { parent.Status = "cancelled"; return; }
+
+            // Thread every success into the prior context (index order) so the next wave — and any resume — sees
+            // them, even if a sibling in this wave failed.
+            foreach (var r in runs.Where(r => r.Ok).OrderBy(r => r.Index))
+            {
+                r.Step.Status = "done";
+                prior.Append($"\n### Output of step {r.Index + 1} ({r.Step.Persona}):\n{r.Step.Result}\n");
+            }
+
+            // A genuine failure pauses the plan at the earliest failed step; the wave's other work is preserved.
+            if (runs.Where(r => !r.Ok).OrderBy(r => r.Index).ToList() is { Count: > 0 } failed)
+            {
+                var f = failed[0];
+                f.Step.Status = "failed";
                 parent.Status = "waiting"; // paused, not dead: resumable from here
-                parent.LatestThought = $"stuck on step {i + 1}: {Head(reason, 80)}";
+                parent.LatestThought = $"stuck on step {f.Index + 1}: {Head(f.Reason, 80)}";
                 session.Append("working_done", Json(new { id = parent.Id, status = "waiting" }));
-                var done = plan.Steps.Take(i).Select((s, k) => $"step {k + 1} ({s.Persona})").ToList();
+                var doneLabels = plan.Steps.Where(s => s.Status == "done").Select(s => s.Persona).ToList();
                 var summary =
-                    $"The plan got through {(done.Count == 0 ? "no steps" : string.Join(", ", done))}, " +
-                    $"then stalled on step {i + 1} ({step.Persona}): {step.Instruction}. " +
-                    $"What blocked it: {reason}. The work so far is saved.";
+                    $"The plan completed {(doneLabels.Count == 0 ? "no steps" : string.Join(", ", doneLabels))}, " +
+                    $"then stalled on step {f.Index + 1} ({f.Step.Persona}): {f.Step.Instruction}. " +
+                    $"What blocked it: {f.Reason}. The work so far is saved.";
                 parent.Result = summary;
-                Trace($"[plan #{parent.Id}] PAUSED at step {i + 1}: {Snip(reason, 160)}");
+                Trace($"[plan #{parent.Id}] PAUSED at step {f.Index + 1}: {Snip(f.Reason, 160)}");
                 await ReVoiceAsync(session, parent, summary).ConfigureAwait(false);
                 return;
             }
-
-            step.Status = "done";
-            prior.Append($"\n### Output of step {i + 1} ({step.Persona}):\n{step.Result}\n");
         }
 
         plan.CurrentStep = plan.Steps.Count;
+        // A cancel that landed during the FINAL step would otherwise fall through here and re-voice the result
+        // (the per-step boundary check is only hit on the next iteration, which never comes). Catch it.
+        if (parent.Cts.IsCancellationRequested) { parent.Status = "cancelled"; return; }
         parent.Status = "done";
         var last = plan.Steps[^1];
         parent.Result = string.IsNullOrWhiteSpace(last.Result) ? "(no result)" : last.Result;
@@ -1608,6 +1630,44 @@ public sealed class Orchestrator
 
     private static string Head(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max].TrimEnd() + "…");
+
+    // Cancel a task AND any hidden child tasks it spawned (a multi-discipline plan runs each step as a child
+    // with its own run loop and token). Cancelling only the named task would leave an in-flight step grinding
+    // to completion and then delivering its result minutes later — so we cancel the whole tree at once.
+    private static void CancelTaskTree(Session session, TaskInfo t)
+    {
+        Cancel(t);
+        foreach (var child in session.Tasks.Values.Where(c => c.ParentTaskId == t.Id))
+            Cancel(child);
+
+        static void Cancel(TaskInfo task)
+        {
+            task.Status = "cancelled";
+            try { task.Cts.Cancel(); } catch { /* already disposed/cancelled — fine */ }
+        }
+    }
+
+    // The orchestrator resends its WHOLE conversation every turn — and again on each worker re-voice — so a long,
+    // intense thread balloons token cost roughly quadratically. Cap what we send to the model: keep all System
+    // seeds (channel, durable context) plus the last N user turns of detail, cutting at a clean user-message
+    // boundary so a tool-call/result pair is never split (a dangling call with no result can make a provider
+    // reject the request). Older detail drops off the PROMPT only — durable facts still live in the memory store
+    // and project context, and the full transcript is untouched. Short threads are sent whole.
+    private const int MaxRecentUserTurns = 12;
+    private const int HistoryWindowThreshold = 60;
+
+    private static IReadOnlyList<Message> WindowForModel(IReadOnlyList<Message> all)
+    {
+        if (all.Count <= HistoryWindowThreshold) return all;
+        int usersSeen = 0, cut = -1;
+        for (int i = all.Count - 1; i >= 0; i--)
+            if (all[i].Role == Role.User && ++usersSeen >= MaxRecentUserTurns) { cut = i; break; }
+        if (cut <= 0) return all; // fewer than N user turns despite the size — nothing safe to trim
+        var kept = new List<Message>(all.Count - cut + 8);
+        for (int i = 0; i < cut; i++) if (all[i].Role == Role.System) kept.Add(all[i]); // durable seeds
+        for (int i = cut; i < all.Count; i++) kept.Add(all[i]);                          // recent tail
+        return kept;
+    }
 
     // Refresh a project's SHORT narrative summary — one or two sentences on where it stands, like telling a
     // friend. Stored on the project (not a separate doc), regenerated in the background whenever it's touched.

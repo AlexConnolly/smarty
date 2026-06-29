@@ -170,6 +170,56 @@ public sealed class TaskPlanner
         catch { return Array.Empty<string>(); }
     }
 
+    private static JsonNode AssessSchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["personas"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+            ["complexity"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("simple", "complex") },
+        },
+        ["required"] = new JsonArray("personas", "complexity"),
+    };
+
+    /// <summary>ONE sizing call that answers BOTH questions the old triage + complexity gates asked separately:
+    /// which specialist disciplines the task needs (in order), and whether it's complex enough to warrant a plan.
+    /// Folding them halves the per-delegation planning overhead. Fails open (no disciplines, simple) so it can
+    /// never block the work.</summary>
+    public async Task<(IReadOnlyList<string> Disciplines, bool Complex)> AssessTaskAsync(string task, string roster, CancellationToken ct)
+    {
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "Quickly size up a task for a team of specialists. Answer two things:\n" +
+                    "1) personas: from the roster, the persona ids this task needs, IN ORDER. Most tasks need ONE " +
+                    "(or none — leave empty for general work). Return MORE THAN ONE only when it genuinely spans " +
+                    "different disciplines that hand off to each other. Don't pad — fewer is better.\n" +
+                    "2) complexity: \"simple\" for a single lookup or quick action one pass can finish; \"complex\" " +
+                    "for multi-step or long-horizon work that benefits from a plan first.\n\n" +
+                    "Roster:\n" + roster + "\n\nTask:\n" + task),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false,
+                ResponseFormat = AssessSchema(),
+                MaxOutputTokens = 140,
+                TurnTimeout = TimeSpan.FromSeconds(25),
+            };
+            var response = await _provider.CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return (Array.Empty<string>(), false);
+            var disciplines = ParseStringArray(response.Content, "personas");
+            using var doc = JsonDocument.Parse(response.Content);
+            bool complex = doc.RootElement.TryGetProperty("complexity", out var c)
+                           && string.Equals(c.GetString(), "complex", StringComparison.OrdinalIgnoreCase);
+            return (disciplines, complex);
+        }
+        catch { return (Array.Empty<string>(), false); }
+    }
+
     private static JsonNode StepsSchema() => new JsonObject
     {
         ["type"] = "object",
@@ -186,8 +236,9 @@ public sealed class TaskPlanner
                         ["persona"] = new JsonObject { ["type"] = "string" },
                         ["instruction"] = new JsonObject { ["type"] = "string" },
                         ["produces"] = new JsonObject { ["type"] = "string" },
+                        ["wave"] = new JsonObject { ["type"] = "integer" },
                     },
-                    ["required"] = new JsonArray("persona", "instruction", "produces"),
+                    ["required"] = new JsonArray("persona", "instruction", "produces", "wave"),
                 },
             },
         },
@@ -204,11 +255,16 @@ public sealed class TaskPlanner
             var convo = new List<Message>
             {
                 Message.User(
-                    "Break this task into an ordered list of steps, each handled by ONE persona from the roster. " +
-                    "Keep it minimal — roughly one step per discipline hand-off, in dependency order. For each " +
-                    "step give: persona (an id from the roster), instruction (what that specialist must do, " +
+                    "Break this task into a minimal set of steps, each handled by ONE persona from the roster. For " +
+                    "each step give: persona (an id from the roster), instruction (what that specialist must do, " +
                     "self-contained; note it can use files earlier steps saved to the shared files area), " +
-                    "produces (the concrete artifact or output it must hand to the next step). No preamble.\n\n" +
+                    "produces (the concrete artifact it hands on), and wave (an integer, 0-based).\n" +
+                    "WAVES — think about what can run AT THE SAME TIME to finish faster: steps that DON'T need each " +
+                    "other's output go in the SAME wave (they run in parallel); a step that needs an earlier step's " +
+                    "output goes in a LATER wave (higher number). Example: analysing data and researching the market " +
+                    "are independent → wave 0 both; writing the report needs both → wave 1. Only force a step into a " +
+                    "later wave when it genuinely depends on an earlier one — default to the same wave when in doubt, " +
+                    "so independent work isn't needlessly serialised. No preamble.\n\n" +
                     "Roster:\n" + roster + "\n\nTask:\n" + task),
             };
             var request = new ModelRequest
@@ -393,13 +449,18 @@ public sealed class TaskPlanner
         if (!doc.RootElement.TryGetProperty("steps", out var arr) || arr.ValueKind != JsonValueKind.Array)
             return null;
         var steps = new List<PlanStep>();
+        int seq = 0;
         foreach (var e in arr.EnumerateArray())
         {
             string? persona = e.TryGetProperty("persona", out var p) ? p.GetString() : null;
             string? instruction = e.TryGetProperty("instruction", out var ins) ? ins.GetString() : null;
             string produces = e.TryGetProperty("produces", out var pr) ? (pr.GetString() ?? "") : "";
+            // A missing/garbled wave degrades to fully sequential (its own position) — never worse than today.
+            int wave = e.TryGetProperty("wave", out var w) && w.ValueKind == JsonValueKind.Number && w.TryGetInt32(out var n) && n >= 0
+                ? n : seq;
             if (!string.IsNullOrWhiteSpace(persona) && !string.IsNullOrWhiteSpace(instruction))
-                steps.Add(new PlanStep(persona!.Trim(), instruction!.Trim(), produces.Trim()));
+                steps.Add(new PlanStep(persona!.Trim(), instruction!.Trim(), produces.Trim()) { Wave = wave });
+            seq++;
         }
         return steps.Count > 0 ? new WorkPlan { Goal = goal, Steps = steps } : null;
     }

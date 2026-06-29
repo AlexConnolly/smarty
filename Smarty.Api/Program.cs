@@ -266,6 +266,13 @@ app.MapDelete("/api/session/{id}/task/{taskId}", (string id, string taskId) =>
 
     task.Status = "cancelled";
     task.Cts.Cancel();
+    // Cancel any hidden child tasks too (a multi-discipline plan's steps run as children with their own
+    // tokens) — otherwise an in-flight step keeps running and delivers its result after the user stopped it.
+    foreach (var child in session.Tasks.Values.Where(c => c.ParentTaskId == task.Id && c.IsRunning))
+    {
+        child.Status = "cancelled";
+        try { child.Cts.Cancel(); } catch { }
+    }
     session.Append("working_done", JsonSerializer.Serialize(new { id = task.Id, status = task.Status }, json));
     return Results.Ok(new { id = task.Id, status = task.Status });
 });
@@ -414,18 +421,27 @@ app.Run();
 
 // Authoritative date/time + environment + truthfulness context, rebuilt fresh each call so the date
 // is always current. Shared by the worker agents and the legacy /api/chat path.
-string HostContext()
+// The STATIC host rules — shell + honesty + language. No clock here on purpose: anything that changes per
+// call (the date/time) would sit in the system-prompt PREFIX and break prompt-cache reuse on every request.
+// The current time is injected separately as a late message (NowLine), so the cacheable prefix stays stable.
+string HostRules()
 {
-    var now = DateTime.Now;
     string shell = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "PowerShell" : "/bin/sh";
     return
-        $"\n\nIt is {now:dddd, d MMMM yyyy, HH:mm} ({TimeZoneInfo.Local.StandardName}), year {now.Year} — the " +
-        "real present from the system clock, not the future; never call this date impossible or fictional.\n" +
-        $"Your shell ({shell}) is a FULL shell WITH internet — fetch live data yourself (e.g. Invoke-RestMethod); " +
+        $"\n\nYour shell ({shell}) is a FULL shell WITH internet — fetch live data yourself (e.g. Invoke-RestMethod); " +
         "never say you lack access. If a command fails, diagnose and retry until you get a real answer.\n" +
         "Report ONLY what a tool actually returned this turn — never fabricate news, prices, results or dates, " +
         "or claim a source you didn't use. If the tools can't get it after honest tries, say so plainly " +
         "(\"I couldn't retrieve that\"). Always reply in English.";
+}
+
+// The volatile clock anchor — injected as a late conversation message (NOT the system prompt) so it never
+// invalidates the cached prefix. Rebuilt per call so it's always current.
+static string NowLine()
+{
+    var now = DateTime.Now;
+    return $"It is {now:dddd, d MMMM yyyy, HH:mm} ({TimeZoneInfo.Local.StandardName}), year {now.Year} — the " +
+           "real present from the system clock, not the future; never call this date impossible or fictional.";
 }
 
 // System prompt for a worker (the "hands"): a capable, relentless task-doer with real tools.
@@ -444,7 +460,7 @@ string WorkerSystemPrompt() =>
     "decide, and suggest the few answers you think most likely. Ask ONLY when truly blocked — never to " +
     "confirm something you can just do. When they answer, you'll continue with everything you've found still " +
     "in context." +
-    HostContext();
+    HostRules();
 
 (AgentInput input, string prompt) BuildAgent(ChatRequest request)
 {
@@ -469,9 +485,12 @@ string WorkerSystemPrompt() =>
         ? "You are a helpful assistant."
         : request.System!;
 
+    // The clock rides as a late seed (not the system prompt) so a stable baseSystem keeps a cacheable prefix.
+    conversation.Add(Message.System(NowLine()));
+
     var input = new AgentInput
     {
-        SystemPrompt = baseSystem + HostContext(),
+        SystemPrompt = baseSystem + HostRules(),
         Model = ModelSpec.Ollama(string.IsNullOrWhiteSpace(request.Model) ? defaultModel : request.Model!, ollamaBaseUrl),
         Conversation = conversation,
     };

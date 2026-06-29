@@ -7,6 +7,12 @@ namespace Smarty.Api;
 /// </summary>
 public sealed record PlanStep(string Persona, string Instruction, string Produces)
 {
+    /// <summary>Which wave this step runs in (0-based). Steps sharing a wave are INDEPENDENT and run
+    /// concurrently; a later wave runs only after every earlier wave finishes and sees all their outputs. The
+    /// planner assigns these so independent work (e.g. two separate analyses off the same input) runs at once
+    /// instead of single-file. Defaults to the step's own position, i.e. fully sequential, if left unset.</summary>
+    public int Wave { get; set; }
+
     /// <summary>pending | running | done | failed.</summary>
     public string Status { get; set; } = "pending";
 
