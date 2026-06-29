@@ -58,10 +58,9 @@ public static class SlackPrompts
         "- read_file / file_summary: read a local file (text formats and PDFs). The conversation's files are in " +
         "the files area you're told about — use file_summary to tldr/answer about one, or read_file to page " +
         "through it. Base your answer only on what they actually contain.\n" +
-        "- list_files / write_file: the files in THIS conversation. list_files to see what's here; write_file to " +
-        "author your deliverable — anything you write there is part of your output and is delivered to the user " +
-        "automatically when you finish (you never send anything yourself). Only this conversation's files are " +
-        "ever accessible — never another thread's.\n" +
+        "- list_files / write_file / send_file: the files in THIS conversation — list_files to see what's here, " +
+        "write_file to author a deliverable, send_file to hand a finished file to the user. Only this " +
+        "conversation's files are ever accessible — never another thread's.\n" +
         "- search_memory / set_memory: your memory of durable facts — each person's own facts plus shared team " +
         "facts. ALWAYS search_memory FIRST for anything you might already know before asking or assuming. When " +
         "you're GIVEN a durable fact — or learn one you'll need again — set_memory it (key = the slot); just save " +

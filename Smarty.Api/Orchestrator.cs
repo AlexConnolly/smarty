@@ -1255,8 +1255,14 @@ public sealed class Orchestrator
                 // persona's own kit (e.g. branding_designer's brand assets). list_files surfaces them with their
                 // real paths so run_python can use them; writes/sends still land in the conversation.
                 tools.Add(FileTools.ListFilesTool(threadFiles, BucketMounts(task)));
+                // Per-LEG de-dupe: a chatty worker often calls send_file more than once for the same file in one
+                // run (e.g. once with a "here it is" caption, then again with a summary), uploading it to the
+                // thread twice. Scoped to this leg only — a later refine ("make it bigger") rebuilds the tools
+                // with a fresh set, so it can legitimately re-send the regenerated file.
+                var sentFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 tools.Add(FileTools.SendFileTool(threadFiles, (path, caption) =>
                 {
+                    if (!sentFiles.Add(Path.GetFullPath(path))) return true; // already sent this leg — skip re-upload
                     session.Append("file", Json(new { path, name = Path.GetFileName(path), caption }));
                     return true;
                 }));
