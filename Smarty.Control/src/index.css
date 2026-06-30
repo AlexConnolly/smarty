@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: theme('colors.bg');
+  color: theme('colors.ink');
+  font-family: theme('fontFamily.sans');
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Thin, unobtrusive scrollbars in keeping with the calm aesthetic. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: theme('colors.line') transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: theme('colors.line');
+  border-radius: 999px;
+}
+
+/* Tighten markdown rendered inside compact bubbles. */
+.md p {
+  margin: 0.25rem 0;
+}
+.md p:first-child {
+  margin-top: 0;
+}
+.md p:last-child {
+  margin-bottom: 0;
+}
+.md pre {
+  background: theme('colors.surface-low');
+  padding: 0.6rem 0.75rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  font-size: 0.8rem;
+}
+.md code {
+  font-family: theme('fontFamily.mono');
+  font-size: 0.85em;
+}
+.md :not(pre) > code {
+  background: theme('colors.surface-low');
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.3rem;
+}

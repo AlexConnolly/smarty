@@ -41,6 +41,19 @@ if (Directory.Exists(webRoot))
     app.MapFallbackToFile("index.html", staticOptions);
 }
 
+// Serve the Smarty.Control command centre at /control from the same origin (built with base "/control/").
+// Its API calls hit /api/control/* at the origin root. Build with: cd Smarty.Control && npm run build
+string controlRoot = builder.Configuration["ControlRoot"]
+    ?? Path.GetFullPath(Path.Combine(builder.Environment.ContentRootPath, "..", "Smarty.Control", "dist"));
+if (Directory.Exists(controlRoot))
+{
+    var controlFiles = new PhysicalFileProvider(controlRoot);
+    app.UseStaticFiles(new StaticFileOptions { FileProvider = controlFiles, RequestPath = "/control" });
+    // SPA fallback for client-side routes under /control.
+    app.MapFallbackToFile("/control/{*path:nonfile}", "index.html",
+        new StaticFileOptions { FileProvider = controlFiles });
+}
+
 string ollamaBaseUrl = builder.Configuration["Ollama:BaseUrl"] ?? OllamaModelProvider.DefaultBaseUrl;
 string defaultModel = builder.Configuration["Ollama:Model"] ?? "qwen3:4b";
 
@@ -109,7 +122,8 @@ var capabilities = new CapabilityRegistry(new ICapability[]
     new KibanaCapability(), new CodeCapability(), new GitHubCapability(), new JiraCapability(),
     new DataScienceCapability(), new FigmaCapability(),
 });
-var personas = new PersonaStore();
+// Personas are now persisted (and editable from Smarty.Control) — built-ins seeded, prompts owned by code.
+var personas = new PersonaStore(Path.Combine(dataDir, "personas.json"), json);
 
 // Run startup validation on all registered capabilities (e.g. CLI tools / Python packages).
 Console.WriteLine("[startup] Validating capability prerequisites...");
@@ -119,7 +133,15 @@ capabilities.ValidateAll();
 string workspaceRoot = builder.Configuration["Tasks:WorkspaceRoot"]
     ?? Path.Combine(builder.Environment.ContentRootPath, "data", "tasks");
 
-var sessions = new SessionStore();
+// Smarty.Control command centre: a hub that tracks every conversation (this chat AND Slack, which forwards
+// its events here cross-process) and fans them out live to control dashboards. Each new web session gets a
+// ControlSink so it's tracked from its first event. A shared token guards the cross-process ingest endpoint.
+var controlHub = new ControlHub(Path.Combine(dataDir, "control.json"), json);
+string? controlToken = Environment.GetEnvironmentVariable("SMARTY_CONTROL_TOKEN") ?? integrations.Get("control", "token");
+var controlCatalog = new ControlCatalog(personas, capabilities, integrations, ollamaBaseUrl, defaultModel);
+var controlBuckets = new ControlBuckets(workspaceRoot, personas);
+
+var sessions = new SessionStore(s => s.Sink = new ControlSink(controlHub, s, "chat"));
 var orchestrator = new Orchestrator(defaultModel, ollamaBaseUrl, WorkerSystemPrompt, json, trainingLog, memory, projects, projectRuns,
     new OrchestratorOptions
     {
@@ -415,6 +437,182 @@ app.MapDelete("/api/chat/{id}", (string id, AgentRunStore store) =>
     return Results.Ok();
 });
 
+// ======================= Smarty.Control — the command centre =======================
+// Read-mostly views over everything Smarty is doing: live conversations (this chat + Slack), tasks/runs,
+// files in every bucket, memories, and personas (with the tools each can call — never the system prompt).
+
+object ConvSummary(ControlConversation c) => new
+{
+    id = c.Id, surface = c.Surface, title = c.Title ?? "(new conversation)", subtitle = c.Subtitle,
+    project = c.Project, persona = c.Persona, userName = c.UserName, status = c.Status,
+    messageCount = c.MessageCount, startedAt = c.StartedAt, lastActivityAt = c.LastActivityAt,
+};
+object RunSummary(ControlRun r) => new
+{
+    id = r.Id, conversationId = r.ConversationId, surface = r.Surface, taskId = r.TaskId,
+    task = r.Task, project = r.Project, persona = r.Persona, status = r.Status,
+    latestNote = r.LatestNote, pendingQuestion = r.PendingQuestion, result = r.Result,
+    startedAt = r.StartedAt, endedAt = r.EndedAt, steps = r.Steps.Count,
+};
+
+// All tracked conversations, newest activity first.
+app.MapGet("/api/control/conversations", () => Results.Json(controlHub.Conversations().Select(ConvSummary), json));
+
+// One conversation: its reconstructed transcript, files, and the runs that happened on it.
+app.MapGet("/api/control/conversations/{id}", (string id) =>
+{
+    var c = controlHub.Conversation(id);
+    if (c is null) return Results.NotFound(new { error = "no such conversation" });
+    return Results.Json(new
+    {
+        summary = ConvSummary(c),
+        files = c.Files,
+        transcript = c.Transcript.Select(m => new { role = m.Role, text = m.Text, at = m.At }),
+        runs = controlHub.RunsFor(id).Select(r => new
+        {
+            id = r.Id, taskId = r.TaskId, task = r.Task, persona = r.Persona, status = r.Status,
+            latestNote = r.LatestNote, pendingQuestion = r.PendingQuestion, result = r.Result,
+            startedAt = r.StartedAt, endedAt = r.EndedAt,
+            steps = r.Steps.Select(s => new { kind = s.Kind, text = s.Text, tool = s.Tool, args = s.Args, result = s.Result }),
+        }),
+    }, json);
+});
+
+// The live activity stream: a snapshot first, then every event from every conversation as it happens.
+app.MapGet("/api/control/stream", async (HttpContext ctx) =>
+{
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache, no-transform";
+    ctx.Response.Headers["X-Accel-Buffering"] = "no";
+
+    await ctx.Response.WriteAsync(":" + new string(' ', 2048) + "\n\n", ctx.RequestAborted);
+    var snapshot = JsonSerializer.Serialize(new
+    {
+        conversations = controlHub.Conversations().Select(ConvSummary),
+        runs = controlHub.Runs().Take(100).Select(RunSummary),
+    }, json);
+    await ctx.Response.WriteAsync($"event: snapshot\ndata: {snapshot}\n\n", ctx.RequestAborted);
+    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+
+    var sub = controlHub.Subscribe();
+    try
+    {
+        await foreach (var frame in sub.Channel.Reader.ReadAllAsync(ctx.RequestAborted))
+        {
+            await ctx.Response.WriteAsync($"event: activity\ndata: {frame}\n\n", ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+        }
+    }
+    catch (OperationCanceledException) { /* dashboard disconnected */ }
+    finally { controlHub.Unsubscribe(sub); }
+});
+
+// Cross-process ingest: Smarty.Slack forwards its conversation events here. Token-guarded when a token is set.
+app.MapPost("/api/control/ingest", (IngestPayload body, HttpContext ctx) =>
+{
+    if (!string.IsNullOrEmpty(controlToken) &&
+        ctx.Request.Headers["X-Control-Token"].ToString() != controlToken)
+        return Results.Unauthorized();
+    if (body is null || string.IsNullOrWhiteSpace(body.ConversationId)) return Results.BadRequest();
+    var meta = new ConversationMeta(body.Title, body.Subtitle, body.Project, body.Persona, body.UserName);
+    controlHub.Ingest(body.ConversationId, string.IsNullOrWhiteSpace(body.Surface) ? "slack" : body.Surface,
+        body.Event ?? "", body.Data ?? "", meta);
+    return Results.Ok();
+});
+
+// Every run across every surface (running + past). Optional ?status= filter.
+app.MapGet("/api/control/tasks", (string? status) =>
+{
+    var runs = controlHub.Runs();
+    if (!string.IsNullOrWhiteSpace(status))
+        runs = runs.Where(r => string.Equals(r.Status, status, StringComparison.OrdinalIgnoreCase)).ToList();
+    return Results.Json(runs.Select(RunSummary), json);
+});
+
+// Cancel a running task on a local web conversation (Slack tasks can't be cancelled cross-process yet).
+app.MapDelete("/api/control/conversations/{id}/tasks/{taskId}", (string id, string taskId) =>
+{
+    var session = sessions.Get(id);
+    if (session is null) return Results.Conflict(new { error = "can only cancel tasks on local chat conversations" });
+    taskId = taskId.TrimStart('#').Trim();
+    if (!session.Tasks.TryGetValue(taskId, out var task)) return Results.NotFound(new { error = "no such task" });
+    if (!task.IsRunning) return Results.Ok(new { id = task.Id, status = task.Status });
+    task.Status = "cancelled";
+    task.Cts.Cancel();
+    foreach (var child in session.Tasks.Values.Where(c => c.ParentTaskId == task.Id && c.IsRunning))
+    {
+        child.Status = "cancelled";
+        try { child.Cts.Cancel(); } catch { }
+    }
+    session.Append("working_done", JsonSerializer.Serialize(new { id = task.Id, status = task.Status }, json));
+    return Results.Ok(new { id = task.Id, status = task.Status });
+});
+
+// ---- memories ----
+app.MapGet("/api/control/memories", () => Results.Json(
+    memory.AllActive().Select(f => new
+    {
+        id = f.Id, type = f.Type, key = f.Key, value = f.Value, context = f.Context,
+        scope = f.Project, asserted = f.Asserted,
+    }), json));
+
+app.MapPost("/api/control/memories", (ControlMemoryWrite body) =>
+{
+    if (body is null) return Results.BadRequest();
+    var msg = memory.Set(body.Type ?? "", body.Key ?? "", body.Value ?? "", body.Context, body.Scope);
+    return Results.Ok(new { message = msg });
+});
+
+app.MapDelete("/api/control/memories/{id}", (string id) =>
+    memory.Retire(id) ? Results.Ok() : Results.NotFound(new { error = "no such active memory" }));
+
+// ---- personas (full management; system prompt never exposed or accepted) ----
+app.MapGet("/api/control/personas", () => Results.Json(controlCatalog.Personas(), json));
+
+app.MapPost("/api/control/personas", (PersonaWrite body) =>
+{
+    if (body is null) return Results.BadRequest();
+    var p = personas.Upsert(body.Id, body.Name ?? "", body.Description ?? "", body.CapabilityIds ?? new List<string>());
+    return p is null
+        ? Results.BadRequest(new { error = "a name is required" })
+        : Results.Json(controlCatalog.View(p), json);
+});
+
+app.MapDelete("/api/control/personas/{id}", (string id) =>
+    personas.Delete(id) ? Results.Ok() : Results.Conflict(new { error = "built-in personas can't be deleted" }));
+
+// ---- capabilities (what tools exist, what they do, and whether they're configured) ----
+app.MapGet("/api/control/capabilities", () => Results.Json(controlCatalog.Capabilities(), json));
+app.MapGet("/api/control/base-tools", () => Results.Json(controlCatalog.BaseTools(), json));
+
+// ---- buckets (files) ----
+app.MapGet("/api/control/buckets", () => Results.Json(controlBuckets.List(), json));
+
+app.MapPost("/api/control/buckets/{kind}/{id}/files", async (string kind, string id, HttpRequest req, CancellationToken ct) =>
+{
+    if (!req.HasFormContentType) return Results.BadRequest(new { error = "expected multipart form upload" });
+    var form = await req.ReadFormAsync(ct);
+    if (form.Files.Count == 0) return Results.BadRequest(new { error = "no files" });
+    var saved = new List<BucketFile>();
+    foreach (var file in form.Files)
+    {
+        await using var s = file.OpenReadStream();
+        var info = await controlBuckets.SaveAsync(kind, id, file.FileName, s, ct);
+        if (info is null) return Results.BadRequest(new { error = "invalid bucket" });
+        saved.Add(info);
+    }
+    return Results.Json(new { saved }, json);
+});
+
+app.MapGet("/api/control/buckets/{kind}/{id}/files/{*name}", (string kind, string id, string name) =>
+{
+    var path = controlBuckets.ResolveFile(kind, id, name);
+    return path is null ? Results.NotFound() : Results.File(path, fileDownloadName: Path.GetFileName(path));
+});
+
+app.MapDelete("/api/control/buckets/{kind}/{id}/files/{*name}", (string kind, string id, string name) =>
+    controlBuckets.DeleteFile(kind, id, name) ? Results.Ok() : Results.NotFound());
+
 app.Run();
 
 // ---- helpers ----
@@ -557,3 +755,7 @@ internal sealed record SessionMessage(string Content);
 internal sealed record ProjectPin(string? Slug);
 
 internal sealed record FeedbackMessage(int MessageId, string Rating, string? Note);
+
+// Smarty.Control write DTOs.
+internal sealed record ControlMemoryWrite(string? Type, string? Key, string? Value, string? Context, string? Scope);
+internal sealed record PersonaWrite(string? Id, string? Name, string? Description, List<string>? CapabilityIds);

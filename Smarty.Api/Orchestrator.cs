@@ -1028,7 +1028,7 @@ public sealed class Orchestrator
         // the user's files from one place. No-op when no workspace root is configured.
         task.WorkspaceDir = CreateWorkspace(session, task, session.PendingAttachments);
         session.Tasks[task.Id] = task;
-        session.Append("working", Json(new { id = task.Id, task = description }));
+        session.Append("working", Json(new { id = task.Id, task = description, persona }));
         _ = Task.Run(() => RunWorkerAsync(session, task));
         return task;
     }
@@ -1109,7 +1109,7 @@ public sealed class Orchestrator
         }
         task.Pending = null;
         task.Status = "running";
-        session.Append("working", Json(new { id = task.Id, task = task.Description }));
+        session.Append("working", Json(new { id = task.Id, task = task.Description, persona = task.Persona }));
         await DriveWithHeartbeat(session, task, answer).ConfigureAwait(false);
     }
 
@@ -1333,9 +1333,13 @@ public sealed class Orchestrator
                         case AgentEvent.ToolStarted ts:
                             task.LatestThought = $"running {ts.ToolName}…";
                             Trace($"[tool] start {ts.ToolName} {Snip(ts.Arguments, 160)}");
+                            // Surface the worker's tool call on the session stream so observers (the control
+                            // centre) can render live tool-calling visuals. The chat/Slack surfaces ignore it.
+                            session.Append("tool_started", Json(new { id = task.Id, name = ts.ToolName, arguments = ts.Arguments }));
                             break;
                         case AgentEvent.ToolCompleted tc:
                             Trace($"[tool] done  {tc.ToolName} -> {Snip(tc.Result, 300)}");
+                            session.Append("tool_completed", Json(new { id = task.Id, name = tc.ToolName, result = Snip(tc.Result, 4000) }));
                             break;
                         case AgentEvent.Completed done:
                             result = done.Answer;

@@ -182,8 +182,21 @@ public sealed class Session
 public sealed class SessionStore
 {
     private readonly ConcurrentDictionary<string, Session> _sessions = new();
+    private readonly Action<Session>? _onCreate;
 
-    public Session GetOrCreate(string id) => _sessions.GetOrAdd(id, key => new Session(key));
+    /// <param name="onCreate">Optional hook run once when a session is first created — used to attach an
+    /// observer sink (e.g. the control hub) so every new conversation is tracked from its first event.</param>
+    public SessionStore(Action<Session>? onCreate = null) => _onCreate = onCreate;
+
+    public Session GetOrCreate(string id) => _sessions.GetOrAdd(id, key =>
+    {
+        var s = new Session(key);
+        _onCreate?.Invoke(s);
+        return s;
+    });
 
     public Session? Get(string id) => _sessions.TryGetValue(id, out var s) ? s : null;
+
+    /// <summary>All sessions currently held in memory.</summary>
+    public IReadOnlyList<Session> All => _sessions.Values.ToList();
 }

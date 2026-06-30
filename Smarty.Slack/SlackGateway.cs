@@ -25,6 +25,8 @@ public sealed class SlackGateway
     private readonly string _botUserId;
     private readonly string _uploadsDir;
     private readonly Regex _mentionRegex;
+    private readonly string? _controlHubUrl; // Smarty.Control hub to forward live events to (null = off)
+    private readonly string? _controlToken;
 
     private readonly Dictionary<string, SlackThread> _threads = new();
     private readonly object _threadsLock = new();
@@ -34,7 +36,8 @@ public sealed class SlackGateway
     private readonly Queue<string> _seenOrder = new();
     private readonly object _seenLock = new();
 
-    public SlackGateway(SlackApiClient api, Orchestrator orchestrator, EngagementQualifier qualifier, string botUserId, string dataDir)
+    public SlackGateway(SlackApiClient api, Orchestrator orchestrator, EngagementQualifier qualifier, string botUserId, string dataDir,
+        string? controlHubUrl = null, string? controlToken = null)
     {
         _api = api;
         _orchestrator = orchestrator;
@@ -42,6 +45,8 @@ public sealed class SlackGateway
         _botUserId = botUserId;
         _uploadsDir = Path.Combine(dataDir, "uploads");
         _mentionRegex = new Regex(@"<@[A-Z0-9]+>", RegexOptions.Compiled);
+        _controlHubUrl = string.IsNullOrWhiteSpace(controlHubUrl) ? null : controlHubUrl.TrimEnd('/');
+        _controlToken = controlToken;
     }
 
     /// <summary>One thread's state: its session plus whether we're engaged and have backfilled history.</summary>
@@ -416,7 +421,19 @@ public sealed class SlackGateway
             bool isDm = channel.StartsWith("D", StringComparison.OrdinalIgnoreCase);
             session.PersonalMemoryEnabled = isDm;
             Trace($"session created for thread {key}; DM={isDm}, personal memory {(isDm ? "enabled" : "disabled")}");
-            session.Sink = new SlackThreadSink(_api, channel, threadTs); // events -> this thread
+            IEventSink sink = new SlackThreadSink(_api, channel, threadTs); // events -> this thread
+            // Also mirror this thread's events to the Smarty.Control hub (cross-process, best-effort) so the
+            // command centre shows Slack threads streaming live alongside the web chat.
+            if (_controlHubUrl is not null)
+            {
+                var forwarder = new HubForwardingSink(
+                    _controlHubUrl + "/api/control/ingest", _controlToken, session.Id, "slack",
+                    () => new ConversationMeta(
+                        Subtitle: isDm ? "Direct message" : $"#{channel}",
+                        UserName: session.CurrentUserName));
+                sink = new CompositeEventSink(sink, forwarder);
+            }
+            session.Sink = sink;
             var thread = new SlackThread { Session = session, Channel = channel, ThreadTs = threadTs };
             _threads[key] = thread;
             return thread;

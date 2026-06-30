@@ -29,6 +29,14 @@ public sealed class SlackConfig
     public string DataDir { get; init; } =
         Path.Combine(AppContext.BaseDirectory, "slack-data");
 
+    /// <summary>Base URL of the Smarty.Api command-centre hub to forward live conversation events to, so
+    /// Smarty.Control can show Slack threads streaming alongside the web chat. Null = don't forward.</summary>
+    public string? ControlHubUrl { get; init; }
+
+    /// <summary>Shared token sent as X-Control-Token on forwarded events (must match the API's
+    /// SMARTY_CONTROL_TOKEN). Optional, but recommended if the API isn't purely local.</summary>
+    public string? ControlToken { get; init; }
+
     public static SlackConfig FromEnvironment()
     {
         string Require(string key) =>
@@ -49,6 +57,8 @@ public sealed class SlackConfig
             Model = Opt("SMARTY_MODEL") is { Length: > 0 } m ? m : "qwen3.5:latest",
             DataDir = Opt("SMARTY_SLACK_DATA_DIR") is { Length: > 0 } d ? d
                 : Path.Combine(AppContext.BaseDirectory, "slack-data"),
+            ControlHubUrl = Opt("SMARTY_CONTROL_HUB_URL"),
+            ControlToken = Opt("SMARTY_CONTROL_TOKEN"),
         };
     }
 }

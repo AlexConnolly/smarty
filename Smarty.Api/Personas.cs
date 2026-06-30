@@ -15,23 +15,161 @@ public sealed record Persona(
     string Name,
     string Description,
     string SystemPrompt,
-    IReadOnlyList<string> CapabilityIds);
+    IReadOnlyList<string> CapabilityIds)
+{
+    /// <summary>True for the shipped templates: their curated <see cref="SystemPrompt"/> is owned by code and
+    /// can never be edited or deleted (the prompt is never shown or edited anywhere — only ever read by the
+    /// orchestrator). User-created personas get a synthesised prompt, equally hidden.</summary>
+    public bool Builtin { get; init; }
+}
 
 /// <summary>
-/// The roster of personas. v1 ships built-in templates (defined in code); shaped like <see cref="ProjectStore"/>
-/// so loading/merging a user-editable <c>personas.json</c> later is a small change, not a rewrite.
+/// The roster of personas. Ships built-in templates (defined in code) and persists user-created/edited ones to
+/// <c>personas.json</c>, merging the two on load. Built-ins are always present and their curated system prompt
+/// is owned by code; user personas store their own (synthesised) prompt. The system prompt is intentionally
+/// never surfaced — the control centre edits a persona's name, description and capabilities only.
 /// </summary>
 public sealed class PersonaStore
 {
+    private readonly object _lock = new();
     private readonly Dictionary<string, Persona> _personas;
+    private readonly string? _path;
+    private readonly JsonSerializerOptions _json;
 
-    public PersonaStore(IEnumerable<Persona>? personas = null) =>
+    /// <summary>In-memory store seeded from a fixed roster (or the built-ins). No persistence — used by hosts
+    /// that don't manage personas (e.g. Slack) and by tests.</summary>
+    public PersonaStore(IEnumerable<Persona>? personas = null)
+    {
         _personas = (personas ?? BuiltIns).ToDictionary(p => p.Id, StringComparer.OrdinalIgnoreCase);
+        _json = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+    }
 
-    public Persona? Get(string? id) =>
-        string.IsNullOrWhiteSpace(id) ? null : _personas.TryGetValue(id.Trim(), out var p) ? p : null;
+    /// <summary>File-backed store: loads <paramref name="path"/> if present, then seeds any missing built-ins
+    /// and re-asserts every built-in's curated prompt (so a stored copy can never override or expose it).</summary>
+    public PersonaStore(string path, JsonSerializerOptions json)
+    {
+        _path = path;
+        _json = json;
+        _personas = new Dictionary<string, Persona>(StringComparer.OrdinalIgnoreCase);
+        Load();
+    }
 
-    public IReadOnlyList<Persona> All => _personas.Values.OrderBy(p => p.Id, StringComparer.Ordinal).ToList();
+    public Persona? Get(string? id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return null;
+        lock (_lock) return _personas.TryGetValue(id.Trim(), out var p) ? p : null;
+    }
+
+    public IReadOnlyList<Persona> All
+    {
+        get { lock (_lock) return _personas.Values.OrderBy(p => p.Id, StringComparer.Ordinal).ToList(); }
+    }
+
+    /// <summary>Create or update a persona's name, description and capabilities. The system prompt is never
+    /// taken from the caller: built-ins keep their curated prompt; user personas get a synthesised one. A new
+    /// id is created from the name. Returns the resulting persona, or null if the inputs are unusable.</summary>
+    public Persona? Upsert(string? id, string name, string description, IReadOnlyList<string> capabilityIds)
+    {
+        name = (name ?? "").Trim();
+        description = (description ?? "").Trim();
+        capabilityIds = (capabilityIds ?? Array.Empty<string>())
+            .Select(c => c.Trim().ToLowerInvariant()).Where(c => c.Length > 0).Distinct().ToList();
+        if (name.Length == 0) return null;
+
+        lock (_lock)
+        {
+            string key = string.IsNullOrWhiteSpace(id) ? Slugify(name) : id!.Trim();
+            if (key.Length == 0) return null;
+
+            _personas.TryGetValue(key, out var existing);
+            // A brand-new id must be unique; disambiguate a collision when creating from a name.
+            if (existing is null && string.IsNullOrWhiteSpace(id))
+            {
+                string baseKey = key; int n = 2;
+                while (_personas.ContainsKey(key)) key = $"{baseKey}_{n++}";
+            }
+
+            bool builtin = existing?.Builtin ?? false;
+            string prompt = builtin ? existing!.SystemPrompt : SynthesisePrompt(name, description, capabilityIds);
+            var persona = new Persona(key, name, description, prompt, capabilityIds) { Builtin = builtin };
+            _personas[key] = persona;
+            Save();
+            return persona;
+        }
+    }
+
+    /// <summary>Delete a user-created persona. Built-ins can't be deleted. Returns false if not found or built-in.</summary>
+    public bool Delete(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return false;
+        lock (_lock)
+        {
+            if (!_personas.TryGetValue(id.Trim(), out var p) || p.Builtin) return false;
+            _personas.Remove(id.Trim());
+            Save();
+            return true;
+        }
+    }
+
+    // A functional, generic role framing for a user-created persona. Deliberately hidden from the UI — the
+    // user manages WHAT a persona is (name/description/tools), not the exact wording the model is steered with.
+    private static string SynthesisePrompt(string name, string description, IReadOnlyList<string> capabilityIds)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"You are acting as a {name}. ");
+        if (description.Length > 0) sb.Append(description.TrimEnd('.') + ". ");
+        sb.Append("Do the task with the tools you have, and base every factual claim only on what a tool " +
+                  "actually returned — if the tools can't get something, say so plainly rather than guessing or " +
+                  "inventing. Be precise and concrete; separate what the evidence shows from what you infer.");
+        return sb.ToString();
+    }
+
+    private static string Slugify(string name)
+    {
+        var chars = name.Trim().ToLowerInvariant()
+            .Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray();
+        var slug = new string(chars);
+        while (slug.Contains("__")) slug = slug.Replace("__", "_");
+        return slug.Trim('_');
+    }
+
+    private void Load()
+    {
+        try
+        {
+            if (_path is not null && File.Exists(_path))
+            {
+                var loaded = JsonSerializer.Deserialize<List<Persona>>(File.ReadAllText(_path), _json);
+                if (loaded is not null)
+                    foreach (var p in loaded)
+                        if (!string.IsNullOrWhiteSpace(p.Id)) _personas[p.Id] = p;
+            }
+        }
+        catch { /* a corrupt personas file shouldn't crash startup */ }
+
+        // Seed missing built-ins and ALWAYS re-assert each built-in's curated prompt + flag, so a stored copy
+        // can neither override the prompt nor be edited into exposing it. Stored name/description/capabilities
+        // for a built-in are preserved (the user may have tweaked them).
+        foreach (var t in BuiltIns)
+        {
+            if (_personas.TryGetValue(t.Id, out var stored))
+                _personas[t.Id] = stored with { SystemPrompt = t.SystemPrompt, Builtin = true };
+            else
+                _personas[t.Id] = t with { Builtin = true };
+        }
+        Save();
+    }
+
+    private void Save()
+    {
+        if (_path is null) return;
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+            File.WriteAllText(_path, JsonSerializer.Serialize(_personas.Values.ToList(), _json));
+        }
+        catch { /* best-effort persistence */ }
+    }
 
     /// <summary>The built-in persona templates. Capability ids must exist in the <see cref="CapabilityRegistry"/>;
     /// a referenced capability that isn't configured simply contributes no tools (the persona still runs).</summary>
@@ -131,6 +269,9 @@ public sealed class CapabilityRegistry
         _caps = capabilities.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
 
     public ICapability? Get(string id) => _caps.TryGetValue(id, out var c) ? c : null;
+
+    /// <summary>All registered capabilities — for the control centre's "what tools can this call" view.</summary>
+    public IReadOnlyList<ICapability> All => _caps.Values.OrderBy(c => c.Id, StringComparer.Ordinal).ToList();
 
     /// <summary>Runs system prerequisite validation for all registered capabilities.</summary>
     public void ValidateAll()

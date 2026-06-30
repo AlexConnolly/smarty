@@ -16,6 +16,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Smarty.Agents\Smarty.Agents.csproj" />
     <ProjectReference Include="..\..\Smarty.Api\Smarty.Api.csproj" />
+    <ProjectReference Include="..\..\Smarty.Slack\Smarty.Slack.csproj" />
   </ItemGroup>
 
 </Project>

@@ -158,6 +158,27 @@ public sealed class MemoryStore
         lock (_lock) return _facts.Where(f => f.Status == "active" && f.Project == project).ToList();
     }
 
+    /// <summary>Every active fact across every scope (global, per-user, per-project), newest first — for the
+    /// control centre's memory view, which shows and groups them by scope.</summary>
+    public IReadOnlyList<MemoryFact> AllActive()
+    {
+        lock (_lock) return _facts.Where(f => f.Status == "active").OrderByDescending(f => f.Asserted).ToList();
+    }
+
+    /// <summary>Soft-retire an active fact by id (kept on disk, never hard-deleted). True if it was active.</summary>
+    public bool Retire(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return false;
+        lock (_lock)
+        {
+            var f = _facts.FirstOrDefault(x => x.Id == id && x.Status == "active");
+            if (f is null) return false;
+            f.Status = "retired";
+            Save();
+            return true;
+        }
+    }
+
     /// <summary>The active facts most relevant to a message — for auto-surfacing context per turn (the
     /// system retrieves; the model doesn't have to decide to search). Keyword-scored for now; this is the
     /// seam where embeddings/vectors slot in to make "relevant" semantic.</summary>

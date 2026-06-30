@@ -118,7 +118,8 @@ catch (Exception ex)
 Console.WriteLine($"[slack] Smarty is @{botUserId}, working with \"{config.CompanyName}\" via model {config.Model}.");
 
 var qualifier = new EngagementQualifier(provider, config.Model);
-var gateway = new SlackGateway(api, orchestrator, qualifier, botUserId, config.DataDir);
+var gateway = new SlackGateway(api, orchestrator, qualifier, botUserId, config.DataDir,
+    config.ControlHubUrl, config.ControlToken);
 var socket = new SlackSocketMode(api);
 
 using var cts = new CancellationTokenSource();
