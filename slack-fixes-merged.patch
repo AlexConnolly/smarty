@@ -1,0 +1,336 @@
+diff --git a/Smarty.Api/AudioTranscoder.cs b/Smarty.Api/AudioTranscoder.cs
+index 9780b67..2424ff1 100644
+--- a/Smarty.Api/AudioTranscoder.cs
++++ b/Smarty.Api/AudioTranscoder.cs
+@@ -9,12 +9,17 @@ namespace Smarty.Api;
+ /// pragmatic, format-agnostic route. Lives beside WhisperTranscriber as the other half of the audio pipeline.
+ ///
+ /// Best-effort by design: a missing ffmpeg or a failed conversion returns <c>false</c> (logged) rather than
+-/// throwing, so a transcode problem degrades to "no local transcript" instead of breaking the caller.
++/// throwing, so a transcode problem degrades to "no local transcript" instead of breaking the caller. Missing
++/// ffmpeg is also auto-installed at startup via <see cref="Ensure"/>, the same way DataScienceCapability brings
++/// Python in with winget.
+ /// </summary>
+ public sealed class AudioTranscoder
+ {
+     private readonly string _ffmpegPath;
+ 
++    // Warn about a missing ffmpeg once per process, not once per clip — otherwise every voice note spams the log.
++    private static bool _warnedMissing;
++
+     public AudioTranscoder(string? ffmpegPath = null)
+         => _ffmpegPath = string.IsNullOrWhiteSpace(ffmpegPath) ? "ffmpeg" : ffmpegPath;
+ 
+@@ -23,6 +28,44 @@ public sealed class AudioTranscoder
+     public static string Resolve()
+         => Environment.GetEnvironmentVariable("SMARTY_FFMPEG") is { Length: > 0 } p ? p : "ffmpeg";
+ 
++    /// <summary>
++    /// Resolve ffmpeg AND install it if missing — mirrors DataScienceCapability's Python bootstrap: try the
++    /// configured/PATH binary, then known install locations, then <c>winget install</c> (Windows), then re-scan.
++    /// Returns a runnable path, or falls back to "ffmpeg" (the caller then degrades gracefully with a clear
++    /// one-time message). Called once at startup when voice notes are enabled, so a slow install doesn't recur.
++    /// </summary>
++    public static string Ensure()
++    {
++        var configured = Resolve();
++        if (Runs(configured)) return configured;
++
++        foreach (var p in KnownFfmpegPaths())
++            if (Runs(p)) { Console.WriteLine($"[audio] found ffmpeg at {p}"); return p; }
++
++        if (OperatingSystem.IsWindows())
++        {
++            Console.WriteLine("[audio] ffmpeg not found — installing via winget (Gyan.FFmpeg); this may take a few minutes…");
++            try
++            {
++                RunToCompletion("winget", "install Gyan.FFmpeg --silent --accept-source-agreements --accept-package-agreements");
++                Console.WriteLine("[audio] winget install completed.");
++            }
++            catch (Exception ex) { Console.Error.WriteLine($"[audio] winget install failed: {ex.Message}"); }
++
++            // The current process's PATH won't reflect the install, so probe the on-disk locations directly.
++            if (Runs("ffmpeg")) return "ffmpeg";
++            foreach (var p in KnownFfmpegPaths())
++                if (Runs(p)) { Console.WriteLine($"[audio] using freshly installed ffmpeg at {p}"); return p; }
++            Console.Error.WriteLine("[audio] ffmpeg still not resolvable after install — voice transcription will degrade to Slack's native transcripts.");
++        }
++        else
++        {
++            Console.Error.WriteLine("[audio] ffmpeg not found and auto-install is Windows-only — install ffmpeg or set SMARTY_FFMPEG.");
++        }
++
++        return "ffmpeg"; // last resort; ToWhisperWavAsync degrades gracefully with a clear one-time hint
++    }
++
+     public async Task<bool> ToWhisperWavAsync(string inputPath, string outputPath, CancellationToken ct = default)
+     {
+         try
+@@ -58,6 +101,20 @@ public sealed class AudioTranscoder
+             // A bare WAV header is 44 bytes; anything larger means we actually got audio.
+             return File.Exists(outputPath) && new FileInfo(outputPath).Length > 44;
+         }
++        catch (System.ComponentModel.Win32Exception)
++        {
++            // ffmpeg couldn't be launched — it isn't installed / not on PATH (and auto-install didn't take). Say
++            // so once, clearly and actionably, instead of repeating the raw "cannot find the file specified" per clip.
++            if (!_warnedMissing)
++            {
++                _warnedMissing = true;
++                Console.Error.WriteLine(
++                    $"[audio] ffmpeg not found (tried \"{_ffmpegPath}\") — voice-note transcription is disabled. " +
++                    "Install ffmpeg and put it on PATH, or set SMARTY_FFMPEG to its full path. Clips with a native " +
++                    "Slack transcript still work; others can't be transcribed until ffmpeg is available.");
++            }
++            return false;
++        }
+         catch (Exception ex)
+         {
+             Console.Error.WriteLine($"[audio] transcode error: {ex.Message}");
+@@ -65,5 +122,69 @@ public sealed class AudioTranscoder
+         }
+     }
+ 
++    // Can this ffmpeg path actually run? A quick `-version` with a short timeout.
++    private static bool Runs(string ffmpeg)
++    {
++        try
++        {
++            using var p = Process.Start(new ProcessStartInfo(ffmpeg, "-version")
++            {
++                RedirectStandardOutput = true,
++                RedirectStandardError = true,
++                UseShellExecute = false,
++                CreateNoWindow = true,
++            });
++            if (p is null) return false;
++            if (!p.WaitForExit(5000)) { try { p.Kill(); } catch { } return false; }
++            return p.ExitCode == 0;
++        }
++        catch { return false; }
++    }
++
++    // Where ffmpeg.exe tends to land after a winget/choco/manual install — the current process's PATH won't have
++    // picked up a fresh install, so we probe disk directly (mirrors DataScienceCapability's GetStandardPythonPaths).
++    private static IEnumerable<string> KnownFfmpegPaths()
++    {
++        var paths = new List<string>();
++        void Add(string p) { if (!string.IsNullOrEmpty(p)) paths.Add(p); }
++
++        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
++        if (!string.IsNullOrEmpty(local))
++        {
++            Add(Path.Combine(local, "Microsoft", "WinGet", "Links", "ffmpeg.exe")); // winget shim, if created
++            // Gyan.FFmpeg unpacks under WinGet\Packages\Gyan.FFmpeg…\ffmpeg-*\bin\ffmpeg.exe — search for it.
++            var pkgs = Path.Combine(local, "Microsoft", "WinGet", "Packages");
++            if (Directory.Exists(pkgs))
++                try { paths.AddRange(Directory.GetFiles(pkgs, "ffmpeg.exe", SearchOption.AllDirectories)); }
++                catch { /* a locked/odd dir — skip */ }
++        }
++        Add(@"C:\ProgramData\chocolatey\bin\ffmpeg.exe");
++        Add(@"C:\ffmpeg\bin\ffmpeg.exe");
++        string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
++        if (!string.IsNullOrEmpty(pf)) Add(Path.Combine(pf, "ffmpeg", "bin", "ffmpeg.exe"));
++
++        return paths.Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase);
++    }
++
++    // Run a command to completion, streaming its output to the console (so a long winget install shows progress).
++    private static void RunToCompletion(string cmd, string args)
++    {
++        using var proc = Process.Start(new ProcessStartInfo
++        {
++            FileName = cmd,
++            Arguments = args,
++            RedirectStandardOutput = true,
++            RedirectStandardError = true,
++            UseShellExecute = false,
++            CreateNoWindow = true,
++        }) ?? throw new Exception($"could not start {cmd}");
++        proc.OutputDataReceived += (_, e) => { if (e.Data is not null) Console.WriteLine($"[{cmd}] {e.Data}"); };
++        proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) Console.WriteLine($"[{cmd}] {e.Data}"); };
++        proc.BeginOutputReadLine();
++        proc.BeginErrorReadLine();
++        proc.WaitForExit();
++        if (proc.ExitCode != 0) throw new Exception($"{cmd} exited with code {proc.ExitCode}");
++    }
++
+     private static string Tail(string s) => s.Length <= 300 ? s : "…" + s[^300..];
+ }
+diff --git a/Smarty.Slack/Program.cs b/Smarty.Slack/Program.cs
+index eea69e8..ec63781 100644
+--- a/Smarty.Slack/Program.cs
++++ b/Smarty.Slack/Program.cs
+@@ -127,7 +127,8 @@ AudioTranscoder? transcoder = null;
+ if (config.VoiceNotesEnabled)
+ {
+     whisper = new WhisperTranscriber(config.WhisperModelPath, config.WhisperModelUrl);
+-    transcoder = new AudioTranscoder(AudioTranscoder.Resolve());
++    // Resolve ffmpeg, installing it via winget if missing (like DataScienceCapability does for Python).
++    transcoder = new AudioTranscoder(AudioTranscoder.Ensure());
+     Console.WriteLine("[slack] Voice-note transcription enabled (Slack transcript + local Whisper fallback).");
+ }
+ 
+diff --git a/Smarty.Slack/SlackThreadSink.cs b/Smarty.Slack/SlackThreadSink.cs
+index 9ee1217..9ea1486 100644
+--- a/Smarty.Slack/SlackThreadSink.cs
++++ b/Smarty.Slack/SlackThreadSink.cs
+@@ -29,11 +29,13 @@ public sealed class SlackThreadSink : IEventSink
+     private readonly string _threadTs;
+ 
+     // msg id -> role, captured at msg_start so we only post the assistant's messages (never echo the human's).
+-    private readonly Dictionary<int, string> _roles = new();
++    // Keyed by the id AS A STRING: message ids arrive as JSON numbers but task ids as JSON strings, and we key
++    // both here uniformly (see EventId) so the two shapes never clash.
++    private readonly Dictionary<string, string> _roles = new();
+ 
+     // task id -> its live status message. Present only while a job is in flight; removed the moment it finishes
+     // so a later resume (which re-emits `working`) starts a brand-new message instead of editing the old one.
+-    private readonly Dictionary<int, JobStatus> _jobs = new();
++    private readonly Dictionary<string, JobStatus> _jobs = new();
+     private readonly object _lock = new();
+ 
+     // The in-progress marker. Slack has no built-in animated spinner; ⏳ always renders (a workspace can swap
+@@ -55,6 +57,20 @@ public sealed class SlackThreadSink : IEventSink
+         _threadTs = threadTs;
+     }
+ 
++    // The event's "id" as a string, whatever JSON shape it arrived in. Message ids are emitted as numbers, but
++    // TASK ids are strings (Session.NextTaskId is an incrementing int rendered ToString()). Reading a task
++    // event's string id with GetInt32() throws ("requires Number, has String"), which silently killed every
++    // job status card. Normalise here so both shapes just work.
++    private static string? EventId(JsonElement root) =>
++        root.TryGetProperty("id", out var e)
++            ? e.ValueKind switch
++            {
++                JsonValueKind.String => e.GetString(),
++                JsonValueKind.Number => e.GetRawText(),
++                _ => null,
++            }
++            : null;
++
+     public void OnEvent(string @event, string data)
+     {
+         switch (@event)
+@@ -63,8 +79,8 @@ public sealed class SlackThreadSink : IEventSink
+             {
+                 using var doc = JsonDocument.Parse(data);
+                 var root = doc.RootElement;
+-                if (root.TryGetProperty("id", out var id) && root.TryGetProperty("role", out var role))
+-                    lock (_lock) _roles[id.GetInt32()] = role.GetString() ?? "";
++                if (EventId(root) is { } id && root.TryGetProperty("role", out var role))
++                    lock (_lock) _roles[id] = role.GetString() ?? "";
+                 break;
+             }
+ 
+@@ -72,8 +88,7 @@ public sealed class SlackThreadSink : IEventSink
+             {
+                 using var doc = JsonDocument.Parse(data);
+                 var root = doc.RootElement;
+-                if (!root.TryGetProperty("id", out var idEl)) break;
+-                int id = idEl.GetInt32();
++                if (EventId(root) is not { } id) break;
+                 string role;
+                 lock (_lock) { _roles.TryGetValue(id, out role!); _roles.Remove(id); }
+                 if (role != "assistant") break; // never repost the user's own turn
+@@ -133,8 +148,7 @@ public sealed class SlackThreadSink : IEventSink
+                 // new status message and remember its ts; a resume deliberately gets its own new message.
+                 using var doc = JsonDocument.Parse(data);
+                 var root = doc.RootElement;
+-                if (!root.TryGetProperty("id", out var idEl)) break;
+-                int id = idEl.GetInt32();
++                if (EventId(root) is not { } id) break;
+                 string task = root.TryGetProperty("task", out var te) ? (te.GetString() ?? "") : "";
+                 string head = Head(task);
+                 string line = ToSlackMrkdwn($"{Spinner} *{head}* — starting…");
+@@ -150,8 +164,7 @@ public sealed class SlackThreadSink : IEventSink
+                 // no new message — so a long task never spams the thread.
+                 using var doc = JsonDocument.Parse(data);
+                 var root = doc.RootElement;
+-                if (!root.TryGetProperty("id", out var idEl)) break;
+-                int id = idEl.GetInt32();
++                if (EventId(root) is not { } id) break;
+                 string note = root.TryGetProperty("note", out var n) ? (n.GetString() ?? "") : "";
+                 string task = root.TryGetProperty("task", out var te) ? (te.GetString() ?? "") : "";
+                 UpdateJob(id, task, note);
+@@ -163,8 +176,7 @@ public sealed class SlackThreadSink : IEventSink
+                 // The job finished — flip the spinner to its outcome and stop tracking it.
+                 using var doc = JsonDocument.Parse(data);
+                 var root = doc.RootElement;
+-                if (!root.TryGetProperty("id", out var idEl)) break;
+-                int id = idEl.GetInt32();
++                if (EventId(root) is not { } id) break;
+                 string status = root.TryGetProperty("status", out var se) ? (se.GetString() ?? "") : "";
+                 FinishJob(id, status);
+                 break;
+@@ -189,7 +201,7 @@ public sealed class SlackThreadSink : IEventSink
+ 
+     // Edit a job's status message with the latest progress note. If the job isn't tracked (e.g. the sink
+     // attached mid-task), fall back to posting a fresh status message so the progress isn't lost.
+-    private void UpdateJob(int id, string task, string note)
++    private void UpdateJob(string id, string task, string note)
+     {
+         lock (_lock)
+         {
+@@ -209,7 +221,7 @@ public sealed class SlackThreadSink : IEventSink
+     }
+ 
+     // Finalise a job's status message (⏳ → ✅ / ❌ / ⏸ / 🚫) and stop tracking it, so a later resume posts anew.
+-    private void FinishJob(int id, string status)
++    private void FinishJob(string id, string status)
+     {
+         lock (_lock)
+         {
+diff --git a/tests/Smarty.Agents.Tests/SlackThreadSinkTests.cs b/tests/Smarty.Agents.Tests/SlackThreadSinkTests.cs
+index bb6c6cd..f72cade 100644
+--- a/tests/Smarty.Agents.Tests/SlackThreadSinkTests.cs
++++ b/tests/Smarty.Agents.Tests/SlackThreadSinkTests.cs
+@@ -47,9 +47,12 @@ public class SlackThreadSinkTests
+         }
+     }
+ 
+-    private static string Working(int id, string task) => JsonSerializer.Serialize(new { id, task });
+-    private static string Progress(int id, string task, string note) => JsonSerializer.Serialize(new { id, task, note });
+-    private static string Done(int id, string status) => JsonSerializer.Serialize(new { id, status });
++    // Task events carry the id AS A STRING in production (Session.NextTaskId() is an int rendered ToString()),
++    // so the helpers mirror that exactly — emitting a numeric id here would test a shape that never occurs and
++    // miss the string-id bug that stopped every job card from posting.
++    private static string Working(int id, string task) => JsonSerializer.Serialize(new { id = id.ToString(), task });
++    private static string Progress(int id, string task, string note) => JsonSerializer.Serialize(new { id = id.ToString(), task, note });
++    private static string Done(int id, string status) => JsonSerializer.Serialize(new { id = id.ToString(), status });
+ 
+     private static (SlackThreadSink sink, FakeSlackApi api) NewSink()
+     {
+@@ -176,4 +179,32 @@ public class SlackThreadSinkTests
+     {
+         Assert.Contains(icon, SlackThreadSink.FinalLine(status, "job"));
+     }
++
++    [Fact]
++    public void A_string_task_id_posts_and_updates_without_throwing()
++    {
++        // Regression: task ids arrive as JSON strings. Reading them with GetInt32() threw ("requires Number,
++        // has String"), which was swallowed by the event sink and silently dropped every job status card.
++        var (sink, api) = NewSink();
++        string sid = "\"7\""; // a bare string id, exactly the production shape
++        sink.OnEvent("working", $"{{\"id\":{sid},\"task\":\"Research the venue\"}}");
++        sink.OnEvent("progress", $"{{\"id\":{sid},\"task\":\"Research the venue\",\"note\":\"reading reviews\"}}");
++        sink.OnEvent("working_done", $"{{\"id\":{sid},\"status\":\"done\"}}");
++
++        Assert.Single(api.Calls, c => c.StartsWith("post "));           // the card posted…
++        Assert.Contains(api.Calls, c => c.Contains("reading reviews")); // …updated in place…
++        Assert.Contains("✅", api.Calls[^1]);                           // …and finished on the same message
++    }
++
++    [Fact]
++    public void A_numeric_message_id_still_works()
++    {
++        // Message ids remain JSON numbers — make sure the string-tolerant id read didn't break that shape.
++        var (sink, api) = NewSink();
++        sink.OnEvent("msg_start", "{\"id\":5,\"role\":\"assistant\"}");
++        sink.OnEvent("msg_end", "{\"id\":5,\"text\":\"Here's your answer.\"}");
++
++        Assert.Single(api.Calls, c => c.StartsWith("post "));
++        Assert.Contains("Here's your answer.", api.Calls[0]);
++    }
+ }

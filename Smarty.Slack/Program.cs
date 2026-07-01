@@ -127,7 +127,8 @@ AudioTranscoder? transcoder = null;
 if (config.VoiceNotesEnabled)
 {
     whisper = new WhisperTranscriber(config.WhisperModelPath, config.WhisperModelUrl);
-    transcoder = new AudioTranscoder(AudioTranscoder.Resolve());
+    // Resolve ffmpeg, installing it via winget if missing (like DataScienceCapability does for Python).
+    transcoder = new AudioTranscoder(AudioTranscoder.Ensure());
     Console.WriteLine("[slack] Voice-note transcription enabled (Slack transcript + local Whisper fallback).");
 }
 

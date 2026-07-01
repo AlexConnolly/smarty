@@ -29,11 +29,13 @@ public sealed class SlackThreadSink : IEventSink
     private readonly string _threadTs;
 
     // msg id -> role, captured at msg_start so we only post the assistant's messages (never echo the human's).
-    private readonly Dictionary<int, string> _roles = new();
+    // Keyed by the id AS A STRING: message ids arrive as JSON numbers but task ids as JSON strings, and we key
+    // both here uniformly (see EventId) so the two shapes never clash.
+    private readonly Dictionary<string, string> _roles = new();
 
     // task id -> its live status message. Present only while a job is in flight; removed the moment it finishes
     // so a later resume (which re-emits `working`) starts a brand-new message instead of editing the old one.
-    private readonly Dictionary<int, JobStatus> _jobs = new();
+    private readonly Dictionary<string, JobStatus> _jobs = new();
     private readonly object _lock = new();
 
     // The in-progress marker. Slack has no built-in animated spinner; ⏳ always renders (a workspace can swap
@@ -55,6 +57,20 @@ public sealed class SlackThreadSink : IEventSink
         _threadTs = threadTs;
     }
 
+    // The event's "id" as a string, whatever JSON shape it arrived in. Message ids are emitted as numbers, but
+    // TASK ids are strings (Session.NextTaskId is an incrementing int rendered ToString()). Reading a task
+    // event's string id with GetInt32() throws ("requires Number, has String"), which silently killed every
+    // job status card. Normalise here so both shapes just work.
+    private static string? EventId(JsonElement root) =>
+        root.TryGetProperty("id", out var e)
+            ? e.ValueKind switch
+            {
+                JsonValueKind.String => e.GetString(),
+                JsonValueKind.Number => e.GetRawText(),
+                _ => null,
+            }
+            : null;
+
     public void OnEvent(string @event, string data)
     {
         switch (@event)
@@ -63,8 +79,8 @@ public sealed class SlackThreadSink : IEventSink
             {
                 using var doc = JsonDocument.Parse(data);
                 var root = doc.RootElement;
-                if (root.TryGetProperty("id", out var id) && root.TryGetProperty("role", out var role))
-                    lock (_lock) _roles[id.GetInt32()] = role.GetString() ?? "";
+                if (EventId(root) is { } id && root.TryGetProperty("role", out var role))
+                    lock (_lock) _roles[id] = role.GetString() ?? "";
                 break;
             }
 
@@ -72,8 +88,7 @@ public sealed class SlackThreadSink : IEventSink
             {
                 using var doc = JsonDocument.Parse(data);
                 var root = doc.RootElement;
-                if (!root.TryGetProperty("id", out var idEl)) break;
-                int id = idEl.GetInt32();
+                if (EventId(root) is not { } id) break;
                 string role;
                 lock (_lock) { _roles.TryGetValue(id, out role!); _roles.Remove(id); }
                 if (role != "assistant") break; // never repost the user's own turn
@@ -133,8 +148,7 @@ public sealed class SlackThreadSink : IEventSink
                 // new status message and remember its ts; a resume deliberately gets its own new message.
                 using var doc = JsonDocument.Parse(data);
                 var root = doc.RootElement;
-                if (!root.TryGetProperty("id", out var idEl)) break;
-                int id = idEl.GetInt32();
+                if (EventId(root) is not { } id) break;
                 string task = root.TryGetProperty("task", out var te) ? (te.GetString() ?? "") : "";
                 string head = Head(task);
                 string line = ToSlackMrkdwn($"{Spinner} *{head}* — starting…");
@@ -150,8 +164,7 @@ public sealed class SlackThreadSink : IEventSink
                 // no new message — so a long task never spams the thread.
                 using var doc = JsonDocument.Parse(data);
                 var root = doc.RootElement;
-                if (!root.TryGetProperty("id", out var idEl)) break;
-                int id = idEl.GetInt32();
+                if (EventId(root) is not { } id) break;
                 string note = root.TryGetProperty("note", out var n) ? (n.GetString() ?? "") : "";
                 string task = root.TryGetProperty("task", out var te) ? (te.GetString() ?? "") : "";
                 UpdateJob(id, task, note);
@@ -163,8 +176,7 @@ public sealed class SlackThreadSink : IEventSink
                 // The job finished — flip the spinner to its outcome and stop tracking it.
                 using var doc = JsonDocument.Parse(data);
                 var root = doc.RootElement;
-                if (!root.TryGetProperty("id", out var idEl)) break;
-                int id = idEl.GetInt32();
+                if (EventId(root) is not { } id) break;
                 string status = root.TryGetProperty("status", out var se) ? (se.GetString() ?? "") : "";
                 FinishJob(id, status);
                 break;
@@ -189,7 +201,7 @@ public sealed class SlackThreadSink : IEventSink
 
     // Edit a job's status message with the latest progress note. If the job isn't tracked (e.g. the sink
     // attached mid-task), fall back to posting a fresh status message so the progress isn't lost.
-    private void UpdateJob(int id, string task, string note)
+    private void UpdateJob(string id, string task, string note)
     {
         lock (_lock)
         {
@@ -209,7 +221,7 @@ public sealed class SlackThreadSink : IEventSink
     }
 
     // Finalise a job's status message (⏳ → ✅ / ❌ / ⏸ / 🚫) and stop tracking it, so a later resume posts anew.
-    private void FinishJob(int id, string status)
+    private void FinishJob(string id, string status)
     {
         lock (_lock)
         {

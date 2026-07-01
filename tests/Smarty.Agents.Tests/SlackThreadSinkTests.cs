@@ -47,9 +47,12 @@ public class SlackThreadSinkTests
         }
     }
 
-    private static string Working(int id, string task) => JsonSerializer.Serialize(new { id, task });
-    private static string Progress(int id, string task, string note) => JsonSerializer.Serialize(new { id, task, note });
-    private static string Done(int id, string status) => JsonSerializer.Serialize(new { id, status });
+    // Task events carry the id AS A STRING in production (Session.NextTaskId() is an int rendered ToString()),
+    // so the helpers mirror that exactly — emitting a numeric id here would test a shape that never occurs and
+    // miss the string-id bug that stopped every job card from posting.
+    private static string Working(int id, string task) => JsonSerializer.Serialize(new { id = id.ToString(), task });
+    private static string Progress(int id, string task, string note) => JsonSerializer.Serialize(new { id = id.ToString(), task, note });
+    private static string Done(int id, string status) => JsonSerializer.Serialize(new { id = id.ToString(), status });
 
     private static (SlackThreadSink sink, FakeSlackApi api) NewSink()
     {
@@ -175,5 +178,33 @@ public class SlackThreadSinkTests
     public void FinalLine_maps_each_status_to_its_icon(string status, string icon)
     {
         Assert.Contains(icon, SlackThreadSink.FinalLine(status, "job"));
+    }
+
+    [Fact]
+    public void A_string_task_id_posts_and_updates_without_throwing()
+    {
+        // Regression: task ids arrive as JSON strings. Reading them with GetInt32() threw ("requires Number,
+        // has String"), which was swallowed by the event sink and silently dropped every job status card.
+        var (sink, api) = NewSink();
+        string sid = "\"7\""; // a bare string id, exactly the production shape
+        sink.OnEvent("working", $"{{\"id\":{sid},\"task\":\"Research the venue\"}}");
+        sink.OnEvent("progress", $"{{\"id\":{sid},\"task\":\"Research the venue\",\"note\":\"reading reviews\"}}");
+        sink.OnEvent("working_done", $"{{\"id\":{sid},\"status\":\"done\"}}");
+
+        Assert.Single(api.Calls, c => c.StartsWith("post "));           // the card posted…
+        Assert.Contains(api.Calls, c => c.Contains("reading reviews")); // …updated in place…
+        Assert.Contains("✅", api.Calls[^1]);                           // …and finished on the same message
+    }
+
+    [Fact]
+    public void A_numeric_message_id_still_works()
+    {
+        // Message ids remain JSON numbers — make sure the string-tolerant id read didn't break that shape.
+        var (sink, api) = NewSink();
+        sink.OnEvent("msg_start", "{\"id\":5,\"role\":\"assistant\"}");
+        sink.OnEvent("msg_end", "{\"id\":5,\"text\":\"Here's your answer.\"}");
+
+        Assert.Single(api.Calls, c => c.StartsWith("post "));
+        Assert.Contains("Here's your answer.", api.Calls[0]);
     }
 }
