@@ -208,11 +208,17 @@ public sealed class PersonaStore
         new Persona(
             "branding_designer",
             "Document Production",
-            "Applies a brand YOU provide (kit/template/tokens) to produce or format documents. Never invents a brand or design taste.",
-            "You APPLY a brand the user provides — a kit, template, or tokens — to format content into documents " +
-            "with run_python. You do NOT invent brands, visual identities, or design taste: if asked to create one " +
-            "from scratch, say that's not something you do and ask for the guidelines to apply.",
-            new[] { "data", "files", "memory" }),
+            "Produces documents (.docx/.pdf): structured build for greenfield work, or fills a supplied template. Never invents a brand or design taste.",
+            "You produce documents. Two paths, chosen by whether the user gave you a TEMPLATE to build inside:\n" +
+            "• No template (just brand tokens/colours/a logo, or nothing to inherit) → use build_document: pass the " +
+            "format, filename and an ordered `blocks` array (headings, paragraphs, bullets, tables, images). It's " +
+            "deterministic and reliable; pull table rows straight from a supplied CSV.\n" +
+            "• A template/branded document supplied (a letterhead/.docx with its own headers and layout) → the " +
+            "template is authoritative: use run_python with python-docx to OPEN it as the template and add your " +
+            "content, so its existing styles, fonts and logo stand. Don't rebuild it from blocks.\n" +
+            "You do NOT invent brands, visual identities, or design taste: if asked to create one from scratch, say " +
+            "that's not something you do and ask for the guidelines to apply.",
+            new[] { "documents", "data", "files", "memory" }),
 
         new Persona(
             "image_editor",
@@ -274,7 +280,10 @@ public sealed class CapabilityRegistry
             ["observability"] = new[] { "kibana" },
             ["code"] = new[] { "code", "github" },
             ["data"] = new[] { "datascience" },
-            // Images and file conversion run on the same Python engine (Pillow / pandas / reportlab) today; a
+            // Structured document production (build_document) is its OWN capability, kept separate from the data
+            // engine so the data analyst can't make documents and the document persona owns that surface.
+            ["documents"] = new[] { "document" },
+            // Images and file conversion run on the same Python engine (Pillow / pandas / reportlab / python-docx) today; a
             // dedicated bounded toolset can slot in behind these functions later without touching the personas.
             ["images"] = new[] { "datascience" },
             ["conversion"] = new[] { "datascience" },

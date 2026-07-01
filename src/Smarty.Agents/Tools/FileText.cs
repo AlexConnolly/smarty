@@ -1,4 +1,6 @@
+using System.IO.Compression;
 using System.Text;
+using System.Text.RegularExpressions;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.DocumentLayoutAnalysis.TextExtractor;
 
@@ -7,7 +9,7 @@ namespace Smarty.Agents;
 /// <summary>
 /// Turns a file on disk into readable plain text — the single place that knows WHICH formats Smarty can
 /// read. The strategy is deliberately "be smart, not exhaustive": handle the formats that need real parsing
-/// (PDF today; Word/images slot in later), fall back to sniffing the bytes for anything text-shaped (so any
+/// (PDF and Word .docx today; images slot in later), fall back to sniffing the bytes for anything text-shaped (so any
 /// code/config/markup file just works without enumerating every extension), and otherwise say plainly that
 /// the format isn't supported yet — never throw, never hand back garbage.
 /// </summary>
@@ -39,8 +41,11 @@ public static class FileText
                 case ".htm":
                     return Success(WebSearcherTool.ToPlainText(File.ReadAllText(path)));
 
-                // Known binaries we can't read yet — say so clearly instead of sniffing them into noise.
                 case ".docx":
+                    return ExtractDocx(path);
+
+                // Known binaries we can't read yet — say so clearly instead of sniffing them into noise.
+                // (.doc is the old binary Word format — a different beast from the zipped .docx above.)
                 case ".doc":
                 case ".pptx":
                 case ".ppt":
@@ -83,6 +88,47 @@ public static class FileText
         return text.Length > 0
             ? Success(text)
             : Fail("That PDF has no extractable text (it may be scanned images — that needs OCR, which isn't supported yet).");
+    }
+
+    // A .docx is a Zip of XML parts; the body text lives in word/document.xml as <w:t> runs inside <w:p>
+    // paragraphs. Reading it doesn't need a full Office parser: pull that part, turn the paragraph/line/tab
+    // markers into whitespace, then strip the remaining tags and decode entities. Good enough to feed the
+    // document's TEXT (brand guidelines, a brief) to a worker — it doesn't try to reconstruct table layout or
+    // styling, and it ignores headers/footers (which live in separate parts).
+    private static ExtractResult ExtractDocx(string path)
+    {
+        using var zip = ZipFile.OpenRead(path); // throws on a non-zip (e.g. a .doc renamed .docx) → caught upstream
+        var entry = zip.GetEntry("word/document.xml");
+        if (entry is null)
+            return Fail("That .docx is missing its document body (word/document.xml) — it may be corrupt.");
+        string xml;
+        using (var reader = new StreamReader(entry.Open(), Encoding.UTF8))
+            xml = reader.ReadToEnd();
+        var text = DocxXmlToText(xml);
+        return text.Length > 0
+            ? Success(text)
+            : Fail("That .docx has no extractable text (it may be empty or contain only images).");
+    }
+
+    private static readonly Regex DocxParagraph = new(@"</w:p>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DocxBreak = new(@"<w:br\b[^>]*/?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DocxTabRun = new(@"<w:tab\b[^>]*/?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DocxAnyTag = new(@"<[^>]+>", RegexOptions.Compiled);
+    private static readonly Regex DocxTrailingWs = new(@"[ \t]+\n", RegexOptions.Compiled);
+    private static readonly Regex DocxBlankRuns = new(@"\n{3,}", RegexOptions.Compiled);
+
+    private static string DocxXmlToText(string xml)
+    {
+        // Turn structural markers into whitespace BEFORE stripping tags, so paragraphs and line breaks survive.
+        xml = DocxParagraph.Replace(xml, "\n");
+        xml = DocxBreak.Replace(xml, "\n");
+        xml = DocxTabRun.Replace(xml, "\t");
+        // Drop every remaining tag — the run text (<w:t> contents) is left behind and concatenated.
+        string text = DocxAnyTag.Replace(xml, "");
+        text = System.Net.WebUtility.HtmlDecode(text); // &amp; &lt; &#xNN; …
+        text = DocxTrailingWs.Replace(text, "\n");
+        text = DocxBlankRuns.Replace(text, "\n\n");
+        return text.Trim();
     }
 
     // For anything not a recognised binary: read the bytes and decide whether they're text. Real documents

@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Text;
 using Smarty.Agents;
 using Xunit;
@@ -42,9 +43,64 @@ public sealed class FileTextTests
     [Fact]
     public void Reports_known_unsupported_formats_clearly()
     {
-        var r = FileText.Extract(Temp("doc.docx", new byte[] { 0x50, 0x4B, 0x03, 0x04 })); // a zip header
+        var r = FileText.Extract(Temp("deck.pptx", new byte[] { 0x50, 0x4B, 0x03, 0x04 })); // a zip header
         Assert.False(r.Ok);
-        Assert.Contains("docx", r.Reason!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("pptx", r.Reason!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Extracts_text_from_a_docx()
+    {
+        // Two paragraphs, a tab between runs, and an XML entity — all in the real WordprocessingML shape.
+        string body =
+            "<w:p><w:r><w:t>Brand voice: bold &amp; warm</w:t></w:r></w:p>" +
+            "<w:p><w:r><w:t>Primary:</w:t><w:tab/><w:t>#FF0000</w:t></w:r></w:p>";
+        var r = FileText.Extract(MakeDocx("brand.docx", body));
+        Assert.True(r.Ok, r.Reason);
+        Assert.Contains("Brand voice: bold & warm", r.Text); // entity decoded, split runs re-joined
+        Assert.Contains("Primary:\t#FF0000", r.Text);        // <w:tab/> → tab
+        Assert.Contains("\n", r.Text);                       // paragraph break survived
+        Assert.DoesNotContain("<w:", r.Text);                // no raw XML leaked through
+    }
+
+    [Fact]
+    public void A_corrupt_docx_fails_gracefully_without_throwing()
+    {
+        // A .doc renamed .docx (or any non-zip): must come back as a friendly reason, never an exception.
+        var r = FileText.Extract(Temp("broken.docx", Encoding.UTF8.GetBytes("this is not a zip")));
+        Assert.False(r.Ok);
+        Assert.NotNull(r.Reason);
+    }
+
+    [Fact]
+    public void A_docx_missing_its_body_part_reports_clearly()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "smarty-filetext-tests");
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, "nobody.docx");
+        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var zip = new ZipArchive(fs, ZipArchiveMode.Create))
+            zip.CreateEntry("[Content_Types].xml"); // a zip, but no word/document.xml
+        var r = FileText.Extract(path);
+        Assert.False(r.Ok);
+        Assert.NotNull(r.Reason);
+    }
+
+    // A minimal but valid .docx: a Zip whose word/document.xml carries the given body. Enough for the
+    // extractor, which only reads that part.
+    private static string MakeDocx(string name, string bodyXml)
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "smarty-filetext-tests");
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, name);
+        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var zip = new ZipArchive(fs, ZipArchiveMode.Create))
+        {
+            var entry = zip.CreateEntry("word/document.xml");
+            using var w = new StreamWriter(entry.Open(), Encoding.UTF8);
+            w.Write("<?xml version=\"1.0\"?><w:document xmlns:w=\"ns\"><w:body>" + bodyXml + "</w:body></w:document>");
+        }
+        return path;
     }
 
     [Fact]

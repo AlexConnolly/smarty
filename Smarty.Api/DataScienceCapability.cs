@@ -14,10 +14,13 @@ public sealed class DataScienceCapability : ICapability
     public IReadOnlyList<string> RequiredConfig => Array.Empty<string>();
 
     public string? PromptHint =>
-        "Use run_python to execute Python code, read/process CSVs/data, render documents (PDF via reportlab) and " +
-        "charts (PNG). ALL of this conversation's files are already present in the working directory each run — " +
-        "open them by bare name in your code (no need to read_file them first, or to list them in 'files'). Files " +
-        "you generate are saved to the conversation automatically and handed to the user when you finish.";
+        "Use run_python to execute Python code, analyse/process CSVs/data, and render charts (PNG). ALL of this " +
+        "conversation's files are already present in the working directory each run — open them by bare name in " +
+        "your code (no need to read_file them first, or to list them in 'files'). Files you generate are saved to " +
+        "the conversation automatically and handed to the user when you finish. " +
+        "(python-docx and reportlab are available too — but structured documents are normally produced with the " +
+        "build_document tool; only reach for run_python to author a document when you're building INSIDE a " +
+        "template file the user supplied: open it with python-docx as the template so its styling stands.)";
 
     public IReadOnlyList<AgentTool> BuildTools(IntegrationConfig config, TaskInfo task)
     {
@@ -63,11 +66,11 @@ public sealed class DataScienceCapability : ICapability
         }
 
         // Verify imports
-        Console.WriteLine("[datascience] Verifying required libraries (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl, pillow)...");
+        Console.WriteLine("[datascience] Verifying required libraries (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl, pillow, python-docx)...");
         bool needsInstall = false;
         try
         {
-            string output = RunSimpleCommand(_pythonCmd, "-c \"import pandas; import numpy; import scipy; import matplotlib; import seaborn; import reportlab; import openpyxl; from PIL import Image; print('ok')\"").Trim();
+            string output = RunSimpleCommand(_pythonCmd, "-c \"import pandas; import numpy; import scipy; import matplotlib; import seaborn; import reportlab; import openpyxl; import docx; from PIL import Image; print('ok')\"").Trim();
             if (output != "ok") needsInstall = true;
         }
         catch
@@ -80,26 +83,26 @@ public sealed class DataScienceCapability : ICapability
             Console.WriteLine("[datascience] Some required libraries are missing. Installing via pip...");
             try
             {
-                RunCommandAndShowOutput(_pythonCmd, "-m pip install pandas numpy scipy matplotlib seaborn reportlab openpyxl pillow");
+                RunCommandAndShowOutput(_pythonCmd, "-m pip install pandas numpy scipy matplotlib seaborn reportlab openpyxl pillow python-docx");
                 Console.WriteLine("[datascience] Libraries successfully installed.");
             }
             catch (Exception ex)
             {
                 throw new InvalidOperationException(
-                    "Required Python packages (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl, pillow) are missing and automatic pip installation failed. " +
-                    "Please install them manually: pip install pandas numpy scipy matplotlib seaborn reportlab openpyxl pillow. " +
+                    "Required Python packages (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl, pillow, python-docx) are missing and automatic pip installation failed. " +
+                    "Please install them manually: pip install pandas numpy scipy matplotlib seaborn reportlab openpyxl pillow python-docx. " +
                     $"Error: {ex.Message}");
             }
 
             // Verify again
             try
             {
-                string output = RunSimpleCommand(_pythonCmd, "-c \"import pandas; import numpy; import scipy; import matplotlib; import seaborn; import reportlab; import openpyxl; from PIL import Image; print('ok')\"").Trim();
+                string output = RunSimpleCommand(_pythonCmd, "-c \"import pandas; import numpy; import scipy; import matplotlib; import seaborn; import reportlab; import openpyxl; import docx; from PIL import Image; print('ok')\"").Trim();
                 if (output != "ok")
                 {
                     throw new Exception("Prerequisites validation failed after installation.");
                 }
-                Console.WriteLine("[datascience] Required libraries (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl) are successfully verified.");
+                Console.WriteLine("[datascience] Required libraries (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl, python-docx) are successfully verified.");
             }
             catch (Exception ex)
             {
@@ -108,7 +111,7 @@ public sealed class DataScienceCapability : ICapability
         }
         else
         {
-            Console.WriteLine("[datascience] Required libraries (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl) are already installed.");
+            Console.WriteLine("[datascience] Required libraries (pandas, numpy, scipy, matplotlib, seaborn, reportlab, openpyxl, python-docx) are already installed.");
         }
     }
 

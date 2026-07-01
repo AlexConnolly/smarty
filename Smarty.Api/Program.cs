@@ -120,7 +120,7 @@ var integrations = IntegrationConfig.Load(Path.Combine(dataDir, "integrations.js
 var capabilities = new CapabilityRegistry(new ICapability[]
 {
     new KibanaCapability(), new CodeCapability(), new GitHubCapability(), new JiraCapability(),
-    new DataScienceCapability(), new FigmaCapability(),
+    new DataScienceCapability(), new FigmaCapability(), new DocumentCapability(),
 });
 // Personas are now persisted (and editable from Smarty.Control) — built-ins seeded, prompts owned by code.
 var personas = new PersonaStore(Path.Combine(dataDir, "personas.json"), json);
