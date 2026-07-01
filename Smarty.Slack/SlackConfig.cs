@@ -37,6 +37,14 @@ public sealed class SlackConfig
     /// SMARTY_CONTROL_TOKEN). Optional, but recommended if the API isn't purely local.</summary>
     public string? ControlToken { get; init; }
 
+    /// <summary>Local-Whisper fallback for voice notes Slack didn't transcribe natively. On by default; set
+    /// SMARTY_VOICE_NOTES=0 to disable (then only Slack's own transcripts are used). Mirrors the web app's
+    /// Whisper defaults so the same model file is reused.</summary>
+    public bool VoiceNotesEnabled { get; init; } = true;
+    public string WhisperModelPath { get; init; } = "models/ggml-base.bin";
+    public string WhisperModelUrl { get; init; } =
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
+
     public static SlackConfig FromEnvironment()
     {
         string Require(string key) =>
@@ -59,6 +67,10 @@ public sealed class SlackConfig
                 : Path.Combine(AppContext.BaseDirectory, "slack-data"),
             ControlHubUrl = Opt("SMARTY_CONTROL_HUB_URL"),
             ControlToken = Opt("SMARTY_CONTROL_TOKEN"),
+            VoiceNotesEnabled = Opt("SMARTY_VOICE_NOTES") is not "0" and not "false",
+            WhisperModelPath = Opt("Whisper__ModelPath") is { Length: > 0 } wp ? wp : "models/ggml-base.bin",
+            WhisperModelUrl = Opt("Whisper__ModelUrl") is { Length: > 0 } wu ? wu
+                : "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
         };
     }
 }

@@ -27,6 +27,8 @@ public sealed class SlackGateway
     private readonly Regex _mentionRegex;
     private readonly string? _controlHubUrl; // Smarty.Control hub to forward live events to (null = off)
     private readonly string? _controlToken;
+    private readonly WhisperTranscriber? _whisper;  // local speech-to-text fallback for voice clips (null = off)
+    private readonly AudioTranscoder? _transcoder;  // ffmpeg → 16 kHz mono WAV for Whisper (null = off)
 
     private readonly Dictionary<string, SlackThread> _threads = new();
     private readonly object _threadsLock = new();
@@ -37,7 +39,8 @@ public sealed class SlackGateway
     private readonly object _seenLock = new();
 
     public SlackGateway(SlackApiClient api, Orchestrator orchestrator, EngagementQualifier qualifier, string botUserId, string dataDir,
-        string? controlHubUrl = null, string? controlToken = null)
+        string? controlHubUrl = null, string? controlToken = null,
+        WhisperTranscriber? whisper = null, AudioTranscoder? transcoder = null)
     {
         _api = api;
         _orchestrator = orchestrator;
@@ -47,6 +50,8 @@ public sealed class SlackGateway
         _mentionRegex = new Regex(@"<@[A-Z0-9]+>", RegexOptions.Compiled);
         _controlHubUrl = string.IsNullOrWhiteSpace(controlHubUrl) ? null : controlHubUrl.TrimEnd('/');
         _controlToken = controlToken;
+        _whisper = whisper;
+        _transcoder = transcoder;
     }
 
     /// <summary>One thread's state: its session plus whether we're engaged and have backfilled history.</summary>
@@ -124,6 +129,20 @@ public sealed class SlackGateway
         // Files dropped into the message (a doc to tldr, a file to act on). Parsed cheaply now; only actually
         // downloaded if we decide to engage (so we don't pull files from cross-talk that isn't for us).
         var fileRefs = ParseFiles(ev);
+
+        // A recorded voice note's words ARE the message. If Slack already transcribed it (the common case), fold
+        // that in NOW — before the engagement gate — so "is this for me / additive?" is judged on what was said,
+        // not on an empty body. Clips Slack hasn't transcribed yet are resolved after we engage (download + local
+        // Whisper), keeping the "don't pull audio from cross-talk" rule for the heavy path. A plain audio UPLOAD
+        // (no clip markers) is deliberately left as a file — never transcribed into a command.
+        string nativeVoice = string.Join(" ", fileRefs
+            .Where(f => f.Clip.NativeTranscript is { Length: > 0 })
+            .Select(f => $"(voice note) {f.Clip.NativeTranscript}"));
+        if (nativeVoice.Length > 0)
+        {
+            text = string.IsNullOrWhiteSpace(text) ? nativeVoice : $"{text} {nativeVoice}";
+            Trace($"folded native transcript into text: \"{Snip(nativeVoice, 80)}\"");
+        }
 
         var thread = GetThread(channel, threadTs);
         await thread.Gate.WaitAsync().ConfigureAwait(false);
@@ -244,10 +263,26 @@ public sealed class SlackGateway
         string author = await _api.GetUserNameAsync(user).ConfigureAwait(false);
         string clean = CleanText(rawText);
 
-        // Now that we've decided this turn is for us, pull any attached files down to disk.
-        var attachments = await DownloadAttachmentsAsync(thread, fileRefs).ConfigureAwait(false);
+        // Split recorded clips from ordinary uploads. A clip's CONTENT is its transcript (folded into the turn),
+        // so the audio file itself doesn't go into the file pot; everything else (incl. a plain .wav upload) is a
+        // normal attachment the model can read/act on.
+        var clipRefs = fileRefs.Where(f => f.Clip.IsClip).ToList();
+        var plainRefs = fileRefs.Where(f => !f.Clip.IsClip).ToList();
 
-        if (clean.Length == 0 && attachments is null)
+        // Now that we've decided this turn is for us, pull any attached (non-clip) files down to disk.
+        var attachments = await DownloadAttachmentsAsync(thread, plainRefs).ConfigureAwait(false);
+
+        // Clips whose native transcript wasn't ready at intake: try files.info, then local Whisper. The ready
+        // ones were already folded into rawText, so we only chase the stragglers here.
+        string fallbackVoice = await ResolveClipTranscriptsAsync(thread, clipRefs).ConfigureAwait(false);
+        if (fallbackVoice.Length > 0)
+            clean = string.IsNullOrWhiteSpace(clean) ? fallbackVoice : $"{clean} {fallbackVoice}";
+
+        if (clean.Length == 0 && clipRefs.Count > 0 && attachments is null)
+            // A voice note we couldn't transcribe at all (no native transcript, files.info/Whisper unavailable).
+            // Don't sit blank or guess at words — say what happened so the user can repeat it or type instead.
+            clean = "(sent a voice note, but I couldn't transcribe it — could you type the gist, or try again?)";
+        else if (clean.Length == 0 && attachments is null)
             // A bare "@smarty" with no message. Don't hand the model an empty prompt — that's what made it
             // flail/spiral. Give it a clear directive to engage with the THREAD it was tagged in, so it picks
             // up the actual context instead of replying "huh?".
@@ -469,8 +504,9 @@ public sealed class SlackGateway
         return false;
     }
 
-    /// <summary>A file Slack reported on a message, before we've downloaded it.</summary>
-    private sealed record SlackFileRef(string Id, string Name, string? Mime, long Size, string UrlDownload);
+    /// <summary>A file Slack reported on a message, before we've downloaded it. <see cref="Clip"/> records
+    /// whether Slack treated it as a recorded voice/video clip (spoken words to act on) vs. an ordinary upload.</summary>
+    private sealed record SlackFileRef(string Id, string Name, string? Mime, long Size, string UrlDownload, AudioClipInfo Clip);
 
     // Pull the file metadata off an event's "files" array (cheap — no network). url_private_download is the
     // authenticated download link; fall back to url_private if it's absent.
@@ -487,7 +523,13 @@ public sealed class SlackGateway
             string name = f.GetPropertyOrNull("name") ?? f.GetPropertyOrNull("title") ?? $"file-{id}";
             string? mime = f.GetPropertyOrNull("mimetype");
             long size = f.TryGetProperty("size", out var s) && s.ValueKind == JsonValueKind.Number ? s.GetInt64() : 0;
-            list.Add(new SlackFileRef(id, name, mime, size, url));
+            var clip = AudioClipInfo.Detect(f);
+            // Slack under-documents the clip fields — dump the raw object once we see audio so the real field
+            // names/values can be confirmed against a live payload (then this trace can be tightened).
+            if (TraceOn && (clip.IsClip || (mime?.StartsWith("audio", StringComparison.OrdinalIgnoreCase) ?? false)))
+                Trace($"audio file object: clip={clip.IsClip} status={clip.TranscriptionStatus ?? "-"} " +
+                      $"nativeTranscript={(clip.NativeTranscript is { Length: > 0 } ? "yes" : "no")} raw={Snip(f.GetRawText(), 600)}");
+            list.Add(new SlackFileRef(id, name, mime, size, url, clip));
         }
         return list;
     }
@@ -511,6 +553,58 @@ public sealed class SlackGateway
             else Trace($"download failed for \"{f.Name}\"");
         }
         return result.Count > 0 ? result : null;
+    }
+
+    // Resolve transcripts for recorded clips whose native transcript wasn't ready at intake. Two-step fallback:
+    //   1. files.info — Slack transcribes asynchronously, so a re-read often has it by the time we engage (free,
+    //      and the right answer when the workspace supports native transcription).
+    //   2. local Whisper — download the clip, transcode to 16 kHz mono WAV (ffmpeg), transcribe on-device. The
+    //      same engine the web app uses; covers workspaces/regions where Slack doesn't transcribe.
+    // Returns the combined "(voice note) ..." text (empty if nothing could be transcribed). Best-effort throughout.
+    private async Task<string> ResolveClipTranscriptsAsync(SlackThread thread, IReadOnlyList<SlackFileRef> clipRefs)
+    {
+        if (clipRefs.Count == 0) return "";
+        var parts = new List<string>();
+        string dir = Path.Combine(_uploadsDir, SafeName($"{thread.Channel}-{thread.ThreadTs}"));
+
+        foreach (var f in clipRefs)
+        {
+            if (f.Clip.NativeTranscript is { Length: > 0 }) continue; // ready ones were folded in at intake
+
+            // 1. Ask Slack again — the transcript may have finished processing since the event arrived.
+            var info = await _api.GetAudioClipInfoAsync(f.Id).ConfigureAwait(false);
+            if (info?.NativeTranscript is { Length: > 0 } native)
+            {
+                Trace($"clip \"{f.Name}\": native transcript via files.info");
+                parts.Add(native);
+                continue;
+            }
+
+            // 2. Local Whisper. Needs both the transcoder (ffmpeg) and the transcriber to be configured.
+            if (_whisper is null || _transcoder is null)
+            {
+                Trace($"clip \"{f.Name}\": no native transcript and local Whisper not configured — skipping");
+                continue;
+            }
+            string src = Path.Combine(dir, $"{f.Id}-{SafeName(f.Name)}");
+            if (!await _api.DownloadFileAsync(f.UrlDownload, src).ConfigureAwait(false))
+            { Trace($"clip \"{f.Name}\": download failed — skipping"); continue; }
+
+            string wav = Path.Combine(dir, $"{f.Id}-whisper.wav");
+            if (!await _transcoder.ToWhisperWavAsync(src, wav).ConfigureAwait(false))
+            { Trace($"clip \"{f.Name}\": transcode failed — skipping"); continue; }
+
+            try
+            {
+                await using var stream = File.OpenRead(wav);
+                string text = (await _whisper.TranscribeAsync(stream).ConfigureAwait(false)).Trim();
+                if (text.Length > 0) { Trace($"clip \"{f.Name}\": Whisper transcript ({text.Length} chars)"); parts.Add(text); }
+                else Trace($"clip \"{f.Name}\": Whisper produced no text");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[slack] whisper error for \"{f.Name}\": {ex.Message}"); }
+        }
+
+        return parts.Count == 0 ? "" : string.Join(" ", parts.Select(p => $"(voice note) {p}"));
     }
 
     private static string SafeName(string name) =>

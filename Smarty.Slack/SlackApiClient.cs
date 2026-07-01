@@ -8,12 +8,22 @@ namespace Smarty.Slack;
 /// <summary>One message in a Slack thread, normalised from the Events API / conversations.replies shapes.</summary>
 public sealed record SlackMessage(string? User, string? BotId, string Text, string Ts, string? ThreadTs);
 
+/// <summary>The subset of thread operations <see cref="SlackThreadSink"/> needs — extracted so the sink's
+/// status-message (spinner → ✅/❌) logic can be unit-tested against a fake without any real HTTP.</summary>
+public interface ISlackThreadApi
+{
+    Task<string?> PostMessageAsync(string channel, string threadTs, string text, CancellationToken ct = default);
+    Task<string?> PostMessageBlocksAsync(string channel, string threadTs, string text, string blocksJson, CancellationToken ct = default);
+    Task<bool> UpdateMessageAsync(string channel, string ts, string text, CancellationToken ct = default);
+    Task<bool> UploadFileAsync(string channel, string threadTs, string filePath, string? title = null, string? comment = null, CancellationToken ct = default);
+}
+
 /// <summary>
 /// A thin hand-rolled Slack Web API client (and the Socket Mode handshake). Honours the repo's "no external
 /// deps" ethos — just HttpClient + System.Text.Json. Only the handful of methods Smarty needs: identify
 /// itself, open a Socket Mode connection, post into a thread, read a thread, and resolve user names.
 /// </summary>
-public sealed class SlackApiClient
+public sealed class SlackApiClient : ISlackThreadApi
 {
     private const string Base = "https://slack.com/api/";
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(30) };
@@ -94,6 +104,29 @@ public sealed class SlackApiClient
         {
             Console.Error.WriteLine($"[slack] chat.postMessage with blocks error: {ex.Message}");
             return null;
+        }
+    }
+
+    /// <summary>Edit a message in place (chat.update) — used to advance a job's status line (⏳ → ✅/❌) as it
+    /// runs, instead of posting a fresh message each time. Best-effort: true on success.</summary>
+    public async Task<bool> UpdateMessageAsync(string channel, string ts, string text, CancellationToken ct = default)
+    {
+        try
+        {
+            using var doc = await PostAsync("chat.update", _botToken,
+                new() { ["channel"] = channel, ["ts"] = ts, ["text"] = text }, ct).ConfigureAwait(false);
+            var root = doc.RootElement;
+            if (!root.GetProperty("ok").GetBoolean())
+            {
+                Console.Error.WriteLine($"[slack] chat.update failed: {root.GetPropertyOrNull("error")}");
+                return false;
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[slack] chat.update error: {ex.Message}");
+            return false;
         }
     }
 
@@ -195,6 +228,30 @@ public sealed class SlackApiClient
         }
         catch (Exception ex) { Console.Error.WriteLine($"[slack] conversations.info error: {ex.Message}"); }
         return null;
+    }
+
+    /// <summary>Fetch a file's current metadata (files.info) and classify it as a voice/video clip. A clip's
+    /// transcription is produced asynchronously, so it's often absent from the initial file_share event — this
+    /// re-reads it once Slack has had a moment to process. Returns null if the call fails (e.g. missing
+    /// files:read); needs the <c>files:read</c> scope.</summary>
+    public async Task<Smarty.Api.AudioClipInfo?> GetAudioClipInfoAsync(string fileId, CancellationToken ct = default)
+    {
+        try
+        {
+            using var doc = await PostAsync("files.info", _botToken, new() { ["file"] = fileId }, ct).ConfigureAwait(false);
+            var root = doc.RootElement;
+            if (!root.GetProperty("ok").GetBoolean() || !root.TryGetProperty("file", out var file))
+            {
+                Console.Error.WriteLine($"[slack] files.info: {root.GetPropertyOrNull("error") ?? "no file"}");
+                return null;
+            }
+            return Smarty.Api.AudioClipInfo.Detect(file);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[slack] files.info error: {ex.Message}");
+            return null;
+        }
     }
 
     /// <summary>Download a Slack-hosted file to local disk. Slack's url_private(_download) requires the bot

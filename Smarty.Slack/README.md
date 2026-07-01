@@ -92,3 +92,16 @@ Smarty acks in-thread, researches in the background, and replies with the answer
 | `SMARTY_MODEL` | no | `qwen3:4b` | Ollama model |
 | `OLLAMA_BASE_URL` | no | `http://localhost:11434` | Ollama gateway |
 | `SMARTY_SLACK_DATA_DIR` | no | `./slack-data` | Isolated data dir (never the web app's data) |
+| `SMARTY_VOICE_NOTES` | no | `1` | Voice-note transcription. `0`/`false` to disable the local-Whisper fallback (then only Slack's own transcripts are used) |
+| `Whisper__ModelPath` | no | `models/ggml-base.bin` | Local Whisper model (auto-downloads on first use) |
+| `Whisper__ModelUrl` | no | _(ggml-base on HF)_ | Where to fetch the Whisper model |
+| `SMARTY_FFMPEG` | no | `ffmpeg` (on PATH) | ffmpeg path, used to transcode clips for the Whisper fallback |
+
+### Voice notes
+
+Record a voice clip in Slack (the mic button) in a thread Smarty is listening to and it's transcribed and
+treated as a normal message — so "check this" alongside a file acts on the file, while a bare audio **upload**
+(e.g. an audio producer's `.wav`) is left as a file, never read as a command. Smarty prefers Slack's own
+transcript; if the workspace doesn't transcribe natively it falls back to local Whisper, which needs **ffmpeg**
+on the PATH (or `SMARTY_FFMPEG`). No ffmpeg and no native transcript → Smarty says it couldn't hear it rather
+than guessing.

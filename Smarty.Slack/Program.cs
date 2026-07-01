@@ -118,8 +118,21 @@ catch (Exception ex)
 Console.WriteLine($"[slack] Smarty is @{botUserId}, working with \"{config.CompanyName}\" via model {config.Model}.");
 
 var qualifier = new EngagementQualifier(provider, config.Model);
+
+// Voice notes: prefer Slack's own transcript; fall back to local Whisper (same engine as the web app) for
+// clips Slack didn't transcribe. Both are best-effort — if ffmpeg or the model are missing, the bot simply
+// relies on Slack's native transcripts. Ordinary audio UPLOADS are never transcribed-as-instructions.
+WhisperTranscriber? whisper = null;
+AudioTranscoder? transcoder = null;
+if (config.VoiceNotesEnabled)
+{
+    whisper = new WhisperTranscriber(config.WhisperModelPath, config.WhisperModelUrl);
+    transcoder = new AudioTranscoder(AudioTranscoder.Resolve());
+    Console.WriteLine("[slack] Voice-note transcription enabled (Slack transcript + local Whisper fallback).");
+}
+
 var gateway = new SlackGateway(api, orchestrator, qualifier, botUserId, config.DataDir,
-    config.ControlHubUrl, config.ControlToken);
+    config.ControlHubUrl, config.ControlToken, whisper, transcoder);
 var socket = new SlackSocketMode(api);
 
 using var cts = new CancellationTokenSource();

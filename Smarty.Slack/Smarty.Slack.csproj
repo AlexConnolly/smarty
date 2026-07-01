@@ -9,6 +9,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Smarty.Agents.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Reuses the conversational engine (Orchestrator, Session, stores) as-is — Slack only supplies a
          different system prompt, a project-free toolset, web-only workers, and a Slack output sink. -->
     <ProjectReference Include="..\src\Smarty.Agents\Smarty.Agents.csproj" />
