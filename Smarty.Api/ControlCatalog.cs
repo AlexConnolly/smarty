@@ -99,11 +99,27 @@ public sealed class ControlCatalog
 
     public PersonaView View(Persona p)
     {
-        var tools = new List<ToolMeta>(BaseTools());
-        tools.AddRange(CapabilityToolsFor(p.CapabilityIds));
-        // De-dupe by name (a persona capability could, in principle, re-add a base-named tool).
+        // A persona now gets ONLY the blocks it declares (mirrors Orchestrator.BuildBlock), so the catalogue must
+        // resolve per-block — not prepend a universal base set that the worker won't actually have at runtime.
+        var provider = new OllamaModelProvider(_ollamaBaseUrl);
+        var task = new TaskInfo { Id = "preview", Description = "preview" };
+        var tools = new List<AgentTool>();
+        void Try(Func<AgentTool> b) { try { tools.Add(b()); } catch { } }
+        foreach (var block in p.CapabilityIds)
+            switch (block.Trim().ToLowerInvariant())
+            {
+                case "web": Try(() => WebResearch.SearchTool()); Try(() => WebResearch.PageAnswerTool(provider, _model)); break;
+                case "read": Try(() => FileTools.ReadFileTool()); Try(() => FileTools.SummaryTool(provider, _model)); Try(() => FileTools.ListFilesTool("(conversation files)")); break;
+                case "files":
+                    Try(() => FileTools.ReadFileTool()); Try(() => FileTools.SummaryTool(provider, _model));
+                    Try(() => FileTools.WriteFileTool("(conversation files)")); Try(() => FileTools.EditFileTool("(conversation files)"));
+                    Try(() => FileTools.FindInFileTool("(conversation files)")); Try(() => FileTools.ListFilesTool("(conversation files)")); break;
+                case "memory": Try(() => MemoryTools.SearchTool(MemoryPlaceholder)); Try(() => MemoryTools.SetTool(MemoryPlaceholder)); break;
+                case "shell": Try(() => ShellTool.Create()); break;
+                default: try { tools.AddRange(_capabilities.BuildFor(new[] { block }, _config, task)); } catch { } break;
+            }
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var unique = tools.Where(t => seen.Add(t.Name)).ToList();
+        var unique = tools.Where(t => seen.Add(t.Name)).Select(Meta).ToList();
         return new PersonaView(p.Id, p.Name, p.Description, p.Builtin, p.CapabilityIds, unique);
     }
 

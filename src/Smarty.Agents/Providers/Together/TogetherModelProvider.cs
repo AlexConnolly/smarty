@@ -34,21 +34,10 @@ public sealed class TogetherModelProvider : IModelProvider
 
         var payload = BuildPayload(request);
 
-        using var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/chat/completions")
-        {
-            Content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json"),
-        };
-        httpRequest.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _apiKey);
-
-        var httpResponse = await _http.SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-
-        if (!httpResponse.IsSuccessStatusCode)
-        {
-            var error = await httpResponse.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            httpResponse.Dispose();
-            throw new InvalidOperationException(
-                $"Together AI request failed ({(int)httpResponse.StatusCode} {httpResponse.ReasonPhrase}): {error}");
-        }
+        // The throttle/outage arrives BEFORE any token streams, so retrying here is safe (nothing has been
+        // yielded yet) and far cheaper than throwing — a thrown 429 makes the orchestrator restart the whole
+        // multi-minute leg, which is exactly how one rate-limit turned a build into a 30-minute ordeal.
+        var httpResponse = await SendWithRetryAsync(payload, ct).ConfigureAwait(false);
 
         try
         {
@@ -283,6 +272,55 @@ public sealed class TogetherModelProvider : IModelProvider
             if (same) return true;
         }
         return false;
+    }
+
+    // Together throttles (429) and occasionally 503s under load. Retry the initial request a few times,
+    // honouring the server's Retry-After when present and otherwise backing off exponentially, before giving
+    // up so a real outage still surfaces. A fresh HttpRequestMessage is built per attempt (they can't be
+    // re-sent), and only the pre-stream response is retried — never a stream that has already emitted tokens.
+    private const int MaxSendAttempts = 4;
+
+    private async Task<HttpResponseMessage> SendWithRetryAsync(JsonObject payload, CancellationToken ct)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            using var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/chat/completions")
+            {
+                Content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json"),
+            };
+            httpRequest.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _apiKey);
+
+            var response = await _http.SendAsync(httpRequest, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+            if (response.IsSuccessStatusCode) return response;
+
+            int status = (int)response.StatusCode;
+            bool transient = status is 429 or 503;
+            if (!transient || attempt >= MaxSendAttempts)
+            {
+                var error = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                response.Dispose();
+                throw new InvalidOperationException(
+                    $"Together AI request failed ({status} {response.ReasonPhrase}): {error}");
+            }
+
+            var delay = RetryDelay(response, attempt);
+            response.Dispose();
+            await Task.Delay(delay, ct).ConfigureAwait(false);
+        }
+    }
+
+    private static TimeSpan RetryDelay(HttpResponseMessage response, int attempt)
+    {
+        // Prefer the server's Retry-After (a delta in seconds or an HTTP-date); else exponential backoff
+        // 2s, 4s, 8s … Either way capped at 60s so a throttle never stalls a leg for minutes.
+        var cap = TimeSpan.FromSeconds(60);
+        if (response.Headers.RetryAfter is { } ra)
+        {
+            if (ra.Delta is { } d && d > TimeSpan.Zero) return d < cap ? d : cap;
+            if (ra.Date is { } when && when - DateTimeOffset.UtcNow is { } until && until > TimeSpan.Zero)
+                return until < cap ? until : cap;
+        }
+        return TimeSpan.FromSeconds(Math.Min(Math.Pow(2, attempt), 60));
     }
 
     private JsonObject BuildPayload(ModelRequest request)

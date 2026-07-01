@@ -90,6 +90,64 @@ public sealed class TaskPlanner
         catch { return false; }
     }
 
+    private static JsonNode ClarifySchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["needs"] = new JsonObject { ["type"] = "boolean" },
+            ["question"] = new JsonObject { ["type"] = "string" },
+            ["options"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+        },
+        ["required"] = new JsonArray("needs"),
+    };
+
+    /// <summary>Decide, BEFORE any work, whether one clarifying question is genuinely needed — a material gap
+    /// (definition/scope/preference) that changes the result, isn't in the task or known facts, and has no safe
+    /// default. Returns the question + likely options, or (null, empty) to just proceed. Never asks about taste,
+    /// or to confirm something it could just do. Best-effort: any failure proceeds without asking.</summary>
+    public async Task<(string? Question, IReadOnlyList<string> Options)> ClarifyAsync(string task, string knownFacts, CancellationToken ct)
+    {
+        var none = ((string?)null, (IReadOnlyList<string>)Array.Empty<string>());
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "Before this task is carried out, decide if ONE clarifying question is genuinely needed. Ask " +
+                    "ONLY when a specific detail would MATERIALLY change the result — a definition, a scope, or a " +
+                    "preference — that is NOT answered by the task text or the known facts below AND has no safe " +
+                    "default. Do NOT ask to confirm something you could just do, and NEVER ask about taste or " +
+                    "aesthetics. If it's clear enough to proceed, set needs=false. When you do ask, give one sharp " +
+                    "question and 2–4 likely short answers.\n\n" +
+                    "Known facts:\n" + (string.IsNullOrWhiteSpace(knownFacts) ? "(none)" : knownFacts) +
+                    "\n\nTask:\n" + task),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false,
+                ResponseFormat = ClarifySchema(),
+                MaxOutputTokens = 160,
+                TurnTimeout = TimeSpan.FromSeconds(25),
+            };
+            var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return none;
+            using var doc = JsonDocument.Parse(response.Content);
+            var root = doc.RootElement;
+            if (!(root.TryGetProperty("needs", out var n) && n.ValueKind == JsonValueKind.True)) return none;
+            var q = root.TryGetProperty("question", out var qe) && qe.ValueKind == JsonValueKind.String ? qe.GetString()?.Trim() : null;
+            if (string.IsNullOrWhiteSpace(q)) return none;
+            var opts = new List<string>();
+            if (root.TryGetProperty("options", out var oe) && oe.ValueKind == JsonValueKind.Array)
+                foreach (var o in oe.EnumerateArray())
+                    if (o.ValueKind == JsonValueKind.String && o.GetString()?.Trim() is { Length: > 0 } s) opts.Add(s);
+            return (q, opts);
+        }
+        catch { return none; }
+    }
+
     private const string PlannerSystem =
         "You are the PLANNING step for a capable executor agent that will carry out a task afterwards with full " +
         "tools. Your job is to produce a clear, concrete, ordered PLAN — NOT to do the task or write the final " +
@@ -257,8 +315,12 @@ public sealed class TaskPlanner
                 Message.User(
                     "Break this task into a minimal set of steps, each handled by ONE persona from the roster. For " +
                     "each step give: persona (an id from the roster), instruction (what that specialist must do, " +
-                    "self-contained; note it can use files earlier steps saved to the shared files area), " +
-                    "produces (the concrete artifact it hands on), and wave (an integer, 0-based).\n" +
+                    "self-contained), produces (the concrete artifact it hands on), and wave (an integer, 0-based).\n" +
+                    "HANDOFF — each step's written output is passed to later steps AUTOMATICALLY as text, so a step " +
+                    "should just PRODUCE its result as its answer; do NOT tell a step to 'save it to a .md file' and a " +
+                    "later step to 'read that file' — that's a wasted, fragile round-trip. Only require a FILE when " +
+                    "the deliverable is INHERENTLY a file the user receives (a designed PDF, an image, a spreadsheet, " +
+                    "a data export). Written analysis, guidelines, copy, strategy → text output, not a file.\n" +
                     "WAVES — think about what can run AT THE SAME TIME to finish faster: steps that DON'T need each " +
                     "other's output go in the SAME wave (they run in parallel); a step that needs an earlier step's " +
                     "output goes in a LATER wave (higher number). Example: analysing data and researching the market " +
@@ -297,19 +359,30 @@ public sealed class TaskPlanner
     /// the guard against a worker that claims success but handed on nothing usable. An empty result fails for
     /// free (no model call). The verifier never blocks progress on its OWN failure — it returns ok=true so a
     /// flaky verifier can't stall a plan.</summary>
-    public async Task<(bool Ok, string Reason)> VerifyStepAsync(string instruction, string produces, string result, CancellationToken ct)
+    public async Task<(bool Ok, string Reason)> VerifyStepAsync(
+        string instruction, string produces, string result, CancellationToken ct,
+        IReadOnlyList<string>? filesPresent = null)
     {
         if (string.IsNullOrWhiteSpace(result) || string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase))
             return (false, "the step produced no usable result");
         try
         {
+            // The deliverable can be EITHER the result text OR a file the step produced — give the verifier the
+            // files now in the shared area so it doesn't fail a step that put its work in a file. The result text
+            // can then legitimately be a short "done — saved X" note.
+            string files = filesPresent is { Count: > 0 }
+                ? "Files now in the shared area: " + string.Join(", ", filesPresent)
+                : "No files in the shared area.";
             var convo = new List<Message>
             {
                 Message.User(
                     "A step in a plan has finished. Decide if its output satisfies what the step was meant to " +
-                    "produce. Be lenient about format, strict about substance: only set ok=false if it clearly " +
-                    "did NOT do the work or produced nothing the next step could use, and give a one-line reason.\n\n" +
-                    "Step: " + instruction + "\nExpected output: " + produces + "\n\nActual output:\n" + result),
+                    "produce. Be lenient about format, strict about substance. The deliverable may be the TEXT " +
+                    "output below OR a file the step created (see the file list) — pass if EITHER carries the work.\n" +
+                    "Set ok=false only if the work genuinely isn't there — including when the output merely says it " +
+                    "is ABOUT to do it (e.g. 'now let me write the analysis', 'I'll create…') with nothing actually " +
+                    "produced, or it ran out before finishing. Give a one-line reason.\n\n" +
+                    "Step: " + instruction + "\nExpected output: " + produces + "\n" + files + "\n\nActual output:\n" + result),
             };
             var request = new ModelRequest
             {

@@ -24,6 +24,9 @@ public sealed class SmartyAgent
     private readonly IModelProvider _secondaryProvider;
     private readonly Dictionary<string, AgentTool> _tools;
 
+    // How many turns from the cap to start announcing the remaining budget (when AnnounceBudget is on).
+    private const int BudgetWarnThreshold = 3;
+
     public SmartyAgent(AgentInput input, ModelProviderRegistry? registry = null)
     {
         _input = input ?? throw new ArgumentNullException(nameof(input));
@@ -77,6 +80,21 @@ public sealed class SmartyAgent
             // matching tool result — which providers reject ("incomplete parallel tool-call group"). Close any
             // such gap before the model call so the group is always well-formed.
             EnsureToolCallsAnswered(conversation);
+
+            // Budget awareness: as the turn cap approaches, tell the worker exactly how many turns remain so it
+            // finishes the job — produces and SAVES its deliverable, then answers — instead of running out one
+            // step short (a research step once made charts and ran out before writing its analysis file). Re-sent
+            // each turn in the final stretch so the count stays accurate even if the cap was dynamically extended.
+            int callsLeft = currentMaxIterations - iteration;
+            if (_input.AnnounceBudget && callsLeft <= BudgetWarnThreshold)
+            {
+                var budgetNote = Message.System(
+                    $"You have {callsLeft} tool-call turn{(callsLeft == 1 ? "" : "s")} left before you must stop. " +
+                    "If you still owe a deliverable — a written result, or a file to save with write_file — produce " +
+                    "and save it NOW, then give your final answer. Don't begin anything you can't finish in that budget.");
+                conversation.Add(budgetNote);
+                run.Messages.Add(budgetNote);
+            }
 
             var request = new ModelRequest
             {

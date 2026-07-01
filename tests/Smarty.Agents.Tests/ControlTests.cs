@@ -80,8 +80,10 @@ public class ControlTests
 
         var view = catalog.View(personas.Get("software_engineer")!);
         Assert.NotEmpty(view.Tools);
-        // Base file/web/memory tools are always present.
-        Assert.Contains(view.Tools, t => t.Name == "web_search");
+        // Per-persona scoping: software_engineer declares the "files" block, so it has file tools (but NOT web —
+        // it's code/files/memory, no web block).
+        Assert.Contains(view.Tools, t => t.Name == "write_file");
+        Assert.DoesNotContain(view.Tools, t => t.Name == "web_search");
 
         // The serialised catalogue must not contain any curated system-prompt text.
         var serialised = JsonSerializer.Serialize(catalog.Personas(), Json);

@@ -67,6 +67,11 @@ public sealed class AgentInput
     /// (keeping all prior work) instead of returning the runaway turn as the answer.</summary>
     public bool RecoverFromLoops { get; set; } = true;
 
+    /// <summary>When set, the agent is told how many tool-call turns it has left as it nears the cap, so it
+    /// spends the last turns PRODUCING and saving its deliverable rather than exploring (a step once ran out one
+    /// turn before writing its output). Off by default so existing callers/tests are unaffected.</summary>
+    public bool AnnounceBudget { get; set; } = false;
+
     /// <summary>Optional source of out-of-band messages, drained between iterations and appended to the
     /// running conversation. Lets a caller steer or interrupt a long task while it is still working
     /// (e.g. "actually, stop after the first batch"). Returns the messages to inject, or none.</summary>

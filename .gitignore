@@ -27,3 +27,8 @@ integrations.json
 # Slack isolated data dir (memory/projects/uploads/schedules) if placed outside bin/
 slack-data/
 /dev/
+
+# Local launch scripts / env files holding live secrets — NEVER commit
+*.local.ps1
+.env
+.env.*

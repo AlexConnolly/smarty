@@ -39,8 +39,14 @@ public sealed class TaskInfo
     public string? UserName { get; init; }            // their display name, for context
     public bool PersonalMemoryEnabled { get; init; } = true; // whether personal memory is enabled for this task
     public string Status { get; set; } = "running"; // running | waiting | done | cancelled | failed
+    public bool Assessed { get; set; }               // has the routing/complexity gate already run? (survives a clarify pause/resume that flips firstLeg)
+    public bool Seeded { get; set; }                 // have the clock/workspace context seeds been added? (survives a clarify pause/resume)
     public string? LatestThought { get; set; } // the worker's recent reasoning, for status peeks
     public string? Result { get; set; } // the final answer once finished
+    // File names ACTUALLY delivered to the user for this task (recorded at the real upload points — send_file and
+    // the end-of-leg deliver pass). The re-voice reads this so it never claims it "sent a file" when none went
+    // out — a recurring false claim. Recorded on the root task so a plan's step deliveries roll up to it.
+    public HashSet<string> DeliveredFiles { get; } = new(StringComparer.OrdinalIgnoreCase);
     public DateTimeOffset StartedAt { get; } = DateTimeOffset.UtcNow;
     public CancellationTokenSource Cts { get; } = new();
 

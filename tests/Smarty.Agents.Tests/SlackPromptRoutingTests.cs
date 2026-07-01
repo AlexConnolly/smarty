@@ -17,9 +17,9 @@ public class SlackPromptRoutingTests
     public void Tentative_requests_must_be_confirmed_not_actioned()
     {
         var p = Prompt();
-        Assert.Contains("tentative", p);
-        Assert.Contains("NOT a green light", p);
+        Assert.Contains("vague/half-formed", p);
         Assert.Contains("ask one sharp question", p);
+        Assert.Contains("then wait", p);
     }
 
     [Fact]
@@ -27,15 +27,16 @@ public class SlackPromptRoutingTests
     {
         // The confirm lane must not make it timid on obvious, directive requests.
         var p = Prompt();
-        Assert.Contains("act, don't stall", p);
+        Assert.Contains("clear ask", p);
+        Assert.Contains("don't stall", p);
     }
 
     [Fact]
     public void Now_or_soon_work_is_gated_on_clarity_not_fired_blindly()
     {
-        // The scheduling line used to say "do anything now-or-soon straight away" — an unconditional accelerator.
+        // Vague asks get confirmed rather than fired blindly; no unconditional "just do it now" accelerator.
         var p = Prompt();
-        Assert.Contains("confirming first if the ask is vague", p);
+        Assert.Contains("confirm the specific thing", p);
         Assert.DoesNotContain("do anything now-or-soon straight away", p);
     }
 }

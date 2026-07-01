@@ -163,8 +163,11 @@ $env:Ollama__Model="qwen3.5:4b"; dotnet run  # Windows PowerShell
 
 ```
 smarty/
-├── Smarty.Api/        ASP.NET Core API — orchestrator, workers, Whisper, SSE  (also serves the UI)
+├── Smarty.Api/        ASP.NET Core API — orchestrator, workers, Whisper, SSE  (also serves the UIs)
 ├── Smarty.Chat/       React + Vite + Tailwind web client
+├── Smarty.Control/    the command centre — live view of every conversation, task, file, memory & persona
+│                      (served by Smarty.Api at /control; see Smarty.Control/README.md)
+├── Smarty.Slack/      Slack gateway (separate process; forwards its activity to the control hub)
 ├── src/Smarty.Agents/ the C# agent framework (agents, tools, Ollama provider)
 ├── samples/           a minimal console sample
 └── tests/             unit tests for the agent framework

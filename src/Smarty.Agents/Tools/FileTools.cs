@@ -219,6 +219,115 @@ public static class FileTools
             });
     }
 
+    /// <summary>edit_file(name, find, replace, all): change part of an existing conversation file by exact-text
+    /// replacement, instead of rewriting the whole thing with write_file. This is how a REVISION should be made —
+    /// a 30KB build script or HTML source costs a handful of small edits, not a full regeneration. The
+    /// <c>find</c> text must occur exactly once (so the edit is unambiguous) unless <c>all</c> is set; a 0- or
+    /// multi-match is reported back so the model can widen the anchor or read the file first.</summary>
+    public static AgentTool EditFileTool(string rootDir, string name = "edit_file")
+    {
+        return new AgentTool(
+            name,
+            "Edits an EXISTING text file in this conversation by replacing an exact snippet — use this for a " +
+            "revision instead of rewriting the whole file with write_file (much faster on a large source like a " +
+            "build script or HTML). Provide 'find' (an exact, unique snippet copied verbatim from the file — use " +
+            "read_file or find_in_file first to get it) and 'replace'. By default 'find' must match exactly once; " +
+            "set all=true to replace every occurrence (e.g. swapping a colour used throughout).",
+            new[]
+            {
+                ToolParameter.String("name", "Name of the existing file to edit, e.g. \"build_playbook.py\".", required: true),
+                ToolParameter.String("find", "Exact text to find, copied verbatim from the file (include enough surrounding text to be unique).", required: true),
+                ToolParameter.String("replace", "Text to put in its place.", required: true),
+                ToolParameter.Boolean("all", "Replace every occurrence instead of requiring a single unique match. Defaults to false.", required: false),
+            },
+            (args, _) =>
+            {
+                string fileName = SafeFileName(args.GetString("name"));
+                if (fileName.Length == 0) return Task.FromResult(ToolOutput.Error("A file name is required."));
+                string find = args.GetStringOrNull("find") ?? "";
+                if (find.Length == 0) return Task.FromResult(ToolOutput.Error("'find' is required — the exact text to replace."));
+                string replace = args.GetStringOrNull("replace") ?? "";
+                bool all = args.GetBool("all", false);
+
+                string fullPath = Path.Combine(rootDir, fileName);
+                if (!File.Exists(fullPath))
+                    return Task.FromResult(ToolOutput.Error(
+                        $"There's no file called \"{fileName}\" in this conversation. Use list_files to check the name, or write_file to create it."));
+                try
+                {
+                    string text = File.ReadAllText(fullPath);
+                    int first = text.IndexOf(find, StringComparison.Ordinal);
+                    if (first < 0)
+                        return Task.FromResult(ToolOutput.Error(
+                            $"That exact text wasn't found in {fileName}. Read it first (read_file or find_in_file) and copy the snippet verbatim — whitespace and case must match."));
+
+                    int count = 0; for (int i = first; i >= 0; i = text.IndexOf(find, i + find.Length, StringComparison.Ordinal)) count++;
+                    if (count > 1 && !all)
+                        return Task.FromResult(ToolOutput.Error(
+                            $"That text appears {count} times in {fileName}, so the edit is ambiguous. Include more surrounding text to make 'find' unique, or set all=true to replace every occurrence."));
+
+                    string updated = all
+                        ? text.Replace(find, replace)
+                        : string.Concat(text.AsSpan(0, first), replace, text.AsSpan(first + find.Length));
+                    File.WriteAllText(fullPath, updated);
+                    int delta = updated.Length - text.Length;
+                    return Task.FromResult(ToolOutput.Ok(
+                        $"Edited {fileName} ({count} replacement{(count == 1 ? "" : "s")}, {(delta >= 0 ? "+" : "")}{delta} chars). " +
+                        $"Re-run the build to regenerate the output, then send the result."));
+                }
+                catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't edit {fileName}: {ex.Message}")); }
+            });
+    }
+
+    /// <summary>find_in_file(name, query): locate text in a conversation file, returning matching lines WITH
+    /// their 1-based line numbers (and a small amount of context), so the model can pinpoint where to edit in a
+    /// large source without paging the whole thing through read_file. Case-insensitive substring search.</summary>
+    public static AgentTool FindInFileTool(string rootDir, string name = "find_in_file")
+    {
+        const int MaxHits = 50;
+        return new AgentTool(
+            name,
+            "Searches an existing conversation file for text and returns the matching lines with their line " +
+            "numbers — use it to find exactly where something is in a large file (a build script, HTML source) " +
+            "before editing it, instead of reading the whole file. Case-insensitive substring match.",
+            new[]
+            {
+                ToolParameter.String("name", "Name of the file to search, e.g. \"playbook.html\".", required: true),
+                ToolParameter.String("query", "Text to look for (case-insensitive), e.g. a hex colour or a heading.", required: true),
+            },
+            (args, _) =>
+            {
+                string fileName = SafeFileName(args.GetString("name"));
+                if (fileName.Length == 0) return Task.FromResult(ToolOutput.Error("A file name is required."));
+                string query = args.GetStringOrNull("query") ?? "";
+                if (query.Length == 0) return Task.FromResult(ToolOutput.Error("A 'query' to search for is required."));
+
+                string fullPath = Path.Combine(rootDir, fileName);
+                if (!File.Exists(fullPath))
+                    return Task.FromResult(ToolOutput.Error(
+                        $"There's no file called \"{fileName}\" in this conversation. Use list_files to check the name."));
+                try
+                {
+                    var lines = File.ReadAllLines(fullPath);
+                    var hits = new StringBuilder();
+                    int found = 0;
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        if (lines[i].IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        found++;
+                        if (found <= MaxHits) hits.Append($"{i + 1}: {lines[i]}\n");
+                    }
+                    if (found == 0)
+                        return Task.FromResult(ToolOutput.Ok($"No lines in {fileName} contain \"{query}\"."));
+                    var header = found > MaxHits
+                        ? $"{found} matching lines in {fileName} (showing first {MaxHits}; narrow the query):\n"
+                        : $"{found} matching line{(found == 1 ? "" : "s")} in {fileName}:\n";
+                    return Task.FromResult(ToolOutput.Ok(header + hits.ToString().TrimEnd()));
+                }
+                catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't search {fileName}: {ex.Message}")); }
+            });
+    }
+
     /// <summary>A read-only file bucket mounted alongside a conversation's own files — e.g. a global company
     /// area or a persona's brand kit. Its files are listed (with their real on-disk path) so a worker can read
     /// them with read_file or reference them by path inside run_python; they are never writable or sendable

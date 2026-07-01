@@ -17,4 +17,8 @@
     <ProjectReference Include="..\src\Smarty.Agents\Smarty.Agents.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Smarty.Agents.Tests" />
+  </ItemGroup>
+
 </Project>

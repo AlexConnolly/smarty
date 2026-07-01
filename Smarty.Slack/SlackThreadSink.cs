@@ -123,15 +123,15 @@ public sealed class SlackThreadSink : IEventSink
             case "file":
             {
                 // A worker is sending a file back into the thread. The path is a thread-scoped file the
-                // orchestrator vouched for; we just upload it (fire-and-forget, like Post).
+                // orchestrator vouched for. Upload it, but DON'T swallow a failure: a silent upload error left
+                // the user told "here's your file" with nothing attached. Report it in the thread instead.
                 using var doc = JsonDocument.Parse(data);
                 var root = doc.RootElement;
                 string? path = root.TryGetProperty("path", out var pe) ? pe.GetString() : null;
                 if (string.IsNullOrWhiteSpace(path)) break;
                 string? name = root.TryGetProperty("name", out var ne) ? ne.GetString() : null;
                 string? caption = root.TryGetProperty("caption", out var ce) ? ce.GetString() : null;
-                _ = _api.UploadFileAsync(_channel, _threadTs, path!, name,
-                    string.IsNullOrWhiteSpace(caption) ? null : ToSlackMrkdwn(caption!));
+                _ = UploadAndReportAsync(path!, name, caption);
                 break;
             }
         }
@@ -171,4 +171,23 @@ public sealed class SlackThreadSink : IEventSink
     // Fire-and-forget the post (Append is called synchronously inside the orchestrator turn; we mustn't block it).
     private void Post(string text) =>
         _ = _api.PostMessageAsync(_channel, _threadTs, text);
+
+    // Upload a file and surface a failure rather than dropping it silently. UploadFileAsync already logs the
+    // specific Slack error to stderr (missing_scope, not_in_channel, …); here we also tell the user in-thread so
+    // they're never told a file arrived when it didn't.
+    private async Task UploadAndReportAsync(string path, string? name, string? caption)
+    {
+        string display = string.IsNullOrWhiteSpace(name) ? Path.GetFileName(path) : name!;
+        bool ok;
+        try
+        {
+            ok = await _api.UploadFileAsync(_channel, _threadTs, path, name,
+                string.IsNullOrWhiteSpace(caption) ? null : ToSlackMrkdwn(caption!)).ConfigureAwait(false);
+        }
+        catch { ok = false; }
+        if (!ok)
+            Post($"⚠️ I couldn't upload `{display}` to this thread — the file is ready, but Slack rejected the " +
+                 "upload. That's usually a permissions issue: I may need the `files:write` scope or to be added to " +
+                 "this channel.");
+    }
 }

@@ -116,11 +116,10 @@ public sealed class PersonaStore
     private static string SynthesisePrompt(string name, string description, IReadOnlyList<string> capabilityIds)
     {
         var sb = new System.Text.StringBuilder();
-        sb.Append($"You are acting as a {name}. ");
+        sb.Append($"You are the {name}. ");
         if (description.Length > 0) sb.Append(description.TrimEnd('.') + ". ");
-        sb.Append("Do the task with the tools you have, and base every factual claim only on what a tool " +
-                  "actually returned — if the tools can't get something, say so plainly rather than guessing or " +
-                  "inventing. Be precise and concrete; separate what the evidence shows from what you infer.");
+        sb.Append("Do the task with your tools; base every claim only on what a tool actually returned — if the " +
+                  "tools can't get it, say so plainly rather than inventing.");
         return sb.ToString();
     }
 
@@ -150,13 +149,11 @@ public sealed class PersonaStore
         // Seed missing built-ins and ALWAYS re-assert each built-in's curated prompt + flag, so a stored copy
         // can neither override the prompt nor be edited into exposing it. Stored name/description/capabilities
         // for a built-in are preserved (the user may have tweaked them).
+        // Built-ins are fully re-asserted from the template (name, description, capabilities, prompt) — a stored
+        // copy can neither drift nor expose the prompt. Their definitions are structural (tool blocks), not
+        // user-tunable. User-CREATED personas (not in BuiltIns) are left untouched.
         foreach (var t in BuiltIns)
-        {
-            if (_personas.TryGetValue(t.Id, out var stored))
-                _personas[t.Id] = stored with { SystemPrompt = t.SystemPrompt, Builtin = true };
-            else
-                _personas[t.Id] = t with { Builtin = true };
-        }
+            _personas[t.Id] = t with { Builtin = true };
         Save();
     }
 
@@ -178,58 +175,60 @@ public sealed class PersonaStore
         new Persona(
             "software_engineer",
             "Software Engineer",
-            "Diagnoses bugs/exceptions/incidents from logs AND the code, then proposes a concrete, reviewable fix.",
-            "You are acting as a SENIOR SOFTWARE ENGINEER. Diagnose problems from EVIDENCE — query the logs, " +
-            "read what's actually there, and reason from it. State the most likely cause and the signal that " +
-            "points to it. Be precise and technical: quote EXACT error types, counts, services, timestamps and " +
-            "figures from the tools — never round, embellish, or invent a number, stack trace, or metric the " +
-            "tools didn't return. Clearly separate what the evidence SHOWS from what you INFER.\n" +
-            "Then PROPOSE A FIX, grounded in the real code: use code_search/code_read to find the exact file and " +
-            "method involved, identify the root cause in the source, and write a concrete proposed change — name " +
-            "the file and method, show the before/after, and explain why it addresses the cause. Prefer writing " +
-            "the proposed patch to a file with write_file and sending it with send_file. You are PROPOSING only: " +
-            "you cannot and must not modify the repository or claim you have applied anything — leave the decision " +
-            "to a human.",
-            new[] { "kibana", "code", "github" }),
+            "Reads and writes code to diagnose issues and propose reviewable fixes.",
+            "Work from the real code: read it, quote the exact files/functions, and propose fixes as concrete " +
+            "before/after changes — never invent. You propose changes; you don't deploy them.",
+            new[] { "code", "files", "memory" }),
+
+        new Persona(
+            "sre",
+            "Site Reliability",
+            "Searches logs to find and explain production issues and incidents.",
+            "Answer from the logs: query them, quote the exact errors/counts/timestamps the tools return, and " +
+            "separate what's shown from what you infer — never invent a metric or stack trace.",
+            new[] { "observability", "memory" }),
 
         new Persona(
             "product_manager",
-            "Product Manager",
-            "Frames product questions, weighs trade-offs, scopes work and writes crisp summaries.",
-            "You are acting as a PRODUCT MANAGER. Think in terms of users, outcomes and trade-offs. Be concise " +
-            "and decisive: clarify the goal, lay out options with their pros/cons, and recommend one. Ground " +
-            "claims about current work in real Jira issues (jira_search / jira_get_issue) rather than guessing, " +
-            "and when the user actually wants a ticket, create it with jira_create_issue. Don't pad with platitudes.",
-            new[] { "jira" }),
+            "Project Manager",
+            "Searches projects and does CRUD on tickets in the connected project-management tool.",
+            "Answer about projects and tickets from the connected project-management tool — search and read real " +
+            "items rather than guessing, and create or update tickets when asked. Be concise and decisive.",
+            new[] { "project_management", "memory" }),
 
         new Persona(
             "data_scientist",
-            "Data Scientist",
-            "Analyzes data files (CSVs, Excel, PDFs, etc.), writes Python to process them, and produces the findings — written analysis, charts, and data — for others to act on or present.",
-            "You are acting as a DATA SCIENTIST. Your role is ANALYSIS, not presentation: find the patterns and " +
-            "tell the story in the numbers. When asked to analyze a file, understand its structure first, then " +
-            "write and execute Python with run_python to do the heavy lifting — statistical analysis and plotting.\n" +
-            "WHAT YOU PRODUCE (this is important):\n" +
-            "- A clear written analysis as a MARKDOWN file (e.g. findings.md) written with write_file: the key " +
-            "findings, ranked, with the concrete figures behind each — best/worst performers, segments, outliers, " +
-            "correlations. Be specific and quantitative; never round away or invent a number.\n" +
-            "- The supporting CHARTS as image files (PNG) saved with matplotlib/seaborn, and any processed DATA " +
-            "(e.g. a cleaned CSV) the work produced.\n" +
-            "- Do NOT build a PDF or any polished/branded document — that is someone else's job. Hand on the raw " +
-            "picture: markdown + images + data. Send the markdown and images back with send_file.\n" +
-            "In your final text response, give a 1–2 sentence high-level summary and point to the files you " +
-            "produced. Don't paste long tables into the chat.",
-            new[] { "datascience" }),
+            "Data Analyst",
+            "Analyses data files with Python and returns findings, charts (PNG) and processed data.",
+            "Analyse data with run_python. Produce a short written analysis of the real findings (with the actual " +
+            "figures — never invent one), plus supporting charts as PNGs and any cleaned data. Hand over raw " +
+            "analysis, not polished or branded documents.",
+            new[] { "data", "files", "memory" }),
 
         new Persona(
             "branding_designer",
-            "Branding & Design",
-            "Designs and edits visuals, and produces on-brand docs and comms. Applies a brand the user provides rather than inventing one.",
-            "You are acting as a BRANDING & DESIGN specialist. You design and edit by writing code — run_python is " +
-            "your workhorse — working from the files in this conversation and sending what you make with send_file.\n" +
-            "When the work should be on-brand, call list_files first: a brand kit the user provided may be mounted " +
-            "read-only — use it, and don't invent a brand. Only ask for one when the work genuinely needs it.",
-            new[] { "datascience", "figma" }),
+            "Document Production",
+            "Applies a brand YOU provide (kit/template/tokens) to produce or format documents. Never invents a brand or design taste.",
+            "You APPLY a brand the user provides — a kit, template, or tokens — to format content into documents " +
+            "with run_python. You do NOT invent brands, visual identities, or design taste: if asked to create one " +
+            "from scratch, say that's not something you do and ask for the guidelines to apply.",
+            new[] { "data", "files", "memory" }),
+
+        new Persona(
+            "image_editor",
+            "Image Editor",
+            "Edits images deterministically: crop, resize, recolour, composite, add a logo or overlay.",
+            "Edit the image(s) provided with the image tools — crop, resize, recolour, composite, place a logo. " +
+            "You transform images you're given; you don't generate or invent new artwork.",
+            new[] { "images", "files" }),
+
+        new Persona(
+            "file_converter",
+            "File Converter",
+            "Converts files between formats (e.g. docx↔pdf, csv↔xlsx, image formats).",
+            "Convert the file(s) provided from one format to another with the conversion tools. Convert only — " +
+            "don't edit or reinterpret the content.",
+            new[] { "conversion", "files" }),
     };
 }
 
@@ -265,6 +264,26 @@ public sealed class CapabilityRegistry
 {
     private readonly Dictionary<string, ICapability> _caps;
 
+    // Platform-agnostic FUNCTIONS → the integration(s) that provide them. Personas reference a function (e.g.
+    // "project_management"), never a platform, so a Smarty instance connected to Trello instead of Jira lights up
+    // the same persona. A reference that isn't a function key is treated as a direct integration id (back-compat).
+    private static readonly IReadOnlyDictionary<string, string[]> Functions =
+        new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["project_management"] = new[] { "jira" },
+            ["observability"] = new[] { "kibana" },
+            ["code"] = new[] { "code", "github" },
+            ["data"] = new[] { "datascience" },
+            // Images and file conversion run on the same Python engine (Pillow / pandas / reportlab) today; a
+            // dedicated bounded toolset can slot in behind these functions later without touching the personas.
+            ["images"] = new[] { "datascience" },
+            ["conversion"] = new[] { "datascience" },
+        };
+
+    // Expand a persona's capability refs (function ids and/or direct integration ids) into integration ids.
+    private static IEnumerable<string> ResolveIntegrations(IReadOnlyList<string> refs) =>
+        refs.SelectMany(r => Functions.TryGetValue(r, out var ints) ? ints : new[] { r }).Distinct(StringComparer.OrdinalIgnoreCase);
+
     public CapabilityRegistry(IEnumerable<ICapability> capabilities) =>
         _caps = capabilities.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
 
@@ -288,7 +307,7 @@ public sealed class CapabilityRegistry
     public IReadOnlyList<AgentTool> BuildFor(IReadOnlyList<string> capabilityIds, IntegrationConfig config, TaskInfo task)
     {
         var tools = new List<AgentTool>();
-        foreach (var id in capabilityIds)
+        foreach (var id in ResolveIntegrations(capabilityIds))
             if (_caps.TryGetValue(id, out var cap))
                 tools.AddRange(cap.BuildTools(config, task));
         return tools;
@@ -299,7 +318,7 @@ public sealed class CapabilityRegistry
     public IReadOnlyList<string> ActiveHints(IReadOnlyList<string> capabilityIds, IntegrationConfig config, TaskInfo task)
     {
         var hints = new List<string>();
-        foreach (var id in capabilityIds)
+        foreach (var id in ResolveIntegrations(capabilityIds))
             if (_caps.TryGetValue(id, out var cap) && cap.PromptHint is { Length: > 0 } hint
                 && cap.BuildTools(config, task).Count > 0)
                 hints.Add(hint);

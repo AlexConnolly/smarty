@@ -14,8 +14,10 @@ public sealed class DataScienceCapability : ICapability
     public IReadOnlyList<string> RequiredConfig => Array.Empty<string>();
 
     public string? PromptHint =>
-        "Use run_python to execute Python code, read/process CSVs/data, and generate charts (PNG). Files you " +
-        "generate are saved to the conversation automatically; send them to the user with send_file.";
+        "Use run_python to execute Python code, read/process CSVs/data, render documents (PDF via reportlab) and " +
+        "charts (PNG). ALL of this conversation's files are already present in the working directory each run — " +
+        "open them by bare name in your code (no need to read_file them first, or to list them in 'files'). Files " +
+        "you generate are saved to the conversation automatically and handed to the user when you finish.";
 
     public IReadOnlyList<AgentTool> BuildTools(IntegrationConfig config, TaskInfo task)
     {
@@ -328,48 +330,34 @@ public sealed class DataScienceCapability : ICapability
     private async Task<ToolOutput> RunPythonAsync(ToolCallArguments args, TaskInfo task, CancellationToken ct)
     {
         string code = args.GetString("code");
-        string? filesJson = args.GetStringOrNull("files");
 
-        var filesToCopy = new List<string>();
-        if (!string.IsNullOrWhiteSpace(filesJson))
-        {
-            try
-            {
-                var parsed = JsonSerializer.Deserialize<List<string>>(filesJson);
-                if (parsed != null)
-                {
-                    filesToCopy.AddRange(parsed);
-                }
-            }
-            catch
-            {
-                // Fallback to simple comma split or parsing
-            }
-        }
+        // WeasyPrint and pdfkit can't render in this environment (missing native GTK/wkhtmltopdf libs) — every
+        // attempt fails and the worker rabbit-holes into base64-inlining HTML. Reject the import up front with a
+        // clear steer to reportlab, deterministically, rather than letting it waste a run discovering that again.
+        if (System.Text.RegularExpressions.Regex.IsMatch(code, @"\b(import\s+weasyprint|from\s+weasyprint|import\s+pdfkit|from\s+pdfkit)\b"))
+            return ToolOutput.Error(
+                "WeasyPrint and pdfkit do NOT work in this environment (no native render libs) — they will fail. " +
+                "Build the PDF with reportlab instead (it is installed and works). Do not use an HTML→PDF renderer.");
 
         // We need a temp directory for execution inside the task workspace.
         string baseDir = task.WorkspaceDir ?? Path.GetTempPath();
         string execDir = Path.Combine(baseDir, $"py_{Guid.NewGuid():N}");
-        string? threadFilesDir = string.IsNullOrEmpty(task.WorkspaceDir) 
-            ? null 
+        string? threadFilesDir = string.IsNullOrEmpty(task.WorkspaceDir)
+            ? null
             : Path.Combine(Path.GetDirectoryName(task.WorkspaceDir)!, "files");
 
         try
         {
             Directory.CreateDirectory(execDir);
 
-            // Copy input files from conversation files area
+            // Stage the WHOLE conversation file area into the working dir every run. run_python is otherwise
+            // stateless per call (fresh temp dir), so files a previous run downloaded/produced would vanish —
+            // which drove the worker to cram everything into one giant script and base64-inline fonts. With all
+            // files present each run, code can just open them by bare name; no read_file paging, no re-staging.
             if (!string.IsNullOrEmpty(threadFilesDir) && Directory.Exists(threadFilesDir))
             {
-                foreach (var fileName in filesToCopy)
-                {
-                    var cleanName = Path.GetFileName(fileName.Trim());
-                    var src = Path.Combine(threadFilesDir, cleanName);
-                    if (File.Exists(src))
-                    {
-                        File.Copy(src, Path.Combine(execDir, cleanName), overwrite: true);
-                    }
-                }
+                foreach (var src in Directory.GetFiles(threadFilesDir))
+                    File.Copy(src, Path.Combine(execDir, Path.GetFileName(src)), overwrite: true);
             }
 
             // Write the python code to script.py
@@ -434,6 +422,26 @@ public sealed class DataScienceCapability : ICapability
                         generatedFiles.Add(name);
                     }
                 }
+
+                // Harvest any font this run produced (typically downloaded) into the shared, cross-thread font
+                // cache, so the next brand task can reference it instead of re-downloading. Best-effort: a cache
+                // miss just means a download next time — it must never fail the run. Root is two levels up from
+                // the thread's files area (<root>/<session>/files → <root>).
+                try
+                {
+                    var root = Path.GetDirectoryName(Path.GetDirectoryName(threadFilesDir));
+                    if (Orchestrator.FontCacheDirFor(root) is { } cacheDir)
+                        foreach (var name in generatedFiles)
+                        {
+                            var ext = Path.GetExtension(name).ToLowerInvariant();
+                            if (ext is not (".ttf" or ".otf" or ".woff" or ".woff2")) continue;
+                            var cached = Path.Combine(cacheDir, name);
+                            if (File.Exists(cached)) continue; // already cached — don't churn
+                            Directory.CreateDirectory(cacheDir);
+                            File.Copy(Path.Combine(threadFilesDir, name), cached, overwrite: false);
+                        }
+                }
+                catch { /* caching is an optimisation, never fatal */ }
             }
 
             var sb = new StringBuilder();

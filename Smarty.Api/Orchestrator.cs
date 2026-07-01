@@ -274,8 +274,8 @@ public sealed class Orchestrator
             session.History.Add(Message.System(
                 "A task you SCHEDULED earlier is now due. Carry it out NOW, using the conversation above as " +
                 "context (it may have moved on since you set this). Do it and report the outcome to the thread " +
-                "in one short, natural line — a proactive heads-up. If it involves a file from this " +
-                "conversation, send it with send_file (delegate the work; the worker has the file tools). Don't " +
+                "in one short, natural line — a proactive heads-up. If it involves producing a file, delegate the " +
+                "work (the worker authors it and it's handed to the user automatically). Don't " +
                 "ask the user to confirm — only stop if you genuinely can't proceed without a decision only they " +
                 "can make. Never mention scheduling, tasks, or any internal mechanics.\n\nScheduled task: " + taskText));
             await RunOrchestratorTurnAsync(
@@ -821,54 +821,13 @@ public sealed class Orchestrator
 
             case "promote_file":
             {
-                if (ThreadFilesDir(session) is not { } filesDir)
-                    return Data("Files aren't available in this context, so there's nothing to save.");
-                var fileName = call.Arguments.GetStringOrNull("name")?.Trim();
-                var scope = call.Arguments.GetStringOrNull("scope")?.Trim();
-                if (string.IsNullOrWhiteSpace(fileName)) return Data("Which file? Use the name shown by list_files.");
-                if (string.IsNullOrWhiteSpace(scope)) return Data("Where to? Give a specialist id (e.g. branding_designer) or \"global\".");
-
-                var safe = string.Concat(Path.GetFileName(fileName).Select(c =>
-                    Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
-                var source = Path.Combine(filesDir, safe);
-                if (safe.Length == 0 || !File.Exists(source))
-                    return Data($"There's no file called \"{fileName}\" in this conversation. Check list_files for the exact name.");
-
-                string? targetDir; string where;
-                if (string.Equals(scope, "global", StringComparison.OrdinalIgnoreCase))
-                {
-                    targetDir = GlobalBucketDir();
-                    where = "the shared company files";
-                }
-                else if (scope!.StartsWith("brand:", StringComparison.OrdinalIgnoreCase))
-                {
-                    // brand:<slug> — save into a brand kit, creating that brand if it's new (e.g. a new client).
-                    var slug = scope.Substring("brand:".Length).Trim();
-                    if (string.IsNullOrEmpty(slug)) return Data("Give a brand slug, e.g. scope \"brand:adidas\" (or \"brand:house\").");
-                    targetDir = BrandBucketDir(slug);
-                    bool isNew = BrandBucketDir(slug) is { } d && !Directory.Exists(d);
-                    where = $"the {slug} brand kit{(isNew ? " (new brand)" : "")}";
-                }
-                else if (_personas?.Get(scope) is { } persona)
-                {
-                    targetDir = PersonaBucketDir(persona.Id);
-                    where = $"the {persona.Name} kit";
-                }
-                else
-                {
-                    var ids = _personas is null ? "" : string.Join(", ", _personas.All.Select(p => p.Id));
-                    return Data($"Unknown scope \"{scope}\". Use \"global\", \"brand:<slug>\" (e.g. brand:adidas), or one of: {ids}.");
-                }
-                if (targetDir is null) return Data("Durable storage isn't available in this context.");
-
-                try
-                {
-                    Directory.CreateDirectory(targetDir);
-                    File.Copy(source, Path.Combine(targetDir, safe), overwrite: true);
-                    return Data($"Saved {safe} to {where} — it'll be available in future conversations. " +
-                                "Tell the user briefly it's saved; don't mention buckets or internals.");
-                }
-                catch (Exception ex) { return Data($"Couldn't save {safe}: {ex.Message}"); }
+                var promoted = PromoteThreadFile(session,
+                    call.Arguments.GetStringOrNull("name")?.Trim() ?? "",
+                    call.Arguments.GetStringOrNull("scope")?.Trim() ?? "");
+                return Data(promoted.Ok
+                    ? $"{promoted.Detail} — it'll be available in future conversations. " +
+                      "Tell the user briefly it's saved; don't mention buckets or internals."
+                    : promoted.Detail);
             }
 
             case "schedule_task":
@@ -1121,17 +1080,41 @@ public sealed class Orchestrator
     {
         string result = "(no result)";
         bool cancelled = false;
+        // Files uploaded to the user this leg, de-duped within the end-of-leg deliver pass.
+        var sentFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Snapshot (name → last-write) of the file area at the start of this leg, so a finalize that names no file
+        // can still fall back to the document(s) this leg actually produced.
+        var filesAtLegStart = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         bool firstLeg = task.Conversation.Count == 0; // capture before the gate/seeds append to the transcript
         Trace($"[worker #{task.Id}] drive: {Snip(message, 120)}");
         try
         {
+            // CLARIFY — before spending any work, check for a MATERIAL gap: a definition/scope/preference that
+            // would change the result and isn't already known. If so, ask ONCE and pause; the answer resumes the
+            // task and is saved so we never ask again. First leg + top-level only (never mid-task or per step).
+            if (_planner is not null && firstLeg && task.ParentTaskId is null)
+            {
+                task.LatestThought = "making sure the ask is clear…";
+                var known = _memory.SearchScopes(task.Description, new[] { task.UserScope, task.Project });
+                var (clarifyQ, clarifyOpts) = await _planner.ClarifyAsync(task.Description, known, task.Cts.Token).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(clarifyQ) && task.Status == "running")
+                {
+                    // On resume, nudge saving a durable answer so this becomes a one-time question, not every time.
+                    task.Conversation.Add(Message.System(
+                        $"Before starting you asked the user to clarify: \"{clarifyQ}\". When they answer, if it's a " +
+                        "durable definition or preference you'll need again, set_memory it so you never ask again."));
+                    PauseWithQuestion(session, task, new PendingQuestion(clarifyQ!, clarifyOpts));
+                    return;
+                }
+            }
+
             // ASSESS — top-level first leg only (a plan's child STEP already has its instruction). ONE sizing call
             // answers both routing questions at once (was two): which disciplines the task needs, and whether it's
             // complex enough to plan. MULTI-discipline → build a step plan and hand to the coordinator (never
             // returns here). SINGLE → set that persona. Then, complex single-discipline work also gets a textual
             // plan seeded so the executor follows a structured approach. Runs inside the background task, so it
             // never slows the chat turn. Fails open (no disciplines, simple) so it can't block the work.
-            if (_planner is not null && firstLeg && task.ParentTaskId is null && task.Plan is null)
+            if (_planner is not null && !task.Assessed && task.ParentTaskId is null && task.Plan is null)
             {
                 task.LatestThought = "sizing up the task…";
                 bool complex;
@@ -1177,12 +1160,13 @@ public sealed class Orchestrator
                     }
                 }
                 else Trace($"[worker #{task.Id}] assess → simple; no single-worker plan");
+                task.Assessed = true;
             }
 
-            // CLOCK — first leg only. The worker's system prompt is STATIC (so its prefix caches across every
-            // task); the current time, which would otherwise break that cache every minute, rides here as a late
-            // seed instead. Seeded into the transcript so it persists across any Q&A legs.
-            if (firstLeg)
+            // CLOCK — seeded once (survives a clarify pause via Seeded, not firstLeg). The worker's system prompt
+            // is STATIC (so its prefix caches across every task); the current time, which would otherwise break
+            // that cache every minute, rides here as a late seed instead, persisted across any Q&A legs.
+            if (!task.Seeded)
             {
                 var now = DateTime.Now;
                 task.Conversation.Add(Message.System(
@@ -1193,7 +1177,7 @@ public sealed class Orchestrator
             // WORKSPACE — first leg only: point the worker at its working directory (the brief in task.md and
             // any files the user attached, copied into files/). Seeded into the transcript so it persists across
             // any Q&A legs. Done after the planning gate so it doesn't trip the gate's "first leg" check.
-            if (firstLeg && task.WorkspaceDir is { } ws)
+            if (!task.Seeded && task.WorkspaceDir is { } ws)
             {
                 string? filesDir = ThreadFilesDir(session);
                 var seed = new StringBuilder(
@@ -1204,13 +1188,15 @@ public sealed class Orchestrator
                     seed.Append($"- This conversation's files are in: {filesDir}\n");
                     seed.Append(
                         "List them with list_files; read one with read_file / file_summary. Write a new file " +
-                        "with write_file, and hand a file to the user with send_file. ONLY files in this " +
-                        "conversation are accessible — you cannot see or send files from anywhere else.\n");
+                        "with write_file, or revise one with edit_file (find_in_file to locate). Your finished " +
+                        "file is handed to the user automatically when you stop — you don't send it yourself. ONLY " +
+                        "files in this conversation are accessible — you cannot see files from anywhere else.\n");
                 }
                 seed.Append("Use run_shell_command too, if you have it. Write any output into this conversation's files area.");
                 task.Conversation.Add(Message.System(seed.ToString()));
                 Trace($"[worker #{task.Id}] workspace seeded: {ws}");
             }
+            task.Seeded = true; // clock + workspace context are in (or N/A); don't re-seed on a resume
 
             // BRAND RESOLUTION — the branding designer works at an agency with many brands; pick which one this
             // task is for (a client, or the house brand) so the right kit gets mounted below. First leg only;
@@ -1230,53 +1216,42 @@ public sealed class Orchestrator
                 : new OllamaModelProvider(_ollamaBaseUrl);
             // If this task runs inside a project, inject that project's context and reframe memory toward
             // tracking the project (not the user); writes are auto-tagged to the project's slug.
-            // A re-targeted surface (Slack) supplies its own worker toolset (web-only, no shell/memory);
-            // the default is the full shell + web + project-memory set.
-            var tools = (_workerToolsFactory?.Invoke(task) ?? new AgentTool[]
+            // A persona is a TIGHT bundle of blocks — it gets ONLY the blocks it declares (files/web/memory plus
+            // its capability functions), so a project_manager sees ticket tools + memory and nothing else. A task
+            // with NO persona (plain delegation) falls back to the surface's default worker set + file authoring.
+            List<AgentTool> tools;
+            var persona = task.Persona is { } pid ? _personas?.Get(pid) : null;
+            if (persona is not null)
             {
-                ShellTool.Create(),
-                WebResearch.SearchTool(),
-                WebResearch.PageAnswerTool(provider, _model),
-                FileTools.ReadFileTool(),
-                FileTools.SummaryTool(provider, _model),
-                MemoryTools.SearchTool(_memory, task.Project),
-                MemoryTools.SetTool(_memory, task.Project),
-            }).ToList();
-
-            // Every worker also gets the conversation-scoped file tools, rooted at THIS thread's file area:
-            // write_file (author), list_files (discover), send_file (hand a file back). send_file emits a "file"
-            // event on the session stream, which the surface (Slack thread / SSE) turns into an upload — so a
-            // worker can return a file the moment it's ready. No workspace root → no file area → skip (web default).
-            if (ThreadFilesDir(session) is { } threadFiles)
+                tools = persona.CapabilityIds.SelectMany(b => BuildBlock(b, session, task, provider)).ToList();
+                Trace($"[worker #{task.Id}] persona '{persona.Id}' → {tools.Count} tools: {string.Join(",", tools.Select(t => t.Name))}");
+            }
+            else
             {
-                Directory.CreateDirectory(threadFiles);
-                tools.Add(FileTools.WriteFileTool(threadFiles));
-                // Mount read-only buckets the worker can draw on: a global company area, plus the active
-                // persona's own kit (e.g. branding_designer's brand assets). list_files surfaces them with their
-                // real paths so run_python can use them; writes/sends still land in the conversation.
-                tools.Add(FileTools.ListFilesTool(threadFiles, BucketMounts(task)));
-                // Per-LEG de-dupe: a chatty worker often calls send_file more than once for the same file in one
-                // run (e.g. once with a "here it is" caption, then again with a summary), uploading it to the
-                // thread twice. Scoped to this leg only — a later refine ("make it bigger") rebuilds the tools
-                // with a fresh set, so it can legitimately re-send the regenerated file.
-                var sentFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                tools.Add(FileTools.SendFileTool(threadFiles, (path, caption) =>
+                tools = (_workerToolsFactory?.Invoke(task) ?? new AgentTool[]
                 {
-                    if (!sentFiles.Add(Path.GetFullPath(path))) return true; // already sent this leg — skip re-upload
-                    session.Append("file", Json(new { path, name = Path.GetFileName(path), caption }));
-                    return true;
-                }));
+                    ShellTool.Create(),
+                    WebResearch.SearchTool(),
+                    WebResearch.PageAnswerTool(provider, _model),
+                    FileTools.ReadFileTool(),
+                    FileTools.SummaryTool(provider, _model),
+                    MemoryTools.SearchTool(_memory, task.Project),
+                    MemoryTools.SetTool(_memory, task.Project),
+                }).ToList();
+                if (ThreadFilesDir(session) is { } tfd)
+                {
+                    Directory.CreateDirectory(tfd);
+                    tools.Add(FileTools.WriteFileTool(tfd));
+                    tools.Add(FileTools.EditFileTool(tfd));
+                    tools.Add(FileTools.FindInFileTool(tfd));
+                    tools.Add(FileTools.ListFilesTool(tfd, BucketMounts(task)));
+                }
             }
 
-            // Persona routing: a delegated task tagged with a persona runs that role's capability tools (Kibana,
-            // etc.) on TOP of the base set, so a specialist keeps general competence. Credentials are read from
-            // IntegrationConfig at build time — never via the model. Unknown/unconfigured capabilities add nothing.
-            if (task.Persona is { } pid && _personas?.Get(pid) is { } persona && _capabilities is { } caps)
-            {
-                foreach (var t in caps.BuildFor(persona.CapabilityIds, _integrationConfig, task))
-                    tools.Add(t);
-                Trace($"[worker #{task.Id}] persona '{persona.Id}' → {tools.Count} tools total");
-            }
+            // Snapshot the file area now (regardless of how tools were assembled) so a finalize that names no file
+            // can still fall back to the document(s) this leg produced.
+            if (ThreadFilesDir(session) is { } snapDir && Directory.Exists(snapDir))
+                foreach (var f in new DirectoryInfo(snapDir).GetFiles()) filesAtLegStart[f.Name] = f.LastWriteTimeUtc;
 
             var input = new AgentInput
             {
@@ -1294,6 +1269,9 @@ public sealed class Orchestrator
                 // fabricating. Reliability past that is a model problem, fixed by a better model, not by
                 // bolting model-specific crutches into this (deliberately model-agnostic) system.
                 Think = true,
+                // Tell the worker how many turns remain as it nears the cap, so it saves its deliverable before
+                // running out — the failure where a step made charts and stopped one turn before writing its file.
+                AnnounceBudget = true,
             };
             if (task.Persona is "data_scientist" or "branding_designer")
             {
@@ -1307,69 +1285,72 @@ public sealed class Orchestrator
                 input.MaxToolFailures = 8;
             }
             var worker = new SmartyAgent(input);
-
-            // Supervise this leg: a background watchdog watches the live transcript and nudges the worker to
-            // wrap up (or aborts it) if it starts thrashing — a relentless failing search. Stopped the instant
-            // the leg ends, so it never lingers past the worker.
-            using var monitorCts = CancellationTokenSource.CreateLinkedTokenSource(task.Cts.Token);
-            if (_watchdog is not null)
-                _ = _watchdog.MonitorAsync(task, monitorCts.Token, Trace);
-
             var thought = new StringBuilder();
-            try
+
+            // One drive of the worker with a given message: stream its events, supervised by the watchdog, and
+            // log the transcript. Called once normally, then re-invoked by the builder-completion guard below.
+            async Task RunPassAsync(string msg)
             {
-                await foreach (var ev in worker.AnswerStream(message, task.Cts.Token).ConfigureAwait(false))
+                // Supervise this pass: a background watchdog watches the live transcript and nudges the worker to
+                // wrap up (or aborts it) if it starts thrashing. Stopped the instant the pass ends.
+                using var monitorCts = CancellationTokenSource.CreateLinkedTokenSource(task.Cts.Token);
+                if (_watchdog is not null)
+                    _ = _watchdog.MonitorAsync(task, monitorCts.Token, Trace);
+                try
                 {
-                    switch (ev)
+                    await foreach (var ev in worker.AnswerStream(msg, task.Cts.Token).ConfigureAwait(false))
                     {
-                        case AgentEvent.ReasoningDelta r:
-                            thought.Append(r.Text);
-                            task.LatestThought = Tail(thought, 240);
-                            break;
-                        case AgentEvent.ContentDelta c:
-                            thought.Append(c.Text);
-                            task.LatestThought = Tail(thought, 240);
-                            break;
-                        case AgentEvent.ToolStarted ts:
-                            task.LatestThought = $"running {ts.ToolName}…";
-                            Trace($"[tool] start {ts.ToolName} {Snip(ts.Arguments, 160)}");
-                            // Surface the worker's tool call on the session stream so observers (the control
-                            // centre) can render live tool-calling visuals. The chat/Slack surfaces ignore it.
-                            session.Append("tool_started", Json(new { id = task.Id, name = ts.ToolName, arguments = ts.Arguments }));
-                            break;
-                        case AgentEvent.ToolCompleted tc:
-                            Trace($"[tool] done  {tc.ToolName} -> {Snip(tc.Result, 300)}");
-                            session.Append("tool_completed", Json(new { id = task.Id, name = tc.ToolName, result = Snip(tc.Result, 4000) }));
-                            break;
-                        case AgentEvent.Completed done:
-                            result = done.Answer;
-                            break;
+                        switch (ev)
+                        {
+                            case AgentEvent.ReasoningDelta r:
+                                thought.Append(r.Text);
+                                task.LatestThought = Tail(thought, 240);
+                                break;
+                            case AgentEvent.ContentDelta c:
+                                thought.Append(c.Text);
+                                task.LatestThought = Tail(thought, 240);
+                                break;
+                            case AgentEvent.ToolStarted ts:
+                                task.LatestThought = $"running {ts.ToolName}…";
+                                Trace($"[tool] start {ts.ToolName} {Snip(ts.Arguments, 160)}");
+                                // Surface the worker's tool call on the session stream so observers (the control
+                                // centre) can render live tool-calling visuals. The chat/Slack surfaces ignore it.
+                                session.Append("tool_started", Json(new { id = task.Id, name = ts.ToolName, arguments = ts.Arguments }));
+                                break;
+                            case AgentEvent.ToolCompleted tc:
+                                Trace($"[tool] done  {tc.ToolName} -> {Snip(tc.Result, 300)}");
+                                session.Append("tool_completed", Json(new { id = task.Id, name = tc.ToolName, result = Snip(tc.Result, 4000) }));
+                                break;
+                            case AgentEvent.Completed done:
+                                result = done.Answer;
+                                break;
+                        }
                     }
                 }
-            }
-            finally
-            {
-                monitorCts.Cancel(); // stop supervising the moment this leg ends
+                finally
+                {
+                    monitorCts.Cancel(); // stop supervising the moment this pass ends
+                }
+
+                // Capture the worker transcript (task → tool calls → results → answer) for the dataset.
+                if (worker.LastRun is { } run)
+                    _log.Interaction(new
+                    {
+                        ts = DateTimeOffset.UtcNow,
+                        session = session.Id,
+                        task_id = task.Id,
+                        role = "worker",
+                        model = _model,
+                        think = true,
+                        system = input.SystemPrompt,
+                        tools = ToolSchemas(input.Tools),
+                        task = task.Description,
+                        transcript = ProjectMessages(run.Messages),
+                        result,
+                    });
             }
 
-            // Capture the worker transcript (task → tool calls → results → answer) for the dataset.
-            if (worker.LastRun is { } run)
-            {
-                _log.Interaction(new
-                {
-                    ts = DateTimeOffset.UtcNow,
-                    session = session.Id,
-                    task_id = task.Id,
-                    role = "worker",
-                    model = _model,
-                    think = true,
-                    system = input.SystemPrompt,
-                    tools = ToolSchemas(input.Tools),
-                    task = task.Description,
-                    transcript = ProjectMessages(run.Messages),
-                    result,
-                });
-            }
+            await RunPassAsync(message);
         }
         catch (OperationCanceledException)
         {
@@ -1390,23 +1371,13 @@ public sealed class Orchestrator
         // the question is surfaced to the user, and we neither log a run nor re-voice — the run is paused.
         // A plan's child STEP never pauses to ask the user — the coordinator decides pass/retry/pause for it —
         // so the question-finalize is top-level only.
-        var question = (!cancelled && task.Status == "running" && task.ParentTaskId is null)
-            ? await FinalizeOutcomeAsync(task, task.Cts.Token).ConfigureAwait(false)
+        var outcome = (!cancelled && task.Status == "running" && task.ParentTaskId is null)
+            ? await FinalizeOutcomeAsync(session, task, task.Cts.Token).ConfigureAwait(false)
             : null;
+        var question = outcome?.Question;
         if (question is not null)
         {
-            task.Status = "waiting";
-            task.Pending = question;
-            task.LatestThought = question.Question;
-            session.Append("working_done", Json(new { id = task.Id, status = "waiting" }));
-            session.Append("question", Json(new
-            {
-                id = task.Id,
-                question = question.Question,
-                options = question.Options,
-                project = task.Project,
-            }));
-            Trace($"[worker #{task.Id}] WAITING >>> {Snip(question.Question, 200)}");
+            PauseWithQuestion(session, task, question);
             return;
         }
 
@@ -1447,17 +1418,33 @@ public sealed class Orchestrator
         // above, and we must not speak a result the user already told us to drop.
         if (cancelled || task.Cts.IsCancellationRequested || task.Status == "cancelled") return;
 
+        // Deliverables: hand the user the file(s) the finalize marked to show, and persist anything it marked to
+        // keep — driven by the structured verdict, the SOLE delivery path now that send_file is gone. Done here,
+        // after the cancel re-check, so a stopped task uploads nothing. savedNote tells the re-voice what was saved.
+        string? savedNote = null;
+        if (outcome is not null && task.ParentTaskId is null)
+        {
+            // Fallback: if finalize named nothing to show, deliver the document(s) this leg actually produced, so
+            // a finalize miss never means the user gets nothing (the failure that made delivery feel unreliable).
+            if (outcome.Show.Count == 0 && FallbackDeliverables(session, filesAtLegStart) is { Count: > 0 } fb)
+            {
+                Trace($"[worker #{task.Id}] deliver fallback -> {string.Join(",", fb)}");
+                outcome = outcome with { Show = fb };
+            }
+            savedNote = ApplyDeliverables(session, task, outcome, sentFiles);
+        }
+
         // A plan's child STEP doesn't speak to the user — its coordinator relays the whole plan once at the
         // end. Only a top-level task re-voices its own result here.
         if (task.ParentTaskId is null)
-            await ReVoiceAsync(session, task, result).ConfigureAwait(false);
+            await ReVoiceAsync(session, task, result, savedNote).ConfigureAwait(false);
     }
 
     /// <summary>Relay a finished task's result to the user in the orchestrator's voice. The MODEL phrases it
     /// (so it matches the user's language), but on a strict instruction: a blank/"(no result)" result must be
     /// reported as a failure with nothing invented — the re-voice once fabricated a whole "latest news" rundown
     /// from an empty result. Shared by single workers and the plan coordinator.</summary>
-    private async Task ReVoiceAsync(Session session, TaskInfo task, string result)
+    private async Task ReVoiceAsync(Session session, TaskInfo task, string result, string? savedNote = null)
     {
         bool failed = string.IsNullOrWhiteSpace(result)
             || string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase);
@@ -1479,6 +1466,22 @@ public sealed class Orchestrator
                   "your own memory or assumptions about what year it is. If the result says something is " +
                   "happening now, it is happening now. But if it says it couldn't find/get something, tell the " +
                   "user that plainly — never invent or pad it.";
+
+            // The file(s) themselves are already uploaded; this just lets the orchestrator mention, in passing,
+            // anything that was saved for next time (e.g. a new brand kit) so the user isn't left guessing.
+            if (!failed && !string.IsNullOrEmpty(savedNote)) instruction += savedNote;
+
+            // File-claim honesty (default-DENY): only ever say a file was sent if one ACTUALLY went out — tracked
+            // at the real upload points (send_file + the deliver pass), not inferred from the result text, which
+            // frequently claims "I've attached it" when nothing was delivered. With nothing delivered, forbid the
+            // claim outright rather than relay the worker's phantom send.
+            if (!failed)
+                instruction += task.DeliveredFiles.Count > 0
+                    ? $"\n\nA file WAS delivered to the user this turn: {string.Join(", ", task.DeliveredFiles)}. " +
+                      "You may refer to it as sent/attached."
+                    : "\n\nIMPORTANT: NO file was delivered to the user this turn. Do NOT say you've sent, attached, " +
+                      "shared, or produced a file — even if the result text claims one. If a file was the point, say " +
+                      "it isn't ready and offer to produce it.";
 
             var convo = new List<Message>(session.History) { Message.System(instruction) };
 
@@ -1588,7 +1591,37 @@ public sealed class Orchestrator
         parent.Result = string.IsNullOrWhiteSpace(last.Result) ? "(no result)" : last.Result;
         session.Append("working_done", Json(new { id = parent.Id, status = "done" }));
         Trace($"[plan #{parent.Id}] DONE ({plan.Steps.Count} steps)");
-        await ReVoiceAsync(session, parent, parent.Result!).ConfigureAwait(false);
+
+        // DELIVER the plan's output the SAME structured way a single worker does — this used to run nowhere for a
+        // plan (finalize/deliver are gated to top-level non-plan tasks, and the coordinator runs through here, not
+        // DriveWorker), which is why plan steps had to fall back to calling send_file by hand. Build a synthetic
+        // transcript from the steps' results so the finalize can pick the user-facing deliverable(s) out of the
+        // shared files area, then hand them over. De-dupe against anything a step already delivered mid-run.
+        string? savedNote = null;
+        if (!parent.Cts.IsCancellationRequested)
+        {
+            var planConvo = new List<Message> { Message.User(parent.Description) };
+            foreach (var s in plan.Steps)
+                if (!string.IsNullOrWhiteSpace(s.Result))
+                    planConvo.Add(Message.Assistant($"[{s.Persona}] {s.Result}"));
+            var planOutcome = await FinalizeOutcomeAsync(session, parent, parent.Cts.Token, planConvo).ConfigureAwait(false);
+
+            // Fallback: if finalize named nothing and no step delivered anything either, hand over the document(s)
+            // the plan produced — so the user never ends up with nothing after a full plan.
+            if (planOutcome.Show.Count == 0 && parent.DeliveredFiles.Count == 0
+                && FallbackDeliverables(session, null) is { Count: > 0 } pfb)
+            {
+                Trace($"[plan #{parent.Id}] deliver fallback -> {string.Join(",", pfb)}");
+                planOutcome = planOutcome with { Show = pfb };
+            }
+
+            var already = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (ThreadFilesDir(session) is { } fd)
+                foreach (var n in parent.DeliveredFiles) already.Add(Path.GetFullPath(Path.Combine(fd, n)));
+            savedNote = ApplyDeliverables(session, parent, planOutcome, already);
+        }
+
+        await ReVoiceAsync(session, parent, parent.Result!, savedNote).ConfigureAwait(false);
     }
 
     /// <summary>Run one plan step as a hidden child worker, with one retry on a verified failure. Returns
@@ -1648,8 +1681,13 @@ public sealed class Orchestrator
             if (child.Status == "cancelled") return (false, "cancelled");
 
             var result = child.Result ?? "";
+            // Hand the verifier the files this step actually left behind, so a deliverable saved as a file passes
+            // even when the text result is terse — and a step that only TALKED about producing one is caught.
+            var present = new List<string>();
+            if (ThreadFilesDir(session) is { } sfd && Directory.Exists(sfd))
+                foreach (var fi in new DirectoryInfo(sfd).GetFiles()) present.Add(fi.Name);
             var (verdictOk, verdictReason) = await _planner!.VerifyStepAsync(
-                step.Instruction, step.Produces, result, parent.Cts.Token).ConfigureAwait(false);
+                step.Instruction, step.Produces, result, parent.Cts.Token, present).ConfigureAwait(false);
             if (verdictOk)
             {
                 step.Result = result;
@@ -1693,6 +1731,33 @@ public sealed class Orchestrator
 
     private static string Head(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max].TrimEnd() + "…");
+
+    // Pause a task to ask the user a question (a clarify-before-work gate, or a blocked finalize). Sets it
+    // waiting, surfaces the question on the session stream, and stashes it as Pending so the resume can continue.
+    private void PauseWithQuestion(Session session, TaskInfo task, PendingQuestion question)
+    {
+        task.Status = "waiting";
+        task.Pending = question;
+        task.LatestThought = question.Question;
+        session.Append("working_done", Json(new { id = task.Id, status = "waiting" }));
+        session.Append("question", Json(new
+        {
+            id = task.Id,
+            question = question.Question,
+            options = question.Options,
+            project = task.Project,
+        }));
+        Trace($"[worker #{task.Id}] WAITING >>> {Snip(question.Question, 200)}");
+    }
+
+    // The top-level task a (possibly child STEP) task belongs to — the one whose re-voice speaks to the user.
+    // Deliveries are rolled up to it so a plan step's upload is known when the coordinator relays the result.
+    private static TaskInfo RootTask(Session session, TaskInfo task)
+    {
+        var t = task;
+        while (t.ParentTaskId is { } pid && session.Tasks.TryGetValue(pid, out var parent)) t = parent;
+        return t;
+    }
 
     // Cancel a task AND any hidden child tasks it spawned (a multi-discipline plan runs each step as a child
     // with its own run loop and token). Cancelling only the named task would leave an in-flight step grinding
@@ -2189,10 +2254,19 @@ public sealed class Orchestrator
         "(a real choice or a missing preference — NEVER to confirm something you could simply do), set " +
         "status = \"question\": put one clear, specific question in \"question\", and the 2–4 most likely short " +
         "answers in \"options\" (the user can also type their own).\n" +
-        "Decide strictly from the conversation above — don't invent a reason to ask.";
+        "- show: the file(s) the USER should receive now — your finished deliverable(s) ONLY, each by its exact " +
+        "name. Leave out scratch and intermediate files (the script you ran, raw data, debug images). Empty if " +
+        "you produced nothing for the user.\n" +
+        "- keep: any file worth SAVING for future conversations as a reusable asset — a brand kit/playbook, a " +
+        "template — each as {file, scope}. scope is \"brand:<slug>\" for a brand kit (\"house\" = your own brand; " +
+        "a slug that doesn't exist yet starts a NEW brand), \"global\" to share with everyone, or a specialist " +
+        "id. Empty unless something is genuinely worth keeping; ordinary working files are not.\n" +
+        "Decide strictly from the conversation above. Only list files that actually exist — never invent a name, " +
+        "a deliverable, or a reason to ask.";
 
     // A strict JSON Schema for the worker's outcome. Passed to the model as Ollama's `format`, so the reply
-    // is GUARANTEED to parse and to carry a real status — the question is a field, never a guess from prose.
+    // is GUARANTEED to parse and to carry a real status — the question (and the show/keep file disposition) are
+    // structured fields, never guessed from prose.
     private static JsonNode OutcomeSchema() => new JsonObject
     {
         ["type"] = "object",
@@ -2201,20 +2275,81 @@ public sealed class Orchestrator
             ["status"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("done", "question") },
             ["question"] = new JsonObject { ["type"] = "string" },
             ["options"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+            ["show"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+            ["keep"] = new JsonObject
+            {
+                ["type"] = "array",
+                ["items"] = new JsonObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JsonObject
+                    {
+                        ["file"] = new JsonObject { ["type"] = "string" },
+                        ["scope"] = new JsonObject { ["type"] = "string" },
+                    },
+                    ["required"] = new JsonArray("file", "scope"),
+                },
+            },
         },
         ["required"] = new JsonArray("status"),
     };
 
-    /// <summary>Force the worker's outcome into a structured verdict instead of parsing it out of free text.
-    /// After the worker has finished, one schema-constrained call classifies the run as finished or
-    /// blocked-on-the-user — the model literally cannot return anything but JSON matching
-    /// <see cref="OutcomeSchema"/>. Returns the structured question when blocked, or null when finished (so
-    /// the worker's own answer is relayed verbatim). Best-effort: any failure falls back to "finished".</summary>
-    private async Task<PendingQuestion?> FinalizeOutcomeAsync(TaskInfo task, CancellationToken ct)
+    /// <summary>What a finished leg resolved to: a blocking question (when the worker can't proceed without the
+    /// user), the file(s) to hand the user now (Show), and the file(s) to persist as reusable assets (Keep).
+    /// <paramref name="ShowRequested"/> records whether the finalize NAMED any file to show at all — even ones
+    /// that turned out not to exist on disk (and so were dropped from Show). That lets the caller catch the
+    /// "claimed a deliverable but nothing actually landed" case and re-voice it honestly instead of celebrating a
+    /// file the user never received.</summary>
+    private sealed record LegOutcome(PendingQuestion? Question, IReadOnlyList<string> Show, IReadOnlyList<KeepItem> Keep, bool ShowRequested = false);
+
+    /// <summary>One file the worker wants saved beyond the conversation, and where (the promote_file scope:
+    /// "brand:&lt;slug&gt;", "global", or a specialist id).</summary>
+    internal sealed record KeepItem(string File, string Scope);
+
+    /// <summary>Pull the show/keep file disposition out of the finalize JSON, keeping only entries that name a
+    /// file actually present in the conversation (<paramref name="presentFiles"/>) — a schema-constrained model
+    /// will still cheerfully name a file it never wrote, and acting on that would upload or "save" nothing. show
+    /// is de-duped; a keep entry needs both a real file and a non-empty scope. Pure, so it can be tested without
+    /// a model.</summary>
+    internal static (IReadOnlyList<string> Show, IReadOnlyList<KeepItem> Keep) ParseDeliverables(
+        JsonElement root, ISet<string> presentFiles)
     {
+        var show = new List<string>();
+        if (root.TryGetProperty("show", out var showEl) && showEl.ValueKind == JsonValueKind.Array)
+            foreach (var f in showEl.EnumerateArray())
+                if (f.ValueKind == JsonValueKind.String && SafeName(f.GetString() ?? "") is { Length: > 0 } n
+                    && presentFiles.Contains(n) && !show.Contains(n, StringComparer.OrdinalIgnoreCase))
+                    show.Add(n);
+
+        var keep = new List<KeepItem>();
+        if (root.TryGetProperty("keep", out var keepEl) && keepEl.ValueKind == JsonValueKind.Array)
+            foreach (var k in keepEl.EnumerateArray())
+            {
+                if (k.ValueKind != JsonValueKind.Object) continue;
+                var file = k.TryGetProperty("file", out var fe) && fe.ValueKind == JsonValueKind.String ? SafeName(fe.GetString() ?? "") : "";
+                var scope = k.TryGetProperty("scope", out var se) && se.ValueKind == JsonValueKind.String ? se.GetString()?.Trim() ?? "" : "";
+                if (file.Length > 0 && scope.Length > 0 && presentFiles.Contains(file))
+                    keep.Add(new KeepItem(file, scope));
+            }
+
+        return (show, keep);
+    }
+
+    /// <summary>Force the worker's outcome into a structured verdict instead of parsing it out of free text.
+    /// After the worker has finished, one schema-constrained call classifies the run: whether it's blocked on the
+    /// user, which finished file(s) to hand over, and which to keep for next time — the model literally cannot
+    /// return anything but JSON matching <see cref="OutcomeSchema"/>. The caller acts on it (the worker no longer
+    /// has to remember to send/promote mid-run). Best-effort: any failure falls back to a plain finish (no
+    /// question, nothing to show/keep) so a real answer is never swallowed.</summary>
+    private async Task<LegOutcome> FinalizeOutcomeAsync(
+        Session session, TaskInfo task, CancellationToken ct, IReadOnlyList<Message>? conversation = null)
+    {
+        var none = new LegOutcome(null, Array.Empty<string>(), Array.Empty<KeepItem>());
         try
         {
-            var convo = new List<Message>(task.Conversation) { Message.System(FinalizeInstruction) };
+            // A single worker classifies from its own transcript; a PLAN coordinator has none of its own, so the
+            // caller passes a synthetic transcript built from the steps' results instead.
+            var convo = new List<Message>(conversation ?? task.Conversation) { Message.System(FinalizeInstruction) };
             var request = new ModelRequest
             {
                 Model = _model,
@@ -2226,7 +2361,7 @@ public sealed class Orchestrator
             };
 
             var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
-            if (string.IsNullOrWhiteSpace(response.Content)) return null;
+            if (string.IsNullOrWhiteSpace(response.Content)) return none;
 
             string content = response.Content.Trim();
             int firstBrace = content.IndexOf('{');
@@ -2238,27 +2373,46 @@ public sealed class Orchestrator
 
             using var doc = JsonDocument.Parse(content);
             var root = doc.RootElement;
+
+            // Only ever offer real, existing conversation files — a model under a schema will still happily name
+            // a file it never wrote, so anything that isn't on disk is dropped rather than acted on.
+            var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (ThreadFilesDir(session) is { } filesDir && Directory.Exists(filesDir))
+                foreach (var f in new DirectoryInfo(filesDir).GetFiles()) present.Add(f.Name);
+            var (show, keep) = ParseDeliverables(root, present);
+
+            // Did the finalize NAME any file to show — before we filter to what's actually on disk? If it did but
+            // none survived (the model "delivered" a file it never wrote), we must NOT relay a success message.
+            bool showRequested = root.TryGetProperty("show", out var rawShow) && rawShow.ValueKind == JsonValueKind.Array
+                && rawShow.EnumerateArray().Any(f => f.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(f.GetString()));
+
             var status = root.TryGetProperty("status", out var s) ? s.GetString() : null;
-            if (!string.Equals(status, "question", StringComparison.OrdinalIgnoreCase)) return null;
+            PendingQuestion? question = null;
+            if (string.Equals(status, "question", StringComparison.OrdinalIgnoreCase))
+            {
+                var q = root.TryGetProperty("question", out var qEl) && qEl.ValueKind == JsonValueKind.String
+                    ? qEl.GetString()?.Trim()
+                    : null;
+                if (!string.IsNullOrWhiteSpace(q)) // said "question" but gave none → treat as finished
+                {
+                    var options = new List<string>();
+                    if (root.TryGetProperty("options", out var optEl) && optEl.ValueKind == JsonValueKind.Array)
+                        foreach (var o in optEl.EnumerateArray())
+                            if (o.ValueKind == JsonValueKind.String && o.GetString()?.Trim() is { Length: > 0 } opt)
+                                options.Add(opt);
+                    Trace($"[worker #{task.Id}] finalize -> QUESTION: {Snip(q!, 160)}");
+                    question = new PendingQuestion(q!, options);
+                }
+            }
 
-            var q = root.TryGetProperty("question", out var qEl) && qEl.ValueKind == JsonValueKind.String
-                ? qEl.GetString()?.Trim()
-                : null;
-            if (string.IsNullOrWhiteSpace(q)) return null; // said "question" but gave none → treat as finished
-
-            var options = new List<string>();
-            if (root.TryGetProperty("options", out var optEl) && optEl.ValueKind == JsonValueKind.Array)
-                foreach (var o in optEl.EnumerateArray())
-                    if (o.ValueKind == JsonValueKind.String && o.GetString()?.Trim() is { Length: > 0 } opt)
-                        options.Add(opt);
-
-            Trace($"[worker #{task.Id}] finalize -> QUESTION: {Snip(q!, 160)}");
-            return new PendingQuestion(q!, options);
+            if (show.Count > 0 || keep.Count > 0)
+                Trace($"[worker #{task.Id}] finalize -> show=[{string.Join(",", show)}] keep=[{string.Join(",", keep.Select(k => $"{k.File}->{k.Scope}"))}]");
+            return new LegOutcome(question, show, keep, showRequested);
         }
         catch (Exception ex)
         {
             Trace($"[worker #{task.Id}] finalize failed ({ex.Message}) — treating as finished");
-            return null; // never let finalization swallow a real answer; relay verbatim
+            return none; // never let finalization swallow a real answer; relay verbatim
         }
     }
 
@@ -2332,8 +2486,158 @@ public sealed class Orchestrator
     private string? BrandsRootDir() =>
         string.IsNullOrEmpty(_workspaceRoot) ? null : Path.Combine(_workspaceRoot, "_buckets", "brand");
 
+    // A shared, cross-thread font cache: <root>/_buckets/_fontcache holds TTF/OTF files a worker downloaded in an
+    // earlier run, mounted read-only into every worker so it can reference one by path in run_python instead of
+    // re-downloading the same font for every new brand. run_python harvests downloaded fonts into it (see
+    // DataScienceCapability), so the cache fills itself. Must live OUTSIDE per-thread file areas — it's global.
+    internal static string? FontCacheDirFor(string? workspaceRoot) =>
+        string.IsNullOrEmpty(workspaceRoot) ? null : Path.Combine(workspaceRoot, "_buckets", "_fontcache");
+
+    private string? FontCacheDir() => FontCacheDirFor(_workspaceRoot);
+
     private string? BrandBucketDir(string slug) =>
         BrandsRootDir() is { } root ? Path.Combine(root, SafeSession(slug)) : null;
+
+    // Reduce a caller-supplied file reference to a safe bare name under the (flat) conversation file area —
+    // the same flattening write_file/send_file use, so a name is resolved identically everywhere and can't
+    // traverse out of the thread's area.
+    private static string SafeName(string name) =>
+        string.Concat(Path.GetFileName((name ?? "").Trim()).Select(c =>
+            Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+
+    /// <summary>Outcome of saving a conversation file into a durable bucket: whether it worked, a human detail
+    /// line, and — for a brand scope — whether this CREATED a brand and which slug, so the caller can tell the
+    /// user a new kit was started.</summary>
+    private sealed record PromoteOutcome(bool Ok, string Detail, bool IsNewBrand, string? BrandSlug);
+
+    /// <summary>Copy a file from this conversation's area into a durable bucket. scope is "global", a specialist
+    /// id, or "brand:&lt;slug&gt;" (a slug whose folder doesn't exist yet starts a new brand — the folder set IS
+    /// the registry). Shared by the promote_file tool and the end-of-leg deliver pass so both resolve names,
+    /// scopes and brand creation identically.</summary>
+    private PromoteOutcome PromoteThreadFile(Session session, string fileName, string scope)
+    {
+        if (ThreadFilesDir(session) is not { } filesDir)
+            return new(false, "Files aren't available in this context, so there's nothing to save.", false, null);
+        if (string.IsNullOrWhiteSpace(fileName)) return new(false, "Which file? Use the name shown by list_files.", false, null);
+        if (string.IsNullOrWhiteSpace(scope)) return new(false, "Where to? Give a specialist id (e.g. branding_designer) or \"global\".", false, null);
+
+        var safe = SafeName(fileName);
+        var source = Path.Combine(filesDir, safe);
+        if (safe.Length == 0 || !File.Exists(source))
+            return new(false, $"There's no file called \"{fileName}\" in this conversation. Check list_files for the exact name.", false, null);
+
+        string? targetDir; string where; bool isNewBrand = false; string? brandSlug = null;
+        if (string.Equals(scope, "global", StringComparison.OrdinalIgnoreCase))
+        {
+            targetDir = GlobalBucketDir();
+            where = "the shared company files";
+        }
+        else if (scope.StartsWith("brand:", StringComparison.OrdinalIgnoreCase))
+        {
+            // brand:<slug> — save into a brand kit, creating that brand if it's new (e.g. a new client).
+            var slug = scope.Substring("brand:".Length).Trim();
+            if (string.IsNullOrEmpty(slug)) return new(false, "Give a brand slug, e.g. scope \"brand:adidas\" (or \"brand:house\").", false, null);
+            targetDir = BrandBucketDir(slug);
+            isNewBrand = targetDir is { } d && !Directory.Exists(d);
+            brandSlug = slug;
+            where = $"the {slug} brand kit{(isNewBrand ? " (new brand)" : "")}";
+        }
+        else if (_personas?.Get(scope) is { } persona)
+        {
+            targetDir = PersonaBucketDir(persona.Id);
+            where = $"the {persona.Name} kit";
+        }
+        else
+        {
+            var ids = _personas is null ? "" : string.Join(", ", _personas.All.Select(p => p.Id));
+            return new(false, $"Unknown scope \"{scope}\". Use \"global\", \"brand:<slug>\" (e.g. brand:adidas), or one of: {ids}.", false, null);
+        }
+        if (targetDir is null) return new(false, "Durable storage isn't available in this context.", false, null);
+
+        try
+        {
+            Directory.CreateDirectory(targetDir);
+            File.Copy(source, Path.Combine(targetDir, safe), overwrite: true);
+            return new(true, $"Saved {safe} to {where}", isNewBrand, brandSlug);
+        }
+        catch (Exception ex) { return new(false, $"Couldn't save {safe}: {ex.Message}", false, null); }
+    }
+
+    // Document types a finalize MISS can safely fall back to delivering — the things a user actually wants handed
+    // over. Deliberately excludes charts/images, scripts, fonts and data inputs (usually intermediate/scratch),
+    // so the fallback delivers the playbook/report, not the build script or a chart it rendered along the way.
+    private static readonly HashSet<string> FallbackDeliverableExts = new(StringComparer.OrdinalIgnoreCase)
+    { ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".md", ".html", ".htm", ".txt", ".zip" };
+
+    // Rendered artifact types a builder (branding_designer) is expected to actually produce — a real deliverable,
+    // not the markdown/scratch it sometimes stops at.
+    private static readonly HashSet<string> RenderedArtifactExts = new(StringComparer.OrdinalIgnoreCase)
+    { ".pdf", ".png", ".jpg", ".jpeg", ".svg", ".gif" };
+
+    /// <summary>Did this leg actually produce a rendered artifact (a PDF/image), vs just describing one? Used to
+    /// catch a builder that "finished" without building — a file of a rendered type that's new or changed since
+    /// the start-of-leg snapshot.</summary>
+    private bool ProducedRenderedArtifact(Session session, IReadOnlyDictionary<string, DateTime> since)
+    {
+        if (ThreadFilesDir(session) is not { } dir || !Directory.Exists(dir)) return false;
+        foreach (var f in new DirectoryInfo(dir).GetFiles())
+        {
+            if (!RenderedArtifactExts.Contains(f.Extension)) continue;
+            if (!since.TryGetValue(f.Name, out var t0) || f.LastWriteTimeUtc > t0) return true; // new or changed this leg
+        }
+        return false;
+    }
+
+    /// <summary>When the finalize names no file to show, the document(s) this leg produced — so a finalize miss
+    /// still delivers something rather than nothing (now the only safety net, with send_file gone). Restricted to
+    /// known document types, and — when a start-of-leg snapshot is given — to files created or changed this leg.</summary>
+    private IReadOnlyList<string> FallbackDeliverables(Session session, IReadOnlyDictionary<string, DateTime>? since)
+    {
+        if (ThreadFilesDir(session) is not { } dir || !Directory.Exists(dir)) return Array.Empty<string>();
+        var outp = new List<string>();
+        foreach (var f in new DirectoryInfo(dir).GetFiles())
+        {
+            if (!FallbackDeliverableExts.Contains(f.Extension)) continue;
+            if (since is not null && since.TryGetValue(f.Name, out var t0) && f.LastWriteTimeUtc <= t0) continue; // unchanged this leg
+            outp.Add(f.Name);
+        }
+        return outp;
+    }
+
+    /// <summary>Act on a finished leg's deliver verdict: upload the finished file(s) the worker marked for the
+    /// user (de-duped against anything it already sent mid-run via <paramref name="sentFiles"/>), and persist
+    /// anything it marked to keep into its bucket. Returns a short note for the re-voice naming what was saved
+    /// (and flagging a newly-created brand kit), or null if nothing was kept.</summary>
+    private string? ApplyDeliverables(Session session, TaskInfo task, LegOutcome outcome, HashSet<string> sentFiles)
+    {
+        if (ThreadFilesDir(session) is { } filesDir)
+            foreach (var name in outcome.Show)
+            {
+                var path = Path.Combine(filesDir, name);
+                if (!File.Exists(path)) continue;
+                if (!sentFiles.Add(Path.GetFullPath(path))) continue; // already sent this leg — don't double-upload
+                session.Append("file", Json(new { path, name, caption = (string?)null }));
+                RootTask(session, task).DeliveredFiles.Add(name); // truth for the re-voice
+                Trace($"[worker #{task.Id}] delivered {name}");
+            }
+
+        var saved = new List<string>();
+        var newBrands = new List<string>();
+        foreach (var item in outcome.Keep)
+        {
+            var res = PromoteThreadFile(session, item.File, item.Scope);
+            if (!res.Ok) { Trace($"[worker #{task.Id}] keep skipped ({item.File} -> {item.Scope}): {res.Detail}"); continue; }
+            saved.Add(res.Detail);
+            if (res.IsNewBrand && res.BrandSlug is { } slug) newBrands.Add(slug);
+        }
+        if (saved.Count == 0) return null;
+
+        var note = "\n\nYou also saved for future use: " + string.Join("; ", saved) + ".";
+        if (newBrands.Count > 0)
+            note += $" That started a NEW brand kit ({string.Join(", ", newBrands)}) — mention you've saved it and that they can rename it or tweak it if they'd like.";
+        note += " Mention briefly what was saved; don't mention buckets or internals.";
+        return note;
+    }
 
     /// <summary>The brands currently managed (the slugs of existing brand buckets). The filesystem is the
     /// registry — no separate store to drift. "house" is implied even before its folder exists.</summary>
@@ -2348,6 +2652,50 @@ public sealed class Orchestrator
                     slugs.Add(name);
             }
         return slugs;
+    }
+
+    /// <summary>Build the tools for ONE persona block. Base blocks (web/read/files/memory/shell) are built here
+    /// from the runtime deps; anything else is treated as a capability FUNCTION and resolved to its connected
+    /// integration's tools. This is what makes a persona a tight, composable bundle instead of an everything-set.</summary>
+    private IEnumerable<AgentTool> BuildBlock(string block, Session session, TaskInfo task, IModelProvider provider)
+    {
+        switch (block.Trim().ToLowerInvariant())
+        {
+            case "web":
+                return new[] { WebResearch.SearchTool(), WebResearch.PageAnswerTool(provider, _model) };
+
+            case "read": // read-only file access
+            {
+                var list = new List<AgentTool> { FileTools.ReadFileTool(), FileTools.SummaryTool(provider, _model) };
+                if (ThreadFilesDir(session) is { } d) { Directory.CreateDirectory(d); list.Add(FileTools.ListFilesTool(d, BucketMounts(task))); }
+                return list;
+            }
+
+            case "files": // read + author/revise files in this conversation
+            {
+                var list = new List<AgentTool> { FileTools.ReadFileTool(), FileTools.SummaryTool(provider, _model) };
+                if (ThreadFilesDir(session) is { } d)
+                {
+                    Directory.CreateDirectory(d);
+                    list.Add(FileTools.WriteFileTool(d));
+                    list.Add(FileTools.EditFileTool(d));
+                    list.Add(FileTools.FindInFileTool(d));
+                    list.Add(FileTools.ListFilesTool(d, BucketMounts(task)));
+                }
+                return list;
+            }
+
+            case "memory": // personal memory when a user is in scope (Slack), else project memory
+                return task.UserScope is { Length: > 0 } scope
+                    ? new[] { MemoryTools.SearchPersonalTool(_memory, scope, task.PersonalMemoryEnabled), MemoryTools.SetPersonalTool(_memory, scope, task.PersonalMemoryEnabled) }
+                    : new[] { MemoryTools.SearchTool(_memory, task.Project), MemoryTools.SetTool(_memory, task.Project) };
+
+            case "shell":
+                return new[] { ShellTool.Create() };
+
+            default: // a capability function (project_management, data, images, …) → the connected integration
+                return _capabilities?.BuildFor(new[] { block }, _integrationConfig, task) ?? (IReadOnlyList<AgentTool>)Array.Empty<AgentTool>();
+        }
     }
 
     /// <summary>The read-only buckets a given task's worker can see: the global area always, plus a persona kit.
@@ -2379,6 +2727,12 @@ public sealed class Orchestrator
             var label = _personas?.Get(pid)?.Name is { Length: > 0 } n ? $"{n} kit" : $"{pid} kit";
             mounts.Add(new FileTools.FileMount(label, pdir));
         }
+
+        // Shared font cache — only worth surfacing once it actually holds something, so an empty cache doesn't
+        // clutter list_files. Once a run downloads a font (harvested by run_python) it shows up here for reuse.
+        if (FontCacheDir() is { } fc && Directory.Exists(fc) && new DirectoryInfo(fc).EnumerateFiles().Any())
+            mounts.Add(new FileTools.FileMount("Cached fonts (reuse instead of re-downloading)", fc));
+
         return mounts;
     }
 
