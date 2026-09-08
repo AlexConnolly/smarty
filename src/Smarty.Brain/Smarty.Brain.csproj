@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Smarty.Brain</RootNamespace>
+    <AssemblyName>Smarty.Brain</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The graph itself is pure; the recall and reconciliation layers need a model, because loose resolution IS
+         judgement. Keeping them in one library means both can be tested against a scripted provider. -->
+    <ProjectReference Include="..\Smarty.Agents\Smarty.Agents.csproj" />
+  </ItemGroup>
+
+</Project>
