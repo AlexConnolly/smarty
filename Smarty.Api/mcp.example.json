@@ -1,0 +1,41 @@
+// MCP servers — tools that live in another process, offered to Smarty's workers as if they were built in.
+//
+// Copy this file to data/mcp.json (that folder is gitignored, so it can hold real paths and secrets) and edit.
+// No data/mcp.json means MCP is simply off. Override the location with Mcp__ConfigPath.
+//
+// Each entry is one server, started as a child process and spoken to over stdio:
+//   command                 the executable ("node", "npx", "python", a full path)
+//   args                    its arguments; %ENV_VARS% are expanded
+//   env                     extra environment for the child — where a server's credentials belong
+//   cwd                     working directory (optional)
+//   functions               the persona capabilities this server answers, e.g. ["browser"]
+//   prefix                  tool name prefix (defaults to a slug of the entry's name)
+//   tools                   an allow-list of the server's own tool names (omit for all of them)
+//   promptHint              how a worker should use it, woven into the prompt when it's connected
+//   disabled                true to keep the entry but not start it
+//   startupTimeoutSeconds   how long to wait for the handshake (default 30)
+//   callTimeoutSeconds      how long one tool call may take (default 120)
+//   maxResultChars          cap on the text one result may add to the transcript (default 20000)
+//
+// Check what connected at http://localhost:5179/api/control/mcp — it lists each server, its tools, and the
+// reason for any that didn't come up.
+{
+  "mcpServers": {
+    "chrome": {
+      "command": "node",
+      "args": ["%USERPROFILE%\\open-chrome-mcp\\server\\src\\index.js"],
+      "env": {
+        "OPEN_CHROME_MCP_PORT": "8777"
+      },
+      "functions": ["browser"],
+      "promptHint": "You can drive the user's actual Chrome (tools prefixed chrome_). Call chrome_tabs_context first — it is what makes tabs addressable, and nothing else works before it. Then chrome_navigate to a URL and chrome_read_page to read it: that returns [ref] lines, and the refs are what chrome_click, chrome_form_input and chrome_scroll take. Refs go stale on navigation, so read again after the page changes. The browser is the ONLY way you reach the web, so use it for reading pages too — including search results. Close tabs you opened with chrome_tabs_close.",
+      "startupTimeoutSeconds": 30
+    },
+
+    "example-disabled-server": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "%USERPROFILE%\\Documents"],
+      "disabled": true
+    }
+  }
+}

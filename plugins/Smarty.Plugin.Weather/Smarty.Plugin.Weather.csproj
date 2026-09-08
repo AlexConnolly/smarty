@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Smarty.Plugin.Weather</RootNamespace>
+    <AssemblyName>Smarty.Plugin.Weather</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The contract only. A plugin is packaged as its own DLL plus whatever it needs; Smarty.Plugins is
+         resolved from the host at load time, so shipping a copy of it would be a second, incompatible
+         definition of IPlugin. -->
+    <ProjectReference Include="..\..\src\Smarty.Plugins\Smarty.Plugins.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

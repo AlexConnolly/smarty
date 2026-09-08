@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Smarty.Plugin.Roborock</RootNamespace>
+    <AssemblyName>Smarty.Plugin.Roborock</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Shipped inside the plugin's zip and loaded from its own folder. This is the case a plugin exists for:
+         Smarty itself has no MQTT client and gains no dependency on one. -->
+    <PackageReference Include="MQTTnet" Version="4.3.7.1207" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Resolved from the host at load time, so it must NOT be copied into the package. -->
+    <ProjectReference Include="..\..\src\Smarty.Plugins\Smarty.Plugins.csproj" Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The protocol pieces are implementation detail, and they are also the part most worth testing:
+         the frame codec, the signature, the broker credentials and the room mapping. -->
+    <InternalsVisibleTo Include="Smarty.Agents.Tests" />
+  </ItemGroup>
+
+</Project>

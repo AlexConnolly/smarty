@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Smarty.Plugins</RootNamespace>
+    <AssemblyName>Smarty.Plugins</AssemblyName>
+    <!-- The contract's version, and it is load-bearing: a package records which one it was compiled against,
+         and the host refuses one built against a contract newer than its own with a message that says so.
+         Bump the minor when something is ADDED; bump the major if anything is removed or changed, because
+         that is a package that can no longer be loaded rather than merely a stale host. 2.0 replaced flat
+         configuration keys with setup stages. -->
+    <Version>2.1.0</Version>
+  </PropertyGroup>
+
+</Project>
