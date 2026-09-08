@@ -1,0 +1,65 @@
+[
+ {
+  "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "uuid": "endpoint-59e1bfe8-dcfd-4902-8e59-8e9585cfab4e",
+  "object": "model",
+  "created": 0,
+  "type": "chat",
+  "running": false,
+  "display_name": "Deepseek V4 Flash 0731",
+  "organization": "Deepseek AI",
+  "context_length": 1048576,
+  "config": {
+   "chat_template": null,
+   "stop": [
+    "<\u00ef\u00bd\u0153end\u00e2\u2013\udc81of\u00e2\u2013\udc81sentence\u00ef\u00bd\u0153>"
+   ],
+   "bos_token": "<\u00ef\u00bd\u0153begin\u00e2\u2013\udc81of\u00e2\u2013\udc81sentence\u00ef\u00bd\u0153>",
+   "eos_token": "<\u00ef\u00bd\u0153end\u00e2\u2013\udc81of\u00e2\u2013\udc81sentence\u00ef\u00bd\u0153>"
+  },
+  "pricing": {
+   "hourly": 0,
+   "input": 0.13999999999999999,
+   "output": 0.27999999999999997,
+   "base": 0,
+   "finetune": 0,
+   "cached_input": 0.030000000000000002,
+   "image_pixel": 0,
+   "transcribe": 0,
+   "image": 0,
+   "video": 0
+  }
+ },
+ {
+  "id": "google/gemma-3n-E4B-it",
+  "uuid": "endpoint-290b90f1-cdb9-46c1-a919-9a73822375c3",
+  "object": "model",
+  "created": 1750955040,
+  "type": "chat",
+  "running": false,
+  "display_name": "Gemma 3N E4B Instruct",
+  "organization": "Google",
+  "link": "https://huggingface.co/google/gemma-3n-E4B-it",
+  "license": "gemma",
+  "context_length": 32768,
+  "config": {
+   "chat_template": null,
+   "stop": [
+    "<eos>"
+   ],
+   "bos_token": "<bos>",
+   "eos_token": "<eos>"
+  },
+  "pricing": {
+   "hourly": 0,
+   "input": 0.060000000000000005,
+   "output": 0.12000000000000001,
+   "base": 0,
+   "finetune": 0,
+   "image_pixel": 0,
+   "transcribe": 0,
+   "image": 0,
+   "video": 0
+  }
+ }
+]

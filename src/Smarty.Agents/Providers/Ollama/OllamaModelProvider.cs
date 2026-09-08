@@ -295,7 +295,13 @@ public sealed class OllamaModelProvider : IModelProvider
         if (request.ResponseFormat is { } format)
             payload["format"] = JsonNode.Parse(format.ToJsonString());
 
-        var options = new JsonObject { ["repeat_last_n"] = 256, ["temperature"] = 0.0, ["num_ctx"] = 12288 };
+        // Temperature is greedy unless a loop-recovery retry asked for noise — see ModelRequest.Temperature.
+        var options = new JsonObject
+        {
+            ["repeat_last_n"] = 256,
+            ["temperature"] = request.Temperature is { } t && t > 0 ? t : 0.0,
+            ["num_ctx"] = 12288,
+        };
         if (request.RepeatPenalty is { } rp && rp > 0)
             options["repeat_penalty"] = rp;
         if (request.MaxOutputTokens is { } np && np > 0)
@@ -341,39 +347,5 @@ public sealed class OllamaModelProvider : IModelProvider
         return obj;
     }
 
-    private static JsonObject SerializeTool(AgentTool tool)
-    {
-        var properties = new JsonObject();
-        var required = new JsonArray();
-
-        foreach (var p in tool.Parameters)
-        {
-            properties[p.Name] = new JsonObject
-            {
-                ["type"] = p.Type,
-                ["description"] = p.Description,
-            };
-            if (p.Required)
-                required.Add(p.Name);
-        }
-
-        var parameters = new JsonObject
-        {
-            ["type"] = "object",
-            ["properties"] = properties,
-        };
-        if (required.Count > 0)
-            parameters["required"] = required;
-
-        return new JsonObject
-        {
-            ["type"] = "function",
-            ["function"] = new JsonObject
-            {
-                ["name"] = tool.Name,
-                ["description"] = tool.Description,
-                ["parameters"] = parameters,
-            },
-        };
-    }
+    private static JsonObject SerializeTool(AgentTool tool) => ToolSchema.Function(tool);
 }

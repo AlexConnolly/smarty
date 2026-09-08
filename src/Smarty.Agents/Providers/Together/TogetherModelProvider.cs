@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -33,6 +33,7 @@ public sealed class TogetherModelProvider : IModelProvider
         }
 
         var payload = BuildPayload(request);
+        DumpPrompt(payload);
 
         // The throttle/outage arrives BEFORE any token streams, so retrying here is safe (nothing has been
         // yielded yet) and far cheaper than throwing — a thrown 429 makes the orchestrator restart the whole
@@ -54,6 +55,8 @@ public sealed class TogetherModelProvider : IModelProvider
             var toolCallBuilders = new Dictionary<int, ToolCallBuilder>();
             int promptEvalCount = 0;
             int evalCount = 0;
+            int cachedCount = 0;      // input tokens served from the provider's prompt cache
+            int reasoningCount = 0;   // output tokens spent thinking rather than answering
 
             var recent = new StringBuilder();
             int sinceCheck = 0;
@@ -171,6 +174,16 @@ public sealed class TogetherModelProvider : IModelProvider
                                 promptEvalCount = ptEl.GetInt32();
                             if (usageEl.TryGetProperty("completion_tokens", out var ctEl) && ctEl.ValueKind == JsonValueKind.Number)
                                 evalCount = ctEl.GetInt32();
+
+                            // Cache hits and thinking tokens, which the billing actually turns on: cached input is
+                            // ~4x cheaper, and reasoning tokens are charged as output even when the user never
+                            // sees them.
+                            if (usageEl.TryGetProperty("prompt_tokens_details", out var pd) && pd.ValueKind == JsonValueKind.Object
+                                && pd.TryGetProperty("cached_tokens", out var cachedEl) && cachedEl.ValueKind == JsonValueKind.Number)
+                                cachedCount = cachedEl.GetInt32();
+                            if (usageEl.TryGetProperty("completion_tokens_details", out var cd) && cd.ValueKind == JsonValueKind.Object
+                                && cd.TryGetProperty("reasoning_tokens", out var reasonEl) && reasonEl.ValueKind == JsonValueKind.Number)
+                                reasoningCount = reasonEl.GetInt32();
                         }
                     }
                 }
@@ -244,6 +257,8 @@ public sealed class TogetherModelProvider : IModelProvider
                 Finish = finish,
                 InputTokens = promptEvalCount,
                 OutputTokens = evalCount,
+                CachedInputTokens = cachedCount,
+                ReasoningTokens = reasoningCount,
             };
             yield return new ModelStreamEvent.Completed(response);
         }
@@ -280,6 +295,12 @@ public sealed class TogetherModelProvider : IModelProvider
     // re-sent), and only the pre-stream response is retried — never a stream that has already emitted tokens.
     private const int MaxSendAttempts = 4;
 
+    /// <summary>
+    /// Models that answered 400 to <c>reasoning_effort</c>. Remembered per model so the round trip is paid once,
+    /// the same way the Ollama provider remembers which models reject <c>think</c>.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> NoEffortModels = new();
+
     private async Task<HttpResponseMessage> SendWithRetryAsync(JsonObject payload, CancellationToken ct)
     {
         for (int attempt = 1; ; attempt++)
@@ -294,7 +315,28 @@ public sealed class TogetherModelProvider : IModelProvider
             if (response.IsSuccessStatusCode) return response;
 
             int status = (int)response.StatusCode;
-            bool transient = status is 429 or 503;
+            // 500 belongs here as much as 503 does. It was missing, and a plain "Internal server error" from
+            // Together — which it returns often enough under load — killed the task outright on the first
+            // attempt: a five-minute research job lost in one second to somebody else's bad minute. Their 5xx is
+            // their server failing, and the same request usually works moments later. 502/504 are their edge
+            // saying the same thing. A 4xx stays fatal: that's our request being wrong, and repeating it just
+            // repeats the mistake.
+            // A model that doesn't take reasoning_effort says so with a 400. Drop it, remember that, and go
+            // again — a leg must not die because we asked a model to think less and it had never heard of the
+            // idea. Same shape as the Ollama provider's handling of `think`.
+            if (status == 400 && payload.ContainsKey("reasoning_effort"))
+            {
+                var complaint = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                if (complaint.Contains("reasoning_effort", StringComparison.OrdinalIgnoreCase))
+                {
+                    NoEffortModels[payload["model"]?.GetValue<string>() ?? ""] = true;
+                    payload.Remove("reasoning_effort");
+                    response.Dispose();
+                    continue;
+                }
+            }
+
+            bool transient = status is 429 or 500 or 502 or 503 or 504;
             if (!transient || attempt >= MaxSendAttempts)
             {
                 var error = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
@@ -363,7 +405,22 @@ public sealed class TogetherModelProvider : IModelProvider
         if (request.RepeatPenalty is { } rp && rp > 0)
             payload["repetition_penalty"] = rp;
 
-        payload["temperature"] = 0.0;
+        // Greedy by default — deterministic, and what reliable tool-calling wants. Raised only by a retry that
+        // is recovering from a detected loop, because re-running a collapsed context greedily reproduces the
+        // collapse exactly.
+        payload["temperature"] = request.Temperature is { } t && t > 0 ? t : 0.0;
+
+        // Thinking, at last actually controlled here.
+        //
+        // Think was honoured only by the Ollama provider, so every `Think = false` in the system — the re-voice,
+        // the one-word classifications, the "keep it fast" calls — was a comment rather than an instruction on
+        // any model reached through Together, and reasoning ran at full length on all of them.
+        //
+        // Sent ONLY when thinking was declined. There is no off switch on these models, just a floor ("low"),
+        // and staying silent when reasoning IS wanted leaves the deployment's own default alone — so this
+        // changes exactly the calls that already said they didn't need it.
+        if (!request.Think && !NoEffortModels.ContainsKey(request.Model))
+            payload["reasoning_effort"] = "low";
 
         return payload;
     }
@@ -412,40 +469,34 @@ public sealed class TogetherModelProvider : IModelProvider
         return obj;
     }
 
-    private static JsonObject SerializeTool(AgentTool tool)
+    private static JsonObject SerializeTool(AgentTool tool) => ToolSchema.Function(tool);
+
+    private static int _dumpSeq;
+
+    /// <summary>
+    /// Write each outgoing prompt to disk when <c>SMARTY_DUMP_PROMPTS</c> is set, so consecutive requests can be
+    /// diffed to find where the cacheable prefix breaks.
+    /// </summary>
+    /// <remarks>
+    /// Prompt caching is prefix matching: the provider reuses the longest identical head of the prompt, so a
+    /// single volatile byte near the front costs the cache for everything behind it. That failure is invisible
+    /// from the outside — you just see cached_tokens stay at zero — and impossible to reason about reliably in a
+    /// prompt assembled from a dozen contributing parts. So: dump, diff, fix.
+    /// </remarks>
+    private static void DumpPrompt(JsonObject payload)
     {
-        var properties = new JsonObject();
-        var required = new JsonArray();
-
-        foreach (var p in tool.Parameters)
+        if (Environment.GetEnvironmentVariable("SMARTY_DUMP_PROMPTS") is not "1") return;
+        try
         {
-            properties[p.Name] = new JsonObject
-            {
-                ["type"] = p.Type,
-                ["description"] = p.Description,
-            };
-            if (p.Required)
-                required.Add(p.Name);
+            var dir = Path.Combine(Path.GetTempPath(), "smarty-prompts");
+            Directory.CreateDirectory(dir);
+            int seq = Interlocked.Increment(ref _dumpSeq);
+            // A unique name per request: concurrent calls (the planner and the worker overlap) were colliding on
+            // the same path and losing all but one dump.
+            var file = $"req-{seq:D4}-{DateTime.Now:HHmmss-fff}-{Guid.NewGuid():N}".Substring(0, 34) + ".json";
+            File.WriteAllText(Path.Combine(dir, file), payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
         }
-
-        var parameters = new JsonObject
-        {
-            ["type"] = "object",
-            ["properties"] = properties,
-        };
-        if (required.Count > 0)
-            parameters["required"] = required;
-
-        return new JsonObject
-        {
-            ["type"] = "function",
-            ["function"] = new JsonObject
-            {
-                ["name"] = tool.Name,
-                ["description"] = tool.Description,
-                ["parameters"] = parameters,
-            },
-        };
+        catch { /* diagnostics must never break a request */ }
     }
 
     private sealed class ToolCallBuilder

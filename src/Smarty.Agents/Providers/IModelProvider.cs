@@ -35,6 +35,18 @@ public sealed class ModelRequest
     /// <summary>Repetition penalty to discourage loops at the sampling level.</summary>
     public double? RepeatPenalty { get; init; }
 
+    /// <summary>
+    /// Sampling temperature. Null means the provider's default of 0 — greedy, deterministic, which is what
+    /// tool-calling wants and what nearly every turn should use.
+    /// <para>
+    /// It exists to be raised on a RETRY AFTER A DETECTED LOOP, and for nothing else. At temperature 0 the next
+    /// token is the argmax, so re-running a context that just collapsed into "crimson crimson crimson" produces
+    /// that same collapse again, token for token. A retry that changes nothing about the sampling is not a
+    /// retry. A little noise is the only thing that makes the second attempt a genuinely different attempt.
+    /// </para>
+    /// </summary>
+    public double? Temperature { get; init; }
+
     /// <summary>Abort the turn if it runs longer than this (cuts off a stuck generation).</summary>
     public TimeSpan? TurnTimeout { get; init; }
 
@@ -68,6 +80,20 @@ public sealed class ModelResponse
 
     /// <summary>Output tokens generated for this request.</summary>
     public int OutputTokens { get; init; }
+
+    /// <summary>
+    /// Input tokens the provider served from its prompt cache. Billed far cheaper than fresh input (Together:
+    /// $0.03 vs $0.14 per million), so a cost figure that ignores them overstates spend on exactly the workloads
+    /// that repeat a long prefix — which is every agent loop.
+    /// </summary>
+    public int CachedInputTokens { get; init; }
+
+    /// <summary>
+    /// Output tokens spent on chain-of-thought rather than the answer. Billed as output. Worth surfacing
+    /// separately because a model that puts its whole reply in the thinking channel is paying full price for
+    /// something the user may never see.
+    /// </summary>
+    public int ReasoningTokens { get; init; }
 
     public bool HasToolCalls => ToolCalls.Count > 0;
 
