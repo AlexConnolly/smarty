@@ -33,16 +33,8 @@ public sealed class TaskPlanner
     {
     }
 
-    private static ModelSpec ResolveModelSpec(string model, string ollamaBaseUrl)
-    {
-        string apiKey = Environment.GetEnvironmentVariable("TOGETHER_API_KEY") 
-            ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY") 
-            ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY") ?? "";
-        string? togetherBaseUrl = (ollamaBaseUrl.Contains("localhost") || ollamaBaseUrl.Contains("127.0.0.1")) ? null : ollamaBaseUrl;
-        return model.Contains("/") || (ollamaBaseUrl != null && ollamaBaseUrl.Contains("together"))
-            ? new ModelSpec("together", model, togetherBaseUrl)
-            : ModelSpec.Ollama(model, ollamaBaseUrl);
-    }
+    private static ModelSpec ResolveModelSpec(string model, string ollamaBaseUrl) =>
+        ModelRouting.Spec(model, ollamaBaseUrl);
 
     private static JsonNode ComplexitySchema() => new JsonObject
     {
@@ -116,11 +108,16 @@ public sealed class TaskPlanner
                 Message.User(
                     "Before this task is carried out, decide if ONE clarifying question is genuinely needed. Ask " +
                     "ONLY when a specific detail would MATERIALLY change the result — a definition, a scope, or a " +
-                    "preference — that is NOT answered by the task text or the known facts below AND has no safe " +
-                    "default. Do NOT ask to confirm something you could just do, and NEVER ask about taste or " +
-                    "aesthetics. If it's clear enough to proceed, set needs=false. When you do ask, give one sharp " +
-                    "question and 2–4 likely short answers.\n\n" +
-                    "Known facts:\n" + (string.IsNullOrWhiteSpace(knownFacts) ? "(none)" : knownFacts) +
+                    "preference — that is NOT answered by the task text or what's already available below AND has " +
+                    "no safe default. Do NOT ask to confirm something you could just do, and NEVER ask about " +
+                    "taste or aesthetics. If it's clear enough to proceed, set needs=false. When you do ask, give " +
+                    "one sharp question and 2–4 likely short answers.\n\n" +
+                    // The distinction that decides it: this is not background reading, it is what the worker will
+                    // already have in hand. Anything answered here must not be asked about — that is what makes a
+                    // specific request go straight through while a vague one gets one question.
+                    "ALREADY AVAILABLE to the worker (memory, the project and what's known about it, its lists, " +
+                    "the files in this conversation). Treat all of it as known — never ask for anything it " +
+                    "answers:\n" + (string.IsNullOrWhiteSpace(knownFacts) ? "(nothing)" : knownFacts) +
                     "\n\nTask:\n" + task),
             };
             var request = new ModelRequest
@@ -152,15 +149,15 @@ public sealed class TaskPlanner
         "You are the PLANNING step for a capable executor agent that will carry out a task afterwards with full " +
         "tools. Your job is to produce a clear, concrete, ordered PLAN — NOT to do the task or write the final " +
         "deliverable.\n" +
-        "If you have recon tools (web_search / get_page_answer), you MAY use a couple of quick lookups ONLY to " +
-        "scope unknowns you need in order to plan well — do not carry out the task itself. Then output the plan as " +
+        "If you have recon tools, you MAY use a couple of quick lookups ONLY to scope unknowns you need in order " +
+        "to plan well — do not carry out the task itself. Then output the plan as " +
         "3–7 short, concrete numbered steps the executor should follow, ending with a single \"Done when: …\" line " +
         "that defines success. Be specific and lean — no preamble, no fluff.";
 
     /// <summary>Produce a plan for a complex task. Runs a focused agent (with any recon tools) whose final
     /// answer IS the plan. Returns null if it couldn't produce one — the executor then just proceeds unplanned,
     /// exactly as today.</summary>
-    public async Task<string?> PlanAsync(string task, CancellationToken ct)
+    public async Task<string?> PlanAsync(string task, CancellationToken ct, string guide = "")
     {
         try
         {
@@ -174,7 +171,7 @@ public sealed class TaskPlanner
                 MaxIterations = tools.Count > 0 ? 5 : 2, // room for a little recon, never the whole job
             };
             var plan = await new SmartyAgent(input, _registry).Answer(
-                "Plan this task (do not carry it out):\n" + task, ct).ConfigureAwait(false);
+                "Plan this task (do not carry it out):\n" + task + guide, ct).ConfigureAwait(false);
             return string.IsNullOrWhiteSpace(plan) ? null : plan.Trim();
         }
         catch { return null; }
@@ -306,7 +303,7 @@ public sealed class TaskPlanner
     /// <summary>Break a cross-discipline task into an ordered list of single-persona steps. Each step names the
     /// persona, what it must do (self-contained — it can read files earlier steps left in the shared area), and
     /// the concrete artifact it hands on. Returns null if it couldn't produce a usable plan.</summary>
-    public async Task<WorkPlan?> PlanStepsAsync(string task, string roster, CancellationToken ct)
+    public async Task<WorkPlan?> PlanStepsAsync(string task, string roster, CancellationToken ct, string guide = "")
     {
         try
         {
@@ -327,7 +324,7 @@ public sealed class TaskPlanner
                     "are independent → wave 0 both; writing the report needs both → wave 1. Only force a step into a " +
                     "later wave when it genuinely depends on an earlier one — default to the same wave when in doubt, " +
                     "so independent work isn't needlessly serialised. No preamble.\n\n" +
-                    "Roster:\n" + roster + "\n\nTask:\n" + task),
+                    "Roster:\n" + roster + "\n\nTask:\n" + task + guide),
             };
             var request = new ModelRequest
             {

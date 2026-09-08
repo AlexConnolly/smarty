@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using Smarty.Agents;
 using Smarty.Api;
@@ -131,27 +131,6 @@ public class ControlTests
         Assert.Equal("waiting", hub.Conversation("c2")!.Status);
         Assert.Equal("waiting", hub.RunsFor("c2").Single().Status);
     }
-
-    // ---- MemoryStore enumeration + retire ----
-
-    [Fact]
-    public void Memory_enumerates_all_scopes_and_retires()
-    {
-        var path = Path.Combine(TempDir(), "memory.json");
-        var mem = new MemoryStore(path, Json);
-        mem.Set("location", "home", "London", null);
-        mem.Set("destination", "trip", "Lisbon", null, "holiday");
-
-        var all = mem.AllActive();
-        Assert.Equal(2, all.Count);
-
-        var london = all.First(f => f.Key == "home");
-        Assert.True(mem.Retire(london.Id));
-        Assert.DoesNotContain(mem.AllActive(), f => f.Id == london.Id);
-        Assert.False(mem.Retire("does-not-exist"));
-    }
-
-    // ---- ControlBuckets: sandboxing ----
 
     [Fact]
     public async Task Buckets_save_list_and_reject_traversal()

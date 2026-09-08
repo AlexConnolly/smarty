@@ -35,16 +35,8 @@ public sealed class TaskWatchdog
     {
     }
 
-    private static ModelSpec ResolveModelSpec(string model, string ollamaBaseUrl)
-    {
-        string apiKey = Environment.GetEnvironmentVariable("TOGETHER_API_KEY") 
-            ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY") 
-            ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY") ?? "";
-        string? togetherBaseUrl = (ollamaBaseUrl.Contains("localhost") || ollamaBaseUrl.Contains("127.0.0.1")) ? null : ollamaBaseUrl;
-        return model.Contains("/") || (ollamaBaseUrl != null && ollamaBaseUrl.Contains("together"))
-            ? new ModelSpec("together", model, togetherBaseUrl)
-            : ModelSpec.Ollama(model, ollamaBaseUrl);
-    }
+    private static ModelSpec ResolveModelSpec(string model, string ollamaBaseUrl) =>
+        ModelRouting.Spec(model, ollamaBaseUrl);
 
     // Failure markers our tools emit (bot-walls, fetch errors, empty results). Used for the cheap trip signal.
     private static readonly string[] FailureMarkers =

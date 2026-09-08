@@ -17,11 +17,17 @@ namespace Smarty.Agents;
 public static class FileTools
 {
     private const int DefaultWindow = 4000; // chars returned by one read_file call when no limit is given
+
+    /// <summary>The most one call may return, however large a limit is asked for.</summary>
+    private const int MaxWindow = 6000;
     private const int SummaryBudgetChars = 24000; // text fed to a single summary call (~6k tokens, fits num_ctx)
 
     // ---- read_file ----------------------------------------------------------------------------
 
-    public static AgentTool ReadFileTool(string name = "read_file")
+    /// <param name="rootDir">Where a bare file name is looked for, as file_summary does. Without it only absolute
+    /// paths resolve, which is no use for a file the job was handed by name — which is how every file here is
+    /// referred to.</param>
+    public static AgentTool ReadFileTool(string name = "read_file", string? rootDir = null)
     {
         return new AgentTool(
             name,
@@ -33,12 +39,21 @@ public static class FileTools
                 ToolParameter.Integer("offset", "Character offset to start reading from. Defaults to 0.", required: false),
                 ToolParameter.Integer("limit", $"How many characters to return. Defaults to {DefaultWindow}.", required: false),
             },
-            (args, _) => Task.FromResult(ReadFile(args)));
+            (args, _) => Task.FromResult(ReadFile(args, rootDir)));
     }
 
-    private static ToolOutput ReadFile(ToolCallArguments args)
+    /// <summary>Newlines in a stretch of text — for reporting a window's position in lines rather than bytes.</summary>
+    private static int CountLines(string text, int from, int to)
     {
-        string path = args.GetString("path").Trim();
+        int count = 0;
+        for (int i = from; i < to && i < text.Length; i++)
+            if (text[i] == '\n') count++;
+        return count;
+    }
+
+    private static ToolOutput ReadFile(ToolCallArguments args, string? rootDir = null)
+    {
+        string path = ResolvePath(args.GetString("path").Trim(), rootDir);
         var extracted = FileText.Extract(path);
         if (!extracted.Ok)
             // A wrong format / scanned PDF won't read on a retry — route the model elsewhere rather than loop.
@@ -49,37 +64,74 @@ public static class FileTools
             return ToolOutput.Ok($"'{Path.GetFileName(path)}' is empty.");
 
         int offset = Math.Clamp(args.GetInt("offset", 0), 0, text.Length);
-        int limit = Math.Clamp(args.GetInt("limit", DefaultWindow), 1, 50_000);
+        // Ceiling, not just a default. A limit the caller can raise to fifty thousand is not a limit — that is
+        // twelve thousand tokens from one call, and the whole point of a window is that the window is small.
+        int limit = Math.Clamp(args.GetInt("limit", DefaultWindow), 1, MaxWindow);
         int take = Math.Min(limit, text.Length - offset);
         string window = text.Substring(offset, take);
         int end = offset + take;
 
-        var header = new StringBuilder($"{Path.GetFileName(path)} — characters {offset}–{end} of {text.Length}");
+        // Say what it IS, not just how many characters came back. "week_of_dinners.pdf (PDF)" tells the model it
+        // is reading extracted prose; a .cs with no label reads like the file itself. And for anything text-like —
+        // which is to say code and config — report LINES, because that is the unit someone navigates source in
+        // and the unit find_in_file answers with.
+        var lines = extracted.Kind == "text"
+            ? $", lines {CountLines(text, 0, offset) + 1}–{CountLines(text, 0, end)}"
+            : "";
+        var kind = extracted.Kind == "text" ? "" : $" ({extracted.Kind})";
+
+        var header = new StringBuilder(
+            $"{Path.GetFileName(path)}{kind} — characters {offset}–{end} of {text.Length}{lines}");
         if (end < text.Length)
-            header.Append($" (more remains; call read_file again with offset={end} to continue)");
+            // Deliberately not "call again with offset=… to continue". That invites reading a whole file a window
+            // at a time, which puts every byte of it into the conversation anyway and defeats the window entirely.
+            // Searching is nearly always the actual intent: someone wanting one function, one error, one price.
+            // Paging is still available and still says where it stopped — it just stops being the suggestion.
+            header.Append($" ({text.Length - end} characters not shown. If you are looking for something specific, " +
+                          $"find_in_file will locate it; read_file with offset={end} continues from here if you " +
+                          "genuinely need the next stretch.)");
         return ToolOutput.Ok($"{header}\n\n{window}");
     }
 
     // ---- file_summary -------------------------------------------------------------------------
 
-    public static AgentTool SummaryTool(IModelProvider provider, string model, string name = "file_summary")
+    /// <param name="rootDir">Where a bare file name is looked for. Without it only absolute paths resolve, which
+    /// is no use for a file handed to the job by name — the way every other tool here refers to one.</param>
+    public static AgentTool SummaryTool(
+        IModelProvider provider, string model, string name = "file_summary", string? rootDir = null)
     {
         return new AgentTool(
             name,
-            "Reads a local file (text-based formats and PDFs) and answers a question about it — or summarises " +
-            "it if no question is given. Returns a short answer grounded in the file's contents.",
+            "Reads a file and answers a question about it — or summarises it if no question is given. Takes the " +
+            "file's name as listed by list_files, or a full path. Text formats and PDFs.",
             new[]
             {
-                ToolParameter.String("path", "The path of the file to read.", required: true),
+                ToolParameter.String("path", "The file's name, or a full path.", required: true),
                 ToolParameter.String("question", "What to find out from the file. Omit to get a general summary.", required: false),
             },
-            (args, ct) => SummaryAsync(args, provider, model, ct));
+            (args, ct) => SummaryAsync(args, provider, model, rootDir, ct));
+    }
+
+    /// <summary>
+    /// A name, resolved where the files actually are.
+    /// <para>
+    /// Everything else in this conversation refers to a file by name — list_files reports names, write_file takes
+    /// one, deliverables are named. Only this tool demanded a full path, so asking it about a file the job had
+    /// been given came back "there's no file at X" when the file was sitting right there.
+    /// </para>
+    /// </summary>
+    private static string ResolvePath(string path, string? rootDir)
+    {
+        if (string.IsNullOrWhiteSpace(rootDir) || Path.IsPathRooted(path) || File.Exists(path)) return path;
+
+        var candidate = Path.Combine(rootDir, Path.GetFileName(path));
+        return File.Exists(candidate) ? candidate : path;
     }
 
     private static async Task<ToolOutput> SummaryAsync(
-        ToolCallArguments args, IModelProvider provider, string model, CancellationToken ct)
+        ToolCallArguments args, IModelProvider provider, string model, string? rootDir, CancellationToken ct)
     {
-        string path = args.GetString("path").Trim();
+        string path = ResolvePath(args.GetString("path").Trim(), rootDir);
         string? rawQuestion = args.GetStringOrNull("question")?.Trim();
         bool isSummary = string.IsNullOrEmpty(rawQuestion);
         string question = isSummary ? "Summarise the main points of this document." : rawQuestion!;
@@ -187,8 +239,40 @@ public static class FileTools
     /// <summary>Reduce any caller-supplied path to a safe bare file name (no directories, no traversal),
     /// sanitising characters the filesystem rejects. Combined with a fixed root, escaping is impossible.</summary>
     private static string SafeFileName(string name) =>
-        string.Concat(Path.GetFileName(name.Trim()).Select(c =>
-            Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+        CollapseStackedExtension(string.Concat(Path.GetFileName(name.Trim()).Select(c =>
+            Path.GetInvalidFileNameChars().Contains(c) ? '_' : c)));
+
+    /// <summary>
+    /// A file may only have the extension it ended up with.
+    /// <para>
+    /// write_file refuses HTML and says to write it as .md. Holding a name it had already chosen, a worker did
+    /// the most literal possible thing and produced <c>Holiday_Playbook_2027_Deck.html.md</c> — a markdown file
+    /// wearing the name of the deck it was told not to write, which then reached the user like that. The
+    /// instruction was followed exactly; the name was the part nobody checked.
+    /// </para>
+    /// <para>
+    /// So a stacked markup extension is collapsed to the real one. Only the handful that come from this
+    /// particular mistake, because plenty of doubled extensions are meant — <c>.tar.gz</c>, <c>.d.ts</c>,
+    /// <c>backup.2026.json</c> — and rewriting those would be a worse bug than the one being fixed.
+    /// </para>
+    /// </summary>
+    private static readonly string[] StackedMarkup = { ".html", ".htm", ".md", ".markdown", ".txt" };
+
+    private static string CollapseStackedExtension(string fileName)
+    {
+        var final = Path.GetExtension(fileName);
+        if (final.Length == 0) return fileName;
+
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+        var inner = Path.GetExtension(stem);
+        if (inner.Length == 0) return fileName;
+
+        bool bothMarkup =
+            StackedMarkup.Contains(final, StringComparer.OrdinalIgnoreCase) &&
+            StackedMarkup.Contains(inner, StringComparer.OrdinalIgnoreCase);
+
+        return bothMarkup ? Path.GetFileNameWithoutExtension(stem) + final : fileName;
+    }
 
     /// <summary>write_file(name, content): author a text file in this conversation's area (create/overwrite).</summary>
     public static AgentTool WriteFileTool(string rootDir, string name = "write_file")
@@ -208,6 +292,20 @@ public static class FileTools
                 string fileName = SafeFileName(args.GetString("name"));
                 if (fileName.Length == 0) return Task.FromResult(ToolOutput.Error("A file name is required."));
                 string content = args.GetStringOrNull("content") ?? "";
+
+                // A deck is not this tool's job, and asking nicely did not work: told three times over to use
+                // build_presentation, a worker hand-wrote HTML every time — once spending its whole run
+                // base64-encoding images into it. A refusal routes it in a way a description cannot.
+                if (fileName.EndsWith(".html", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.EndsWith(".htm", StringComparison.OrdinalIgnoreCase))
+                    return Task.FromResult(ToolOutput.DeadEnd(
+                        $"write_file doesn't write HTML. For something the user will look at — a deck, a " +
+                        "comparison, anything you would show someone — call build_presentation instead: it takes " +
+                        "the slides as markdown and handles the design, layout, paging and images for you. If you " +
+                        // Naming the corrected file rather than the rule: "write it as .md" was read as an
+                        // instruction to append, and produced Holiday_Playbook_2027_Deck.html.md.
+                        $"genuinely want a plain document, call write_file again with the name " +
+                        $"\"{Path.GetFileNameWithoutExtension(fileName)}.md\"."));
                 try
                 {
                     Directory.CreateDirectory(rootDir);
@@ -360,7 +458,12 @@ public static class FileTools
                     var convo = Directory.Exists(rootDir)
                         ? new DirectoryInfo(rootDir).GetFiles().OrderBy(f => f.Name).ToList()
                         : new List<FileInfo>();
-                    sb.Append("Files in this conversation:\n");
+                    // The directory is stated once, so a name here can be turned into a path when something
+                    // outside this toolset needs one. Uploading a photo to a web form is the case that forced
+                    // it: the browser reads files from disk itself and takes absolute paths, and a worker
+                    // holding only "PXL_1234.jpg" had no way to produce one — it tried building an empty File
+                    // in the page and fetching the bytes from an origin that wasn't there.
+                    sb.Append($"Files in this conversation (on disk at {rootDir}):\n");
                     if (convo.Count == 0) sb.Append("- (none yet)\n");
                     else foreach (var f in convo) sb.Append($"- {f.Name} ({HumanSize(f.Length)})\n");
 
@@ -375,11 +478,16 @@ public static class FileTools
                             foreach (var f in files) sb.Append($"- {f.FullName} ({HumanSize(f.Length)})\n");
                         }
 
-                    sb.Append("\nUse read_file / file_summary to read one, or send_file to send a conversation file to the user.");
+                    sb.Append("\nUse file_summary to read one by name, or find_in_file to search inside it.");
                     return Task.FromResult(ToolOutput.Ok(sb.ToString().TrimEnd()));
                 }
                 catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't list files: {ex.Message}")); }
-            });
+            })
+        {
+            // Listing twice is not a repeat: the point of looking again is that something was written in between,
+            // and refusing the second look told a worker its own new file did not exist.
+            Repeatable = true,
+        };
     }
 
     /// <summary>send_file(name, caption): send one of THIS conversation's files back to the user. The

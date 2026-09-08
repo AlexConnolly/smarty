@@ -186,6 +186,37 @@ public sealed class ControlHub
                 conv.Status = "waiting";
                 break;
             }
+            // Spend for a finished run, reported by the host. Kept on the run so the control centre can answer
+            // "what did that task cost?" without the orchestrator having to stay in memory.
+            case "spend":
+            {
+                string taskId = ReadString(data, "id") ?? "";
+                var run = RunFor(conv, taskId);
+                if (run is null) break;
+                try
+                {
+                    using var doc = JsonDocument.Parse(data);
+                    if (!doc.RootElement.TryGetProperty("models", out var models) || models.ValueKind != JsonValueKind.Array)
+                        break;
+
+                    int Int(JsonElement e, string prop) =>
+                        e.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : 0;
+
+                    run.Spend = models.EnumerateArray().Select(m => new RunSpend
+                    {
+                        Model = m.TryGetProperty("model", out var mm) ? mm.GetString() ?? "" : "",
+                        Calls = Int(m, "calls"),
+                        InputTokens = Int(m, "input"),
+                        CachedInputTokens = Int(m, "cachedInput"),
+                        OutputTokens = Int(m, "output"),
+                        ReasoningTokens = Int(m, "reasoning"),
+                        Cost = m.TryGetProperty("cost", out var c) && c.ValueKind == JsonValueKind.Number ? c.GetDecimal() : 0m,
+                        PriceKnown = m.TryGetProperty("priceKnown", out var pk) && pk.ValueKind == JsonValueKind.True,
+                    }).ToList();
+                }
+                catch (JsonException) { /* a malformed spend frame shouldn't lose the run */ }
+                break;
+            }
             case "working_done":
             {
                 string taskId = ReadString(data, "id") ?? "";
@@ -248,6 +279,19 @@ public sealed class ControlHub
 
     public ControlConversation? Conversation(string id) =>
         _conversations.TryGetValue(id, out var c) ? c : null;
+
+    /// <summary>
+    /// Forget a conversation and its runs. Deleting a chat has to reach here too: the hub keeps its own
+    /// transcript, and a conversation that still exists in the hub is one that can be reopened and re-listed —
+    /// so without this, "delete" only hides it until the next reload.
+    /// </summary>
+    public bool Forget(string id)
+    {
+        var removed = _conversations.TryRemove(id, out _);
+        lock (_lock) _runs.RemoveAll(r => string.Equals(r.ConversationId, id, StringComparison.OrdinalIgnoreCase));
+        if (removed) Persist();
+        return removed;
+    }
 
     /// <summary>All runs, newest first. Includes live (running/waiting) and finished runs across every surface.</summary>
     public IReadOnlyList<ControlRun> Runs()
@@ -348,7 +392,21 @@ public sealed class ControlHub
             }
             foreach (var r in snap.Runs)
             {
-                if (r.Status is "running" or "waiting") { r.Status = "interrupted"; r.EndedAt ??= r.StartedAt; }
+                // RUNNING is genuinely interrupted — it was mid-work and the work stopped.
+                //
+                // WAITING is not. It had already stopped, on purpose, holding a question for the user, and a
+                // restart changes nothing about that. Flattening the two lost the distinction and cost both
+                // ways: a real question could no longer be answered ("task #6 isn't waiting… status:
+                // interrupted"), while its text stayed on the record forever, because the hub only clears a
+                // question when a run reports finishing and a killed process never reports anything. Every
+                // question ever asked came back live on the next load, and the pile only grew.
+                if (r.Status == "running")
+                {
+                    r.Status = "interrupted";
+                    r.EndedAt ??= r.StartedAt;
+                    // Whatever it had asked earlier was answered long ago, or it would not have been working.
+                    r.PendingQuestion = null;
+                }
                 _runs.Add(r);
             }
         }
@@ -462,4 +520,21 @@ public sealed class ControlRun
     public DateTimeOffset StartedAt { get; set; }
     public DateTimeOffset? EndedAt { get; set; }
     public List<RunStep> Steps { get; set; } = new();
+
+    /// <summary>What this run cost, per model. Reported by the host when the run ends, so it survives a restart
+    /// alongside the rest of the run — and so Slack's spend arrives here too, cross-process, like its events do.</summary>
+    public List<RunSpend> Spend { get; set; } = new();
+}
+
+/// <summary>One model's tally within a run: tokens the way providers bill them, plus the cost we computed.</summary>
+public sealed class RunSpend
+{
+    public string Model { get; set; } = "";
+    public int Calls { get; set; }
+    public int InputTokens { get; set; }
+    public int CachedInputTokens { get; set; }
+    public int OutputTokens { get; set; }
+    public int ReasoningTokens { get; set; }
+    public decimal Cost { get; set; }
+    public bool PriceKnown { get; set; }
 }

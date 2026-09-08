@@ -18,6 +18,10 @@
 
   <ItemGroup>
     <ProjectReference Include="..\src\Smarty.Agents\Smarty.Agents.csproj" />
+    <ProjectReference Include="..\src\Smarty.Brain\Smarty.Brain.csproj" />
+    <!-- The contract an uploaded plugin is compiled against. It must be loaded by the HOST, not out of the
+         package, or the IPlugin the plugin implements is a different type from the one we look for. -->
+    <ProjectReference Include="..\src\Smarty.Plugins\Smarty.Plugins.csproj" />
   </ItemGroup>
 
   <ItemGroup>

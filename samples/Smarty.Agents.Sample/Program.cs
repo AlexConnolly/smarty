@@ -2,7 +2,7 @@ using System.Text.Json;
 using Smarty.Agents;
 
 var provider = new OllamaModelProvider("http://localhost:11434");
-var modelName = "qwen3:4b";
+var modelName = ModelSpec.DefaultModelName;
 
 var agentInput = new AgentInput
 {

@@ -15,7 +15,13 @@ public static class ShellTool
     {
         return new AgentTool(
             name,
-            "Runs a command in the local system shell and returns its output. A capable fallback when no other tool fits.",
+            // The two rules that used to sit in the worker's system prompt, describing a tool most workers do not
+            // even have. They belong on the tool: whoever can see this can act on it, and nobody else pays for it.
+            "Runs a command in the local system shell and returns its output. A capable fallback when no other " +
+            "tool fits: system info, local files, an API the web can't reach. NOT for downloading — download_file " +
+            "does that and looks like a browser. Never use it to base64-encode a file: a picture is already " +
+            "stored and already has a URL, and hand-encoding one produces a string too big to fit through a tool " +
+            "result, which has twice cost a run its entire budget.",
             new[]
             {
                 ToolParameter.String("command", "The command line to execute.", required: true),
@@ -63,8 +69,32 @@ public static class ShellTool
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
 
-        process.OutputDataReceived += (_, e) => { if (e.Data is not null) stdout.AppendLine(e.Data); };
-        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) stderr.AppendLine(e.Data); };
+        // Stopped at the source, not trimmed afterwards.
+        //
+        // A command's output has no natural size: one unbounded recursive listing of a home directory is megabytes,
+        // and truncating it later is too late — by then it has been collected, kept, and resent on every turn of
+        // the run. Asked to send an email, a worker ran several of those hunting for mail settings and exhausted
+        // the model's context in a single result.
+        //
+        // Detected by cost rather than by shape on purpose. A blocklist of reckless commands is unwinnable: it
+        // would need -Recurse without -First, dir /s, grep -r /, and whatever gets invented next. A byte limit
+        // catches every unbounded command, including the ones nobody thought of, and the one that trips it learns
+        // something specific — narrow the question.
+        bool overflowed = false;
+        void Collect(StringBuilder into, string? line)
+        {
+            if (line is null || overflowed) return;
+            if (stdout.Length + stderr.Length + line.Length > MaxOutputChars)
+            {
+                overflowed = true;
+                try { process.Kill(entireProcessTree: true); } catch { /* it may already be gone */ }
+                return;
+            }
+            into.AppendLine(line);
+        }
+
+        process.OutputDataReceived += (_, e) => Collect(stdout, e.Data);
+        process.ErrorDataReceived += (_, e) => Collect(stderr, e.Data);
 
         process.Start();
         process.BeginOutputReadLine();
@@ -83,6 +113,13 @@ public static class ShellTool
             return ToolOutput.Error($"Command timed out after {timeoutSeconds}s.\n{Combine(stdout, stderr)}");
         }
 
+        if (overflowed)
+            return ToolOutput.Error(
+                $"Stopped: this command produced more than {MaxOutputChars:N0} characters and was killed part-way, " +
+                "so what came back is incomplete and the rest does not exist. Running it again will do the same " +
+                "thing. Ask a smaller question instead — a path rather than a drive, a filter, -First, a count, or " +
+                "a pattern.\n\n" + Combine(stdout, stderr));
+
         int exitCode = process.ExitCode;
         string combined = Combine(stdout, stderr);
         bool failed = exitCode != 0 || stderr.Length > 0;
@@ -94,6 +131,22 @@ public static class ShellTool
 
         return new ToolOutput(combined, failed);
     }
+
+    /// <summary>
+    /// How much of a command's output may be collected before the command is killed.
+    /// <para>
+    /// A limit rather than a trim: trimming implies the output was gathered and then shortened, which is the
+    /// expensive half. Nothing beyond this is ever read, so a runaway command costs a moment and a partial
+    /// answer instead of a run.
+    /// </para>
+    /// <para>
+    /// Two thousand characters, not a hundred thousand. A hundred thousand is twenty-five thousand tokens for one
+    /// result, which is not a limit — it is a slower version of the problem. Two thousand fits a listing, a status,
+    /// a version, a count: the things a command is actually good for. Anything that does not fit was a question
+    /// that should have been asked more precisely, or asked of a different tool.
+    /// </para>
+    /// </summary>
+    private const int MaxOutputChars = 2_000;
 
     private static string Combine(StringBuilder stdout, StringBuilder stderr)
     {

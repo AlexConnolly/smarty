@@ -154,6 +154,15 @@ public sealed class PersonaStore
         // user-tunable. User-CREATED personas (not in BuiltIns) are left untouched.
         foreach (var t in BuiltIns)
             _personas[t.Id] = t with { Builtin = true };
+
+        // Drop a stored built-in that no longer exists in code. Without this, retiring a built-in leaves it in
+        // every existing personas.json forever — still offered to the router, and undeletable through the API
+        // because built-ins can't be deleted. User-created personas (Builtin: false) are never touched.
+        foreach (var stale in _personas.Values
+                     .Where(p => p.Builtin && BuiltIns.All(b => !string.Equals(b.Id, p.Id, StringComparison.OrdinalIgnoreCase)))
+                     .Select(p => p.Id).ToList())
+            _personas.Remove(stale);
+
         Save();
     }
 
@@ -179,6 +188,20 @@ public sealed class PersonaStore
             "Work from the real code: read it, quote the exact files/functions, and propose fixes as concrete " +
             "before/after changes — never invent. You propose changes; you don't deploy them.",
             new[] { "code", "files", "memory" }),
+
+        new Persona(
+            "proact",
+            "Proact",
+            "Works on the user's behalf without being asked: notices things, prepares work, proposes the rest.",
+            "Nobody asked you for this, so the bar is higher than usual, not lower. Everything you produce has to be " +
+            "about THIS person and drawn from something you actually read — a fact about their own week, work you " +
+            "did and left ready, or something worth offering them. Never advice they did not ask for, never a " +
+            "generality, never a greeting. You cannot send, buy, book or cancel anything and you have no tools that " +
+            "could; anything of that kind is a proposal for them to tick. Finding nothing worth reporting is a good " +
+            "outcome and you should say so plainly.",
+            // The blocks it starts from. What it ENDS with is narrower — the browser arrives read-only and the
+            // sending half of everything is removed by name. See Proact.Keep, which is where the boundary lives.
+            new[] { "read", "files", "memory", "web" }),
 
         new Persona(
             "sre",
@@ -219,6 +242,35 @@ public sealed class PersonaStore
             "You do NOT invent brands, visual identities, or design taste: if asked to create one from scratch, say " +
             "that's not something you do and ask for the guidelines to apply.",
             new[] { "documents", "data", "files", "memory" }),
+
+        // The role that was missing, and it is a finishing role.
+        //
+        // Everything else here either gathers material (research) or transforms one file into another (documents,
+        // images). Nobody was responsible for what the user actually SEES — so a general-purpose worker did it in
+        // passing, between reading pages, and produced bullet lists in a default typeface. Art direction is a
+        // separate job from finding things out, which is why agencies staff it separately.
+        new Persona(
+            "designer",
+            "Designer",
+            "Turns gathered material — findings, photographs, numbers — into something worth looking at: a " +
+            "presentation, a visual comparison, a page you would show someone. Composes; does not research.",
+            "You are a designer. Someone else did the research; your job is what the user SEES.\n" +
+            "Build with build_presentation. Choose the display font, the body font and the accent colour for THIS " +
+            "subject — two decks on unrelated subjects should not look alike, and leaving them " +
+            "unset gets a default, which is the only genuinely wrong answer. Where a slide deserves a layout of " +
+            "its own, write that slide as HTML with Tailwind classes rather than markdown.\n" +
+            "Pictures are the work, not decoration. Use chrome_images to find them — it gives size and alt text, " +
+            "which is what separates a photograph of the place from the logo and the payment icons — and read the " +
+            "alt before you use one. A slide describing somewhere with no picture of it has failed. Take images " +
+            "from the subject's own site where you can; a reseller's stock shot of a different pool is worse than " +
+            "none.\n" +
+            "Work with the material you are given: the project's files, the facts and lists it holds, the images on " +
+            "the pages you are pointed at. If something essential is missing — no photographs exist, a price was " +
+            "never established — say so plainly rather than inventing it or padding round it. You are not here to " +
+            "verify claims; you are here to present them well, and a placeholder is not presenting.",
+            // "web" because the pictures are on the web: chrome_images and chrome_grab_image live there, and a
+            // designer told to find photographs without a browser is a designer told to invent them.
+            new[] { "web", "files", "images", "data", "memory" }),
 
         new Persona(
             "image_editor",
@@ -269,11 +321,12 @@ public interface ICapability
 public sealed class CapabilityRegistry
 {
     private readonly Dictionary<string, ICapability> _caps;
+    private readonly object _lock = new();
 
     // Platform-agnostic FUNCTIONS → the integration(s) that provide them. Personas reference a function (e.g.
     // "project_management"), never a platform, so a Smarty instance connected to Trello instead of Jira lights up
     // the same persona. A reference that isn't a function key is treated as a direct integration id (back-compat).
-    private static readonly IReadOnlyDictionary<string, string[]> Functions =
+    private static readonly IReadOnlyDictionary<string, string[]> BuiltInFunctions =
         new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
         {
             ["project_management"] = new[] { "jira" },
@@ -289,22 +342,83 @@ public sealed class CapabilityRegistry
             ["conversion"] = new[] { "datascience" },
         };
 
-    // Expand a persona's capability refs (function ids and/or direct integration ids) into integration ids.
-    private static IEnumerable<string> ResolveIntegrations(IReadOnlyList<string> refs) =>
-        refs.SelectMany(r => Functions.TryGetValue(r, out var ints) ? ints : new[] { r }).Distinct(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string[]> _functions;
 
-    public CapabilityRegistry(IEnumerable<ICapability> capabilities) =>
+    // Expand a persona's capability refs (function ids and/or direct integration ids) into integration ids.
+    private IEnumerable<string> ResolveIntegrations(IReadOnlyList<string> refs)
+    {
+        lock (_lock)
+            return refs.SelectMany(r => _functions.TryGetValue(r, out var ints) ? ints : new[] { r })
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>
+    /// Register a capability at runtime, with the functions it answers — how an MCP server added from the control
+    /// centre starts contributing tools without restarting the host. Replaces one of the same id.
+    /// </summary>
+    /// <remarks>
+    /// Safe to do live because worker toolsets are assembled per task: the next task sees the new capability, and
+    /// a task already running keeps the toolset it started with.
+    /// </remarks>
+    public void Register(ICapability capability, IReadOnlyList<string>? functions = null)
+    {
+        lock (_lock)
+        {
+            _caps[capability.Id] = capability;
+            foreach (var function in functions ?? Array.Empty<string>())
+            {
+                var ids = _functions.TryGetValue(function, out var existing)
+                    ? existing.Where(i => !string.Equals(i, capability.Id, StringComparison.OrdinalIgnoreCase)).Append(capability.Id).ToArray()
+                    : new[] { capability.Id };
+                _functions[function] = ids;
+            }
+        }
+    }
+
+    /// <summary>Forget a capability and drop it from every function it answered.</summary>
+    public bool Unregister(string id)
+    {
+        lock (_lock)
+        {
+            if (!_caps.Remove(id)) return false;
+            foreach (var function in _functions.Keys.ToList())
+            {
+                var remaining = _functions[function]
+                    .Where(i => !string.Equals(i, id, StringComparison.OrdinalIgnoreCase)).ToArray();
+                if (remaining.Length == 0) _functions.Remove(function);
+                else _functions[function] = remaining;
+            }
+            return true;
+        }
+    }
+
+    /// <param name="capabilities">The integrations available to this host.</param>
+    /// <param name="extraFunctions">Function → integration ids discovered at runtime rather than declared in code,
+    /// which is how an MCP server claims a function ("browser") without the framework knowing the server exists.
+    /// Merged over the built-ins, so a configured server can also take over a built-in function.</param>
+    public CapabilityRegistry(
+        IEnumerable<ICapability> capabilities,
+        IReadOnlyDictionary<string, string[]>? extraFunctions = null)
+    {
         _caps = capabilities.ToDictionary(c => c.Id, StringComparer.OrdinalIgnoreCase);
 
-    public ICapability? Get(string id) => _caps.TryGetValue(id, out var c) ? c : null;
+        var functions = new Dictionary<string, string[]>(BuiltInFunctions, StringComparer.OrdinalIgnoreCase);
+        foreach (var (function, ids) in extraFunctions ?? new Dictionary<string, string[]>())
+            functions[function] = functions.TryGetValue(function, out var existing)
+                ? existing.Concat(ids).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+                : ids;
+        _functions = functions;
+    }
+
+    public ICapability? Get(string id) { lock (_lock) return _caps.TryGetValue(id, out var c) ? c : null; }
 
     /// <summary>All registered capabilities — for the control centre's "what tools can this call" view.</summary>
-    public IReadOnlyList<ICapability> All => _caps.Values.OrderBy(c => c.Id, StringComparer.Ordinal).ToList();
+    public IReadOnlyList<ICapability> All { get { lock (_lock) return _caps.Values.OrderBy(c => c.Id, StringComparer.Ordinal).ToList(); } }
 
     /// <summary>Runs system prerequisite validation for all registered capabilities.</summary>
     public void ValidateAll()
     {
-        foreach (var cap in _caps.Values)
+        foreach (var cap in All)
         {
             Console.WriteLine($"[startup] Validating capability: {cap.DisplayName} ({cap.Id})...");
             cap.ValidateSystemPrerequisites();
@@ -317,7 +431,7 @@ public sealed class CapabilityRegistry
     {
         var tools = new List<AgentTool>();
         foreach (var id in ResolveIntegrations(capabilityIds))
-            if (_caps.TryGetValue(id, out var cap))
+            if (Get(id) is { } cap)
                 tools.AddRange(cap.BuildTools(config, task));
         return tools;
     }
@@ -328,7 +442,7 @@ public sealed class CapabilityRegistry
     {
         var hints = new List<string>();
         foreach (var id in ResolveIntegrations(capabilityIds))
-            if (_caps.TryGetValue(id, out var cap) && cap.PromptHint is { Length: > 0 } hint
+            if (Get(id) is { } cap && cap.PromptHint is { Length: > 0 } hint
                 && cap.BuildTools(config, task).Count > 0)
                 hints.Add(hint);
         return hints;

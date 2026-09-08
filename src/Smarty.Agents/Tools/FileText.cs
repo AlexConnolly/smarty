@@ -1,4 +1,4 @@
-using System.IO.Compression;
+﻿using System.IO.Compression;
 using System.Text;
 using System.Text.RegularExpressions;
 using UglyToad.PdfPig;
@@ -17,10 +17,12 @@ public static class FileText
 {
     /// <summary>The outcome of extraction: the text (when <paramref name="Ok"/>), or a friendly reason it
     /// couldn't be read (a missing file, or a format not supported yet).</summary>
-    public readonly record struct ExtractResult(string Text, bool Ok, string? Reason);
+    /// <param name="Kind">What it turned out to be — "PDF", "Word document", "web page", "text". Named in the
+    /// window's header so the model knows whether it's looking at extracted prose or at source.</param>
+    public readonly record struct ExtractResult(string Text, bool Ok, string? Reason, string Kind = "text");
 
     private static ExtractResult Fail(string reason) => new("", false, reason);
-    private static ExtractResult Success(string text) => new(text, true, null);
+    private static ExtractResult Success(string text, string kind = "text") => new(text, true, null, kind);
 
     /// <summary>Extract readable text from a file. Best-effort and total — any failure comes back as a
     /// readable reason in <see cref="ExtractResult.Reason"/>, never an exception.</summary>
@@ -39,7 +41,7 @@ public static class FileText
 
                 case ".html":
                 case ".htm":
-                    return Success(WebSearcherTool.ToPlainText(File.ReadAllText(path)));
+                    return Success(WebSearcherTool.ToPlainText(File.ReadAllText(path)), "web page");
 
                 case ".docx":
                     return ExtractDocx(path);
@@ -59,7 +61,11 @@ public static class FileText
                 case ".webp":
                 case ".bmp":
                 case ".tiff":
-                    return Fail($"That's an image ({ext}); reading images isn't supported yet — text-based files and PDFs are.");
+                    // Naming the tool that CAN do it, because "not supported" sent a worker looking for a way to
+                    // read a screenshot as text instead of to the one tool that can see it.
+                    return Fail(
+                        $"That's an image ({ext}) — this tool reads text. Use describe_image with the same file " +
+                        "name to see what's in it.");
 
                 default:
                     return ExtractTextLike(path);
@@ -86,7 +92,7 @@ public static class FileText
         }
         var text = sb.ToString().Trim();
         return text.Length > 0
-            ? Success(text)
+            ? Success(text, "PDF")
             : Fail("That PDF has no extractable text (it may be scanned images — that needs OCR, which isn't supported yet).");
     }
 
@@ -106,7 +112,7 @@ public static class FileText
             xml = reader.ReadToEnd();
         var text = DocxXmlToText(xml);
         return text.Length > 0
-            ? Success(text)
+            ? Success(text, "Word document")
             : Fail("That .docx has no extractable text (it may be empty or contain only images).");
     }
 

@@ -9,6 +9,12 @@ public sealed class DataScienceCapability : ICapability
 {
     private string _pythonCmd = "python";
 
+    /// <summary>
+    /// The Python this host actually resolved to, for anything else that needs it. Set during validation, so
+    /// it is the interpreter already proven to exist and to have the libraries — not a second guess at one.
+    /// </summary>
+    public static string PythonCommand { get; private set; } = "python";
+
     public string Id => "datascience";
     public string DisplayName => "Data Science (Python code execution & report generation)";
     public IReadOnlyList<string> RequiredConfig => Array.Empty<string>();
@@ -44,6 +50,7 @@ public sealed class DataScienceCapability : ICapability
         try
         {
             _pythonCmd = ResolvePythonCommand();
+            PythonCommand = _pythonCmd;
             Console.WriteLine($"[datascience] Using Python command: '{_pythonCmd}'");
         }
         catch (Exception ex)

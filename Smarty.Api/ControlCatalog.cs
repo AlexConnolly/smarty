@@ -39,16 +39,24 @@ public sealed class ControlCatalog
     private readonly IntegrationConfig _config;
     private readonly string _ollamaBaseUrl;
     private readonly string _model;
+    private readonly Smarty.Brain.Memory? _memory;
 
     public ControlCatalog(PersonaStore personas, CapabilityRegistry capabilities, IntegrationConfig config,
-        string ollamaBaseUrl, string model)
+        string ollamaBaseUrl, string model, Smarty.Brain.Memory? memory = null)
     {
         _personas = personas;
         _capabilities = capabilities;
         _config = config;
         _ollamaBaseUrl = ollamaBaseUrl;
         _model = model;
+        _memory = memory;
     }
+
+    /// <summary>The memory's tools, for preview only — the catalogue exposes names, descriptions and parameters and
+    /// never calls one, so the provenance callback here is never invoked.</summary>
+    private IReadOnlyList<AgentTool> BrainToolSet() => _memory is null
+        ? Array.Empty<AgentTool>()
+        : MemoryTools.All(_memory, _memory.Graph, () => null, () => null);
 
     /// <summary>The base tools every worker gets regardless of persona (web, shell, files, memory).</summary>
     public IReadOnlyList<ToolMeta> BaseTools()
@@ -58,17 +66,25 @@ public sealed class ControlCatalog
         void Try(Func<AgentTool> build) { try { tools.Add(build()); } catch { /* skip a tool we can't preview */ } }
 
         Try(() => ShellTool.Create());
-        Try(() => WebResearch.SearchTool());
-        Try(() => WebResearch.PageAnswerTool(provider, _model));
         Try(() => FileTools.ReadFileTool());
         Try(() => FileTools.SummaryTool(provider, _model));
         Try(() => FileTools.WriteFileTool("(conversation files)"));
         Try(() => FileTools.ListFilesTool("(conversation files)"));
         Try(() => FileTools.SendFileTool("(conversation files)", (_, _) => true));
-        Try(() => MemoryTools.SearchTool(MemoryPlaceholder));
-        Try(() => MemoryTools.SetTool(MemoryPlaceholder));
+        tools.AddRange(BrainToolSet());
+        // The web arrives as the connected browser's tools, so they belong in the always-present set.
+        tools.AddRange(BrowserTools());
 
         return tools.Select(Meta).ToList();
+    }
+
+    /// <summary>The connected browser's tools — what "web research" resolves to now that there are no
+    /// fetch-and-extract tools. Empty when no MCP server claims the <c>browser</c> function.</summary>
+    private IReadOnlyList<AgentTool> BrowserTools()
+    {
+        var task = new TaskInfo { Id = "preview", Description = "preview" };
+        try { return _capabilities.BuildFor(new[] { "browser" }, _config, task); }
+        catch { return Array.Empty<AgentTool>(); }
     }
 
     public IReadOnlyList<CapabilityMeta> Capabilities()
@@ -108,13 +124,13 @@ public sealed class ControlCatalog
         foreach (var block in p.CapabilityIds)
             switch (block.Trim().ToLowerInvariant())
             {
-                case "web": Try(() => WebResearch.SearchTool()); Try(() => WebResearch.PageAnswerTool(provider, _model)); break;
+                case "web": tools.AddRange(BrowserTools()); break; // web research = the connected browser
                 case "read": Try(() => FileTools.ReadFileTool()); Try(() => FileTools.SummaryTool(provider, _model)); Try(() => FileTools.ListFilesTool("(conversation files)")); break;
                 case "files":
                     Try(() => FileTools.ReadFileTool()); Try(() => FileTools.SummaryTool(provider, _model));
                     Try(() => FileTools.WriteFileTool("(conversation files)")); Try(() => FileTools.EditFileTool("(conversation files)"));
                     Try(() => FileTools.FindInFileTool("(conversation files)")); Try(() => FileTools.ListFilesTool("(conversation files)")); break;
-                case "memory": Try(() => MemoryTools.SearchTool(MemoryPlaceholder)); Try(() => MemoryTools.SetTool(MemoryPlaceholder)); break;
+                case "memory": tools.AddRange(BrainToolSet()); break;
                 case "shell": Try(() => ShellTool.Create()); break;
                 default: try { tools.AddRange(_capabilities.BuildFor(new[] { block }, _config, task)); } catch { } break;
             }
@@ -130,8 +146,5 @@ public sealed class ControlCatalog
         t.Description,
         t.Parameters.Select(p => new ToolParamMeta(p.Name, p.Type, p.Description, p.Required)).ToList());
 
-    // A throwaway memory store only used to build the memory tools' metadata (never read or written here).
-    private static readonly MemoryStore MemoryPlaceholder =
-        new(Path.Combine(Path.GetTempPath(), "smarty-control-tool-preview.json"),
-            new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web));
+
 }

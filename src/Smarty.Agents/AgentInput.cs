@@ -26,8 +26,24 @@ public sealed class AgentInput
     /// needed. Defaults to true.</summary>
     public bool Think { get; set; } = true;
 
-    /// <summary>Maximum model round-trips before the loop gives up (guards against tool loops).</summary>
+    /// <summary>
+    /// Model round-trips before the supervisor is asked whether the run is still getting anywhere. Not a hard
+    /// stop: a run judged to be progressing is extended by half this again, as often as it keeps earning it, so
+    /// this sets the size of a stride rather than the length of the walk. A run judged stuck gets two turns to
+    /// wrap up. It follows that a small value doesn't just cut work short — it puts the question to the
+    /// supervisor early and often, and one pessimistic answer ends the run.
+    /// </summary>
     public int MaxIterations { get; set; } = 8;
+
+    /// <summary>
+    /// How many tool calls between forced stand-backs, where the worker states what it is trying to establish,
+    /// what it expects next, and what has stopped working. Zero turns it off.
+    /// <para>
+    /// Twelve by default: often enough to catch a run that has lost the thread, rare enough that it costs a few
+    /// sentences an hour rather than interrupting a worker who is getting on with it.
+    /// </para>
+    /// </summary>
+    public int ReflectEvery { get; set; } = 12;
 
     /// <summary>When a tool reports an error, inject a corrective nudge so the model retries
     /// instead of giving up and merely describing the failure.</summary>
@@ -85,6 +101,20 @@ public sealed class AgentInput
         "actual reply to the user — concise and complete. Put the answer in your response, not only in " +
         "your private thinking. Do not repeat your earlier reasoning. If you genuinely still need " +
         "information, call a tool — but do not loop or over-think.";
+
+    /// <summary>
+    /// The nudge injected when a turn COLLAPSED — the stream degenerated into a repeated token and was cut.
+    /// Deliberately different from <see cref="LoopRecoveryNudge"/>: nothing is being asked to "conclude" here,
+    /// because the turn produced no thought worth concluding. What it needs is to know the fragment it can see
+    /// itself starting to write was discarded and is not something to continue from, and that the way out is a
+    /// concrete next action rather than more narration.
+    /// </summary>
+    public string LoopCollapseNudge { get; set; } =
+        "That last turn broke: your output degenerated into the same token repeating, and it has been " +
+        "discarded — the user never saw it and it is not part of the conversation. Do not try to continue or " +
+        "repair that sentence. Take the next concrete step towards finishing the task instead: if you know " +
+        "what to do next, CALL THE TOOL for it now; if you have enough to answer, give the final answer " +
+        "plainly. Keep this turn short — long narration is what broke last time.";
 
     /// <summary>Whether to run a supervisor guard using the secondary model when turn or tool limits are reached
     /// to decide if the agent should continue (if making progress) or wrap up (if at a dead end).</summary>

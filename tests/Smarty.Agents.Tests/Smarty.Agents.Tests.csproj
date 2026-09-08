@@ -14,9 +14,20 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Real provider payloads, kept verbatim so a parser is tested against what the API actually sends. -->
+    <None Include="fixtures\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Smarty.Agents\Smarty.Agents.csproj" />
     <ProjectReference Include="..\..\Smarty.Api\Smarty.Api.csproj" />
     <ProjectReference Include="..\..\Smarty.Slack\Smarty.Slack.csproj" />
+    <!-- The plugins, for two different reasons. Weather's DLL has to sit beside the tests because the
+         install round trip zips a separately-compiled assembly, which is the only way to catch the contract
+         being loaded twice. Roborock is here for its internals: the frame codec, the request signature and
+         the room mapping are the parts that have to be exactly right and can't be proved by running it. -->
+    <ProjectReference Include="..\..\plugins\Smarty.Plugin.Weather\Smarty.Plugin.Weather.csproj" />
+    <ProjectReference Include="..\..\plugins\Smarty.Plugin.Roborock\Smarty.Plugin.Roborock.csproj" />
   </ItemGroup>
 
 </Project>

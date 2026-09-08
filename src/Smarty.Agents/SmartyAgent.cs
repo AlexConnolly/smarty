@@ -27,6 +27,52 @@ public sealed class SmartyAgent
     // How many turns from the cap to start announcing the remaining budget (when AnnounceBudget is on).
     private const int BudgetWarnThreshold = 3;
 
+    // How many times a repeatable tool may be called with identical arguments before it is treated as a loop.
+    // Three allows the legitimate pattern — read, navigate, read again, navigate, read — and stops the pattern
+    // that has no reading of the world behind it.
+    private const int RepeatableCallLimit = 3;
+
+    /// <summary>
+    /// How many times a call may come back with the identical result before it's treated as a dead end. Two
+    /// unchanged reads is a coincidence worth one more look; three is a worker grinding its budget away against a
+    /// page that isn't moving.
+    /// </summary>
+    private const int UnchangedResultLimit = 3;
+
+    /// <summary>
+    /// How many times a tool may REFUSE in exactly the same words before the run is told to stop trying.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The gap the other two guards left between them. One counts identical ARGUMENTS, and a worker trying to satisfy
+    /// a complaint changes its arguments every time, so the count never rises. The other compares results and only
+    /// looks at successful ones. An identical refusal, over and over, was invisible to both — and it is the clearest
+    /// evidence of a loop there is, because the tool is saying the same sentence about the same objection.
+    /// </para>
+    /// <para>
+    /// Found watching a panel sit on "Building the data feed" for four minutes: publishing was refused twelve times
+    /// running, with the identical message, while the worker rearranged everything except the thing being objected to.
+    /// Nothing in the run reported a fault; from outside it looked like slow work.
+    /// </para>
+    /// </remarks>
+    private const int IdenticalRefusalLimit = 3;
+
+    // A refusal this loop makes ITSELF must not count its own repeats out loud.
+    //
+    // The guard further down notices a tool refusing with the same objection over and over, and it compares the
+    // sentences. The refusals below are the ones most certain to repeat — and they used to number themselves
+    // ("…with these exact arguments 3 times", then 4, then 5), so every restatement was a different string and
+    // reset the count. The escalation was unreachable against exactly the refusals it was written for: a panel
+    // build looking for a football fixture was refused thirty-six times in a row by one of these sentences, each
+    // with a larger number in it, and nothing ever concluded it was one objection.
+    //
+    // The count is not lost — the escalation itself states it, which is the place it means something.
+
+    /// <summary>Sampling temperature for the one turn following a collapse. Enough noise to take a different
+    /// path out of the state that degenerated, low enough that tool-calling stays reliable — the retry still
+    /// has a job to do, and doing it accurately matters more than doing it differently.</summary>
+    private const double LoopRetryTemperature = 0.3;
+
     public SmartyAgent(AgentInput input, ModelProviderRegistry? registry = null)
     {
         _input = input ?? throw new ArgumentNullException(nameof(input));
@@ -54,11 +100,33 @@ public sealed class SmartyAgent
         int toolFailures = 0; // cumulative failed tool calls this run — drives the failure budget
         var toolCallCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase); // per-tool call budget
         var successfulToolCalls = new HashSet<string>(); // exact (name+args) signatures that succeeded
+        // How many times each exact signature has been attempted, across the whole run — the loop guard for tools
+        // that are otherwise allowed to repeat themselves.
+        var repeatSignatureCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        // The last thing each call returned, so a result that hasn't moved can be recognised as one.
+        var lastOutputBySignature = new Dictionary<string, string>(StringComparer.Ordinal);
+        var unchangedResultCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        // Keyed by tool NAME, not by call signature: the whole point is that the arguments keep changing while the
+        // objection does not.
+        var lastRefusalByTool = new Dictionary<string, string>(StringComparer.Ordinal);
+        var identicalRefusalCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        // The last tool run, so a repeat can be told from a return visit: only consecutive identical calls count.
+        string? lastToolCalled = null;
+        // When the next stand-back is due, in tool calls. Seeded so the first one lands after a real attempt
+        // rather than immediately, and moved forward each time so a long run is paced rather than nagged.
+        int nextReflectionAt = _input.ReflectEvery;
+        // True for exactly the turn that follows a stand-back, so a plan stated in prose isn't mistaken for a
+        // finished job.
+        bool justReflected = false;
 
         int currentMaxIterations = _input.MaxIterations;
         int currentMaxCallsPerTool = _input.MaxCallsPerTool;
         int currentMaxToolFailures = _input.MaxToolFailures;
         bool isDeadEndWrapUp = false;
+
+        // Non-null for ONE turn after a collapse: the retry samples with a little noise so it can't reproduce
+        // the same degenerate output token for token. Cleared as soon as a turn comes back clean.
+        double? retryTemperature = null;
 
         for (int iteration = 0; iteration < currentMaxIterations; iteration++)
         {
@@ -80,6 +148,37 @@ public sealed class SmartyAgent
             // matching tool result — which providers reject ("incomplete parallel tool-call group"). Close any
             // such gap before the model call so the group is always well-formed.
             EnsureToolCallsAnswered(conversation);
+
+            // Stand back every so often and say what this is for.
+            //
+            // Every other guard here asks "was that call wasteful?" and none asks "is this run getting anywhere?" —
+            // which is why a worker once alternated read_page and inspect two hundred times, each one refused by its
+            // own per-tool cap, each refusal simply redirecting it to the other tool. The caps fired correctly, the
+            // supervisor kept extending because every call returned something, and nothing ever asked it what it was
+            // trying to establish.
+            //
+            // This lands in the worker's OWN transcript rather than being a verdict passed over its head, so it
+            // changes the next decision instead of grading the last one. The important part is the prediction: an
+            // expectation stated out loud is falsifiable three calls later, and a model reading its own failed
+            // prediction is far likelier to change tack than one told to stop.
+            int callsSoFar = run.ToolInvocations.Count;
+            if (_input.ReflectEvery > 0 && callsSoFar > 0 && callsSoFar >= nextReflectionAt)
+            {
+                nextReflectionAt = callsSoFar + _input.ReflectEvery;
+                var reflection = Message.System(
+                    $"Pause. You have made {callsSoFar} tool calls. Before the next one, answer briefly — three or " +
+                    "four sentences, no lists:\n" +
+                    "1. What exactly are you trying to establish right now, and for which part of the task?\n" +
+                    "2. What do you expect the next few calls to give you? Be specific enough that you will know " +
+                    "if it doesn't happen.\n" +
+                    "3. What has not been working, and what should you stop doing? If a tool has told you to stop, " +
+                    "or the same approach has failed more than twice, that approach is finished — say what you will " +
+                    "do instead, or say you have enough and conclude.\n" +
+                    "This is for you, not the user. Then carry on.");
+                conversation.Add(reflection);
+                run.Messages.Add(reflection);
+                justReflected = true;
+            }
 
             // Budget awareness: as the turn cap approaches, tell the worker exactly how many turns remain so it
             // finishes the job — produces and SAVES its deliverable, then answers — instead of running out one
@@ -104,6 +203,7 @@ public sealed class SmartyAgent
                 Tools = _input.Tools,
                 MaxOutputTokens = _input.MaxOutputTokensPerTurn,
                 RepeatPenalty = _input.RepeatPenalty,
+                Temperature = retryTemperature,
                 TurnTimeout = _input.TurnTimeout,
                 Think = _input.Think,
             };
@@ -123,6 +223,7 @@ public sealed class SmartyAgent
                         break;
                     case ModelStreamEvent.Completed completed:
                         final = completed.Response;
+                        run.Spend.Record(_input.Model.Model, final);
                         break;
                 }
             }
@@ -133,24 +234,61 @@ public sealed class SmartyAgent
             // limit) and produced no tool call, don't treat the runaway turn as the answer. Discard it,
             // nudge the model to conclude using what it already has, and try again. Everything before
             // this turn (prior tool calls/results) stays in the conversation.
-            // A turn that produced NO answer and NO tool call is a dead end — it looped, timed out, hit
-            // the token cap, or finished with its answer trapped in the thinking channel (no real
-            // content). Nudge the model to actually answer the user, and retry. (final.Finish carries
-            // the specific reason if needed; for recovery, "no answer + no tool" is what matters.)
+            //
+            // A turn that produced NO answer and NO tool call is a dead end — it looped, timed out, hit the
+            // token cap, or finished with its answer trapped in the thinking channel (no real content).
+            //
+            // But emptiness was the ONLY test, and a collapsed turn is usually not empty. The provider watches
+            // the stream, spots the degenerate repetition and cuts it — leaving a coherent opening welded to a
+            // wall of one repeated token: "Let me find the Waitrose link on the feedcrimson crimson crimson…".
+            // That has content, so it read as a perfectly good answer, went into the transcript, and became part
+            // of the context for the next turn — which made the next collapse likelier still. One shopping run
+            // did that nineteen times and spent its whole budget on it. The stream already KNEW: FinishReason
+            // .Loop was set and thrown away. Believe it.
             bool noAnswer = string.IsNullOrWhiteSpace(final.Content);
-            if (noAnswer && !final.HasToolCalls && _input.RecoverFromLoops && iteration < currentMaxIterations - 1)
+            bool collapsed = final.Finish == FinishReason.Loop;
+
+            // The case that used to escape: a collapse that left REAL TEXT behind. An empty looping turn was
+            // already caught by noAnswer and is left exactly as it was — it needs telling to go and answer,
+            // which is a different instruction from "that sentence is gibberish, don't finish it".
+            bool collapsedMidSentence = collapsed && !noAnswer;
+
+            if ((noAnswer || collapsedMidSentence) && !final.HasToolCalls && _input.RecoverFromLoops
+                && iteration < currentMaxIterations - 1)
             {
-                var recovery = Message.System(_input.LoopRecoveryNudge);
+                // Drop the fragment on the floor. It is not evidence of anything, and the one thing that
+                // reliably provokes the next collapse is the last one sitting in the context.
+                if (collapsedMidSentence && streamedContent)
+                    yield return new AgentEvent.ContentCleared();
+
+                // At temperature 0 the retry would reproduce the collapse token for token — true whether the
+                // loop happened in the answer or in the reasoning. The nudge changes the context, which helps,
+                // but the sampling has to change too or "try again" means "do the identical thing again".
+                if (collapsed) retryTemperature = LoopRetryTemperature;
+
+                var recovery = Message.System(collapsedMidSentence ? _input.LoopCollapseNudge : _input.LoopRecoveryNudge);
                 conversation.Add(recovery);
                 run.Messages.Add(recovery);
                 continue;
             }
+
+            // Survived a clean turn — back to deterministic sampling for the next one.
+            if (!collapsed) retryTemperature = null;
 
             // Some models (notably small qwen) sometimes "chat" the tool call — emitting it as JSON
             // text in the content instead of as a structured call. Recover it so we actually run the
             // command rather than printing it back to the user.
             IReadOnlyList<ToolCall> toolCalls = final.ToolCalls;
             string answerText = final.Content ?? "";
+
+            // A collapse that still produced a real tool call: the intent survived, only the narration around
+            // it degenerated. Keep the call — it's the thing that makes progress — and bin the words, which are
+            // gibberish that would otherwise be transcribed and read straight back next turn.
+            if (collapsed && toolCalls.Count > 0 && !string.IsNullOrWhiteSpace(answerText))
+            {
+                if (streamedContent) yield return new AgentEvent.ContentCleared();
+                answerText = "";
+            }
             if (toolCalls.Count == 0 && TryExtractInlineToolCalls(answerText, out var inlineCalls, out var cleaned))
             {
                 toolCalls = inlineCalls;
@@ -161,6 +299,25 @@ public sealed class SmartyAgent
                 answerText, final.Reasoning, toolCalls.Count > 0 ? toolCalls : null);
             conversation.Add(assistantMessage);
             run.Messages.Add(assistantMessage);
+
+            // A stand-back is not an answer.
+            //
+            // Asked to explain itself, the worker replies in prose and calls no tool — which is byte-for-byte the
+            // shape of a finished job. So the run ended on the reflection and the user was handed "I'm gathering
+            // photos of each resort, three to go… nothing has failed" as their brochure, including the line saying
+            // it was not for them. The turn after a reflection is the one turn where text without a tool call means
+            // "still working", so it is kept in the transcript and the loop carries on.
+            if (justReflected && toolCalls.Count == 0)
+            {
+                justReflected = false;
+                var resume = Message.System(
+                    "Good. That was for your own benefit and the user has not seen it. Now DO the next thing you " +
+                    "just described — call the tool. Do not summarise your plan again.");
+                conversation.Add(resume);
+                run.Messages.Add(resume);
+                continue;
+            }
+            justReflected = false;
 
             if (toolCalls.Count == 0)
             {
@@ -191,15 +348,49 @@ public sealed class SmartyAgent
                 // with useless results (so the failure budget never trips): a relentless, going-nowhere loop.
                 string signature = call.Name + "|" + call.Arguments.ToString().ToLowerInvariant();
                 int priorCalls = toolCallCounts.TryGetValue(call.Name, out var cc) ? cc : 0;
+
+                // A stateful tool is largely exempt from the repeat guards: identical arguments genuinely mean
+                // something different once the world has moved. Reading a browser page after navigating elsewhere
+                // is the case that matters — same {tabId}, different page — and refusing it blocks precisely what
+                // the tool's description tells the model to do.
+                //
+                // Largely, not entirely. A blanket exemption removed the only thing standing between a stateful
+                // tool and a loop: a run asked for photos took the same screenshot of the same page twice in a
+                // row, then again, because nothing said no and a screenshot tells the model nothing it can read.
+                // So repeats are allowed but counted, and the same call with the same arguments stops being
+                // answered once it has clearly stopped being a fresh look at a changed world.
+                //
+                // "In a row" is the whole of it, and counting without that qualifier broke browsing outright: a
+                // worker clicked a link, asked to read the page it had just opened, and was refused because
+                // chrome_read_page{} is byte-identical every time it is called. Anything happening in between —
+                // a click, a navigation, a scroll — means the world may have moved, so the count starts again.
+                // Three reads with nothing between them is a loop; read, click, read, click, read is browsing.
+                bool repeatable = _tools.TryGetValue(call.Name, out var declared) && declared.Repeatable;
+                if (lastToolCalled is not null && !string.Equals(lastToolCalled, call.Name, StringComparison.Ordinal))
+                    repeatSignatureCounts.Clear();
+                lastToolCalled = call.Name;
+
+                repeatSignatureCounts.TryGetValue(signature, out int priorIdentical);
+                repeatSignatureCounts[signature] = priorIdentical + 1;
+                bool repeatedTooOften = repeatable && priorIdentical >= RepeatableCallLimit;
+                bool repeatInTurn = !seenToolCallsInThisTurn.Add(signature);
+
                 ToolOutput output;
-                if (!seenToolCallsInThisTurn.Add(signature))
+                if (repeatedTooOften)
+                {
+                    output = ToolOutput.DeadEnd(
+                        $"You have already run {call.Name} with these exact arguments, more than once, and it " +
+                        "has not changed. Whatever you are hoping will be different is not going to be. Use what " +
+                        "you have, try a genuinely different approach, or say plainly that you couldn't get it.");
+                }
+                else if (repeatInTurn && !repeatable)
                 {
                     // Exact repeat in the same turn
                     output = ToolOutput.DeadEnd(
                         $"You already ran {call.Name} with these exact arguments in this turn. Running it " +
                         "again changes nothing.");
                 }
-                else if (successfulToolCalls.Contains(signature))
+                else if (!repeatable && successfulToolCalls.Contains(signature))
                 {
                     // Exact repeat of a successful call from a prior turn
                     output = ToolOutput.DeadEnd(
@@ -234,9 +425,9 @@ public sealed class SmartyAgent
                         else
                         {
                             output = ToolOutput.DeadEnd(
-                                $"You've called {call.Name} {priorCalls} times this run and you're not getting there. STOP " +
-                                $"calling {call.Name} now — work with what you've already got and either give your best " +
-                                "answer or say plainly you couldn't find it. Don't call it again.");
+                                $"You've called {call.Name} more times this run than it was going to take, and you're " +
+                                $"not getting there. STOP calling {call.Name} now — work with what you've already got and " +
+                                "either give your best answer or say plainly you couldn't find it. Don't call it again.");
                             
                             if (!isDeadEndWrapUp)
                             {
@@ -251,9 +442,9 @@ public sealed class SmartyAgent
                     else
                     {
                         output = ToolOutput.DeadEnd(
-                            $"You've called {call.Name} {priorCalls} times this run and you're not getting there. STOP " +
-                            $"calling {call.Name} now — work with what you've already got and either give your best " +
-                            "answer or say plainly you couldn't find it. Don't call it again.");
+                            $"You've called {call.Name} more times this run than it was going to take, and you're " +
+                            $"not getting there. STOP calling {call.Name} now — work with what you've already got and " +
+                            "either give your best answer or say plainly you couldn't find it. Don't call it again.");
                     }
                 }
                 else
@@ -265,6 +456,76 @@ public sealed class SmartyAgent
                         successfulToolCalls.Add(signature);
                     }
                 }
+                // An identical RESULT is the real evidence of a loop — better evidence than an identical call.
+                //
+                // The repeat guard above counts calls, and only consecutive ones, because read/click/read is
+                // ordinary browsing. But a shopping run spent 192 of its 250 page reads on the byte-identical
+                // call, each separated by a click, and every one came back the same: the count never tripped
+                // while the worker ground through its whole budget re-reading a page that had not moved. Whether
+                // the world changed is a question the result answers directly, so ask it there.
+                //
+                // Returning the same payload again also pays for it again — a 1200-node page read is the most
+                // expensive thing in the transcript, and the second copy adds nothing.
+                if (!output.IsError && output.Content.Length > 0)
+                {
+                    if (lastOutputBySignature.TryGetValue(signature, out var previous)
+                        && string.Equals(previous, output.Content, StringComparison.Ordinal))
+                    {
+                        unchangedResultCounts.TryGetValue(signature, out int unchanged);
+                        unchangedResultCounts[signature] = unchanged + 1;
+
+                        output = unchanged + 1 >= UnchangedResultLimit
+                            ? ToolOutput.DeadEnd(
+                                $"{call.Name} has now returned exactly the same result {unchanged + 1} times in a " +
+                                "row. Nothing you are doing is changing it. Stop repeating this call: act on what " +
+                                "you already have, try a genuinely different approach, or say plainly that you " +
+                                "couldn't get there.")
+                            : ToolOutput.Ok(
+                                $"(Identical to the last {call.Name} with these arguments — nothing has changed " +
+                                "since, so the result is not repeated here. Use the copy above; if you expected a " +
+                                "change, whatever you did to cause it did not take effect.)");
+                    }
+                    else
+                    {
+                        lastOutputBySignature[signature] = output.Content;
+                        unchangedResultCounts.Remove(signature); // it moved; the world is live again
+                    }
+                }
+
+                // The same REFUSAL, again. Counted per tool rather than per call, because a worker trying to satisfy a
+                // complaint varies its arguments on every attempt — so the identical-arguments guard never fires while
+                // the identical objection repeats forever. A tool saying the same sentence three times running is not
+                // going to say anything else on the fourth.
+                if (output.IsError)
+                {
+                    if (lastRefusalByTool.TryGetValue(call.Name, out var previousRefusal)
+                        && string.Equals(previousRefusal, output.Content, StringComparison.Ordinal))
+                    {
+                        identicalRefusalCounts.TryGetValue(call.Name, out int refused);
+                        identicalRefusalCounts[call.Name] = refused + 1;
+
+                        if (refused + 1 >= IdenticalRefusalLimit)
+                            output = ToolOutput.DeadEnd(
+                                $"{call.Name} has now refused {refused + 1} times with exactly the same objection:\n" +
+                                output.Content +
+                                "\n\nEverything you have changed between those attempts was not the thing it is " +
+                                "objecting to. Re-read the objection literally and change ONLY what it names. If you " +
+                                "cannot see what it means, stop and say plainly what you were trying to do and what " +
+                                "it kept refusing — that is a fault worth reporting, and repeating the call is not.");
+                    }
+                    else
+                    {
+                        lastRefusalByTool[call.Name] = output.Content;
+                        identicalRefusalCounts.Remove(call.Name);
+                    }
+                }
+                else
+                {
+                    // It got through. Whatever the objection was, it is behind us.
+                    lastRefusalByTool.Remove(call.Name);
+                    identicalRefusalCounts.Remove(call.Name);
+                }
+
                 run.ToolInvocations.Add(new ToolInvocation(call.Name, call.Arguments.ToString(), output.Content, output.IsError));
 
                 var toolMessage = Message.ToolResult(call.Id, call.Name, output.Content);
@@ -709,4 +970,8 @@ public sealed class AgentRun
     public List<Message> Messages { get; } = new();
 
     public List<ToolInvocation> ToolInvocations { get; } = new();
+
+    /// <summary>What this run spent, per model — every provider request made while producing it, including the
+    /// cheap gate calls, so "what did that task cost?" has a real answer.</summary>
+    public ModelSpend Spend { get; } = new();
 }

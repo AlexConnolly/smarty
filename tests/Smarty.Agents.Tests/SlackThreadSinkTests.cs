@@ -73,6 +73,46 @@ public class SlackThreadSinkTests
     }
 
     [Fact]
+    public void An_announcement_and_its_answer_post_as_two_slack_messages()
+    {
+        // The orchestrator now ends the "let me check that for you" line as its own message and opens a second one
+        // for the answer. That orchestrator is shared with this surface, so the change lands here too — and two
+        // posts is right in Slack for the same reason it's right in the web app: it's what a person does. Locked
+        // down because the alternative failure is silent and the wrong way round — one post, with the announcement
+        // swallowed and only the answer arriving.
+        var (sink, api) = NewSink();
+        var msg = (int id, string role) => JsonSerializer.Serialize(new { id, role });
+        var end = (int id, string text) => JsonSerializer.Serialize(new { id, text });
+
+        sink.OnEvent("msg_start", msg(1, "assistant"));
+        sink.OnEvent("msg_end", end(1, "Let me check that for you."));
+        sink.OnEvent("msg_start", msg(2, "assistant"));
+        sink.OnEvent("msg_end", end(2, "Two things: the dentist at 10, and dinner at 8."));
+
+        var posts = api.Calls.Where(c => c.StartsWith("post ")).ToList();
+        Assert.Equal(2, posts.Count);
+        Assert.Contains("Let me check that for you.", posts[0]);
+        Assert.Contains("the dentist at 10", posts[1]);
+    }
+
+    [Fact]
+    public void The_users_own_turn_is_never_reposted_even_when_the_reply_is_split()
+    {
+        // The roles are tracked per message id and retired at its end. A second assistant message in the same turn
+        // must not disturb that bookkeeping and echo the human back into their own thread.
+        var (sink, api) = NewSink();
+        sink.OnEvent("msg_start", JsonSerializer.Serialize(new { id = 0, role = "user" }));
+        sink.OnEvent("msg_end", JsonSerializer.Serialize(new { id = 0, text = "what's on my calendar?" }));
+        sink.OnEvent("msg_start", JsonSerializer.Serialize(new { id = 1, role = "assistant" }));
+        sink.OnEvent("msg_end", JsonSerializer.Serialize(new { id = 1, text = "Let me look." }));
+        sink.OnEvent("msg_start", JsonSerializer.Serialize(new { id = 2, role = "assistant" }));
+        sink.OnEvent("msg_end", JsonSerializer.Serialize(new { id = 2, text = "Dentist at 10." }));
+
+        Assert.DoesNotContain(api.Calls, c => c.Contains("what's on my calendar?"));
+        Assert.Equal(2, api.Calls.Count(c => c.StartsWith("post ")));
+    }
+
+    [Fact]
     public void Progress_edits_the_same_message_rather_than_posting_new_ones()
     {
         var (sink, api) = NewSink();

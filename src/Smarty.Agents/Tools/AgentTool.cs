@@ -72,6 +72,20 @@ public sealed class AgentTool
 
     public IReadOnlyList<ToolParameter> Parameters { get; }
 
+    /// <summary>
+    /// True when the same arguments can legitimately return something different — because the answer depends on
+    /// state outside the call, not just on the inputs.
+    /// </summary>
+    /// <remarks>
+    /// The agent loop refuses an exact repeat of a call that already succeeded, which is right for a stateless
+    /// tool (searching the same query twice is a wasted turn) and WRONG for a stateful one. Reading a browser
+    /// page takes <c>{tabId}</c> and nothing else, so a read after navigating somewhere new looks byte-identical
+    /// to the read before it — and gets refused, exactly when the tool's own description is telling the model to
+    /// read again because the page changed. Such a tool sets this, and the repeat guards leave it alone; the
+    /// per-tool call budget and the watchdog still bound it, so runaway loops are still caught.
+    /// </remarks>
+    public bool Repeatable { get; init; }
+
     public Task<ToolOutput> InvokeAsync(ToolCallArguments arguments, CancellationToken ct = default)
         => _execute(arguments, ct);
 }
