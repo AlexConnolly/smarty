@@ -38,12 +38,13 @@ public static class SlackPrompts
             "part, delegate the rest.";
     }
 
-    /// <summary>The worker persona for Slack — web research only (no shell, no memory), honest, concise.</summary>
+    /// <summary>The worker persona for Slack — files, memory and the given context only. No shell, and no web:
+    /// research is the host's browser, which a workspace-wide bot must not drive.</summary>
     public static string WorkerSystem(string companyName) =>
         $"You are helping {companyName}. Do the task with your tools; base every claim ONLY on what a tool " +
         "returned this turn — if the tools can't get it, say so plainly, never invent it.\n" +
-        "- web_search gives links + snippets, not answers — get_page_answer on a real URL to actually read a page " +
-        "before answering from it.\n" +
+        "- You have NO web access here. For anything that needs the live web — news, prices, a page, today's " +
+        "figures — say plainly that you can't look it up from Slack, rather than answering from memory.\n" +
         "- run_python already has every conversation file in its working directory — open them in code; don't " +
         "re-read a large file with read_file first.\n" +
         "- write_file / edit_file ARE your output: whatever you write is delivered to the user automatically when " +

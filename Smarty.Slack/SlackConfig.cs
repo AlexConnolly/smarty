@@ -1,3 +1,5 @@
+using Smarty.Agents;
+
 namespace Smarty.Slack;
 
 /// <summary>
@@ -22,7 +24,7 @@ public sealed class SlackConfig
     public string? CompanyContext { get; init; }
 
     public string OllamaBaseUrl { get; init; } = "http://localhost:11434";
-    public string Model { get; init; } = "qwen3.5:latest";
+    public string Model { get; init; } = ModelSpec.DefaultModelName;
 
     /// <summary>Isolated data directory for Slack — its own memory/projects/training, NEVER the web app's
     /// real data dir. Defaults to a sibling folder so a test run can't touch the user's personal data.</summary>
@@ -62,7 +64,7 @@ public sealed class SlackConfig
             CompanyName = Opt("SMARTY_COMPANY_NAME") is { Length: > 0 } c ? c : "the team",
             CompanyContext = Opt("SMARTY_COMPANY_CONTEXT"),
             OllamaBaseUrl = Opt("OLLAMA_BASE_URL") is { Length: > 0 } u ? u : "http://localhost:11434",
-            Model = Opt("SMARTY_MODEL") is { Length: > 0 } m ? m : "qwen3.5:latest",
+            Model = Opt("SMARTY_MODEL") is { Length: > 0 } m ? m : ModelSpec.DefaultModelName,
             DataDir = Opt("SMARTY_SLACK_DATA_DIR") is { Length: > 0 } d ? d
                 : Path.Combine(AppContext.BaseDirectory, "slack-data"),
             ControlHubUrl = Opt("SMARTY_CONTROL_HUB_URL"),

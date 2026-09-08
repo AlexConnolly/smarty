@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 using Smarty.Agents;
 using Smarty.Api;
@@ -20,10 +20,33 @@ var json = new JsonSerializerOptions(JsonSerializerDefaults.Web)
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
 };
 
-// Isolated stores — Slack gets its OWN data dir, never the web app's real data. Memory/projects stay empty
-// here (no projects on Slack for now); they exist only to satisfy the shared orchestrator's constructor.
+// Isolated stores — Slack gets its OWN data dir, never the web app's real data. Projects stay empty here (no
+// projects on Slack for now); they exist only to satisfy the shared orchestrator's constructor.
 Directory.CreateDirectory(config.DataDir);
-var memory = new MemoryStore(Path.Combine(config.DataDir, "memory.json"), json);
+
+// Created up front because the people directory resolves Slack user ids through it.
+var api = new SlackApiClient(config.BotToken, config.AppToken);
+// The brain, and the directory that turns Slack user ids into people. See BRAIN_SPEC.md.
+//
+// WARNING: recall is NOT scoped to the channel any more. The old store filtered every fact against the room's
+// audience, so what three people said in a private channel could not surface anywhere else; the graph has no
+// equivalent, so everything in it is visible in every channel. Each edge records its Source, so who said it is
+// still known and a filter remains possible — but nothing enforces one, and in a shared workspace that is a leak
+// waiting to happen. Fine for one person testing; not fine for a company.
+var graph = new Smarty.Brain.Graph(config.DataDir, json);
+var brain = new Smarty.Brain.Memory(graph, ModelRouting.Provider(config.Model, config.OllamaBaseUrl),
+    config.Model, config.DataDir, json)
+{
+    Trace = line => Console.WriteLine(line),
+
+    // The boundary this gateway cannot do without: a channel's membership decides what may be recalled in it, so
+    // something three people discussed privately stays with those three.
+    Sees = BrainContext.Sees,
+};
+var people = new PeopleStore(Path.Combine(config.DataDir, "people.json"), json,
+    lookup: async (alias, ct) => alias.StartsWith("slack:", StringComparison.OrdinalIgnoreCase)
+        ? await api.GetUserIdentityAsync(alias[6..], ct).ConfigureAwait(false)
+        : (null, null));
 var projects = new ProjectStore(Path.Combine(config.DataDir, "projects.json"), json);
 var runs = new ProjectRunStore(Path.Combine(config.DataDir, "runs.json"), json);
 var training = new TrainingLog(Path.Combine(config.DataDir, "training-data"), json);
@@ -46,33 +69,23 @@ var personas = new PersonaStore();
 Console.WriteLine("[startup] Validating capability prerequisites...");
 capabilities.ValidateAll();
 
-string apiKey = Environment.GetEnvironmentVariable("TOGETHER_API_KEY") 
-    ?? Environment.GetEnvironmentVariable("OLLAMA_API_KEY") 
-    ?? Environment.GetEnvironmentVariable("SMARTY_API_KEY") ?? "";
-string? togetherBaseUrl = (config.OllamaBaseUrl.Contains("localhost") || config.OllamaBaseUrl.Contains("127.0.0.1")) ? null : config.OllamaBaseUrl;
-IModelProvider provider = config.Model.Contains("/") || (config.OllamaBaseUrl != null && config.OllamaBaseUrl.Contains("together"))
-    ? new TogetherModelProvider(apiKey, togetherBaseUrl)
-    : new OllamaModelProvider(config.OllamaBaseUrl);
+IModelProvider provider = ModelRouting.Provider(config.Model, config.OllamaBaseUrl);
 
-// Cache searches + fetched pages for an hour (persisted to the Slack data dir, survives restarts) so
-// repeated lookups don't re-hit — and re-trip the bot-blocks of — the search engines and sites.
-WebResearch.Cache = new FileResearchCache(Path.Combine(config.DataDir, "research-cache.json"));
-
-// Web research + read-only file tools — no shell (anyone who can @mention the bot would otherwise get code
-// execution on this host). The file tools only READ files the user attached (carried into the task workspace).
-var webTools = new AgentTool[]
+// Read-only file tools, and nothing else. No shell (anyone who can @mention the bot would otherwise get code
+// execution on this host) — and, since web research is now the browser, no web either: pointing a
+// workspace-wide bot at the host's signed-in Chrome would let any member of the workspace drive someone's
+// personal browser sessions. So Slack answers from what it's told, its memory, and the files it's given; it
+// says it can't when a question needs the live web.
+var readOnlyTools = new AgentTool[]
 {
-    WebResearch.SearchTool(),
-    WebResearch.PageAnswerTool(provider, config.Model),
     FileTools.ReadFileTool(),
     FileTools.SummaryTool(provider, config.Model),
 };
 
-// Per-user memory: a fact is scoped to the SPEAKER by default ("I'm vegetarian" → that person), or shared
-// team-wide when flagged (the office address). Reads span the speaker's own scope + the shared scope. The
-// worker's tools are built PER TASK so they carry the asker's scope (TaskInfo.UserScope); the orchestrator's
-// set_memory is a schema only — it's executed with the live speaker's scope inside the orchestrator.
-var planner = new TaskPlanner(config.Model, config.OllamaBaseUrl, () => webTools); // recon = web only, read-only
+// Knowledge is scoped by WHO WAS THERE, not by a personal/shared flag: the channel's membership is the
+// audience, so "I'm vegetarian" in a DM stays in that DM, and what three people agreed in a private channel is
+// recallable when those three talk again. The worker's tools are built PER TASK so they carry that task's room.
+var planner = new TaskPlanner(config.Model, config.OllamaBaseUrl, () => readOnlyTools); // recon: read what's attached
 
 // Supervisor: watches running workers and, when one thrashes (relentless failing search), nudges it to wrap
 // up with what it has — or aborts a hopeless task. The go/no-go check only runs when cheap signals trip.
@@ -81,14 +94,13 @@ var watchdog = new TaskWatchdog(config.Model, config.OllamaBaseUrl);
 var options = new OrchestratorOptions
 {
     SystemPrompt = SlackPrompts.OrchestratorSystem(config.CompanyName, config.CompanyContext),
-    // delegate + task management (no project tools) + per-user memory (recall/record from chat).
+    // delegate + task management (no project tools) + the brain (recall/record, scoped to the channel's people).
+    // These are schemas: the orchestrator executes them by name against the live room.
     Tools = Orchestrator.TaskTools
-        .Append(MemoryTools.SearchTool(memory))
-        .Append(MemoryTools.SetChatPersonalTool(memory))
+        .Concat(MemoryTools.All(brain, () => null, () => null))
         .ToArray(),
-    WorkerTools = task => webTools
-        .Append(MemoryTools.SearchPersonalTool(memory, task.UserScope, task.PersonalMemoryEnabled))
-        .Append(MemoryTools.SetPersonalTool(memory, task.UserScope, task.PersonalMemoryEnabled))
+    WorkerTools = task => readOnlyTools
+        .Concat(MemoryTools.All(brain, () => $"task {task.Id}", () => task.Room.Room.Key))
         .ToArray(),
     RevoiceThink = false,                            // re-voicing only relays completed results; disable think/CoT for speed
     Planner = planner,                               // size-gate + plan complex tasks in the background
@@ -96,16 +108,35 @@ var options = new OrchestratorOptions
     TurnTimeout = TimeSpan.FromSeconds(90),          // chat turn: cut a spiral early so recovery is quick (longer margin for local models)
     WorkspaceRoot = Path.Combine(config.DataDir, "tasks"), // each task gets task.md + the user's attached files
     Schedules = schedules,                           // schedule_task / cancel_schedule + proactive firing into the thread
+    People = people,                                 // slack ids -> people, so rooms resolve to audiences
     Personas = personas,                             // specialist roles delegate can route to
     Capabilities = capabilities,                     // integrations (Kibana…) personas draw on
     IntegrationConfig = integrations,                // credentials for capabilities — never shown to the model
+    Routing = new ProjectRouting(graph, null),       // no embedder here, so it falls back to asking which project
 };
+
+// Draining the queue. Nothing observes the delay: telling it something is instant, and a question reconciles
+// whatever is waiting before it answers.
+_ = Task.Run(async () =>
+{
+    while (true)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            foreach (var dropped in (await brain.ReconcileAsync().ConfigureAwait(false)).Dropped)
+                Console.WriteLine($"[brain] gave up on \"{dropped.Text}\" — {dropped.Error}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[brain] reconciliation loop: {ex.Message}");
+        }
+    }
+});
 
 var orchestrator = new Orchestrator(
     config.Model, config.OllamaBaseUrl, () => SlackPrompts.WorkerSystem(config.CompanyName),
-    json, training, memory, projects, runs, options);
-
-var api = new SlackApiClient(config.BotToken, config.AppToken);
+    json, training, brain, projects, runs, options);
 
 string botUserId;
 try { botUserId = await api.AuthTestAsync(); }
@@ -132,7 +163,7 @@ if (config.VoiceNotesEnabled)
     Console.WriteLine("[slack] Voice-note transcription enabled (Slack transcript + local Whisper fallback).");
 }
 
-var gateway = new SlackGateway(api, orchestrator, qualifier, botUserId, config.DataDir,
+var gateway = new SlackGateway(api, orchestrator, qualifier, botUserId, config.DataDir, people,
     config.ControlHubUrl, config.ControlToken, whisper, transcoder);
 var socket = new SlackSocketMode(api);
 

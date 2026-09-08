@@ -27,6 +27,7 @@ public sealed class SlackGateway
     private readonly Regex _mentionRegex;
     private readonly string? _controlHubUrl; // Smarty.Control hub to forward live events to (null = off)
     private readonly string? _controlToken;
+    private readonly PeopleStore _people;           // slack ids -> people, so a channel's membership becomes an audience
     private readonly WhisperTranscriber? _whisper;  // local speech-to-text fallback for voice clips (null = off)
     private readonly AudioTranscoder? _transcoder;  // ffmpeg → 16 kHz mono WAV for Whisper (null = off)
 
@@ -39,10 +40,12 @@ public sealed class SlackGateway
     private readonly object _seenLock = new();
 
     public SlackGateway(SlackApiClient api, Orchestrator orchestrator, EngagementQualifier qualifier, string botUserId, string dataDir,
+        PeopleStore people,
         string? controlHubUrl = null, string? controlToken = null,
         WhisperTranscriber? whisper = null, AudioTranscoder? transcoder = null)
     {
         _api = api;
+        _people = people;
         _orchestrator = orchestrator;
         _qualifier = qualifier;
         _botUserId = botUserId;
@@ -60,6 +63,10 @@ public sealed class SlackGateway
         public required Session Session { get; init; }
         public required string Channel { get; init; }
         public required string ThreadTs { get; init; }
+
+        /// <summary>True for a public channel ("C…") — open to the organisation, so its room is the wildcard and
+        /// only public knowledge is recalled or recorded there.</summary>
+        public bool IsPublicChannel { get; init; }
         public bool Backfilled { get; set; }
         public SemaphoreSlim Gate { get; } = new(1, 1); // serialises this thread's intake decisions
 
@@ -367,6 +374,9 @@ public sealed class SlackGateway
             // Gather every file across the batch into this one turn (a burst could include several uploads).
             var attachments = batch.Where(b => b.Attachments is not null).SelectMany(b => b.Attachments!).ToList();
             Trace($"turn for {batch.Count} message(s){(attachments.Count > 0 ? $", {attachments.Count} file(s)" : "")}: \"{Snip(combined, 80)}\"");
+            // Establish the room BEFORE the turn: who is in this channel right now, as people. Re-read every
+            // turn, so someone joining a private channel narrows recall on the very next message.
+            await EstablishRoomAsync(thread, lastUser, CancellationToken.None).ConfigureAwait(false);
             try { await _orchestrator.HandleMessageAsync(thread.Session, combined, CancellationToken.None, $"user:{lastUser}", lastName, attachments.Count > 0 ? attachments : null).ConfigureAwait(false); }
             catch (Exception ex) { Console.Error.WriteLine($"[slack] handle-message: {ex.Message}"); }
         }
@@ -446,6 +456,48 @@ public sealed class SlackGateway
         finally { session.TurnLock.Release(); }
     }
 
+    /// <summary>
+    /// Work out whose conversation this is, as people, and hand the brain the room.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A channel's membership IS the audience — that is the whole model. A DM resolves to two people, a private
+    /// channel to its members, and a public channel to the wildcard (anyone in the organisation), which recalls
+    /// and records public knowledge only.
+    /// </para>
+    /// <para>
+    /// Recomputed every turn on purpose. It costs a cached lookup, and it's what makes membership drift correct
+    /// for free: nobody has to remember to revoke anything when a fourth person joins.
+    /// </para>
+    /// </remarks>
+    private async Task EstablishRoomAsync(SlackThread thread, string? speakerId, CancellationToken ct)
+    {
+        var session = thread.Session;
+        var speaker = await _people.ResolveAsync($"slack:{speakerId}", ct).ConfigureAwait(false);
+
+        // A public channel is open to the whole organisation, so it is the wildcard room — not a big audience.
+        if (thread.IsPublicChannel)
+        {
+            session.IsPublicRoom = true;
+            session.Room = BrainContext.PublicRoom(speaker);
+            Trace($"room for {thread.Channel}: public");
+            return;
+        }
+
+        var memberIds = await _api.GetChannelMembersAsync(thread.Channel, ct).ConfigureAwait(false);
+        var participants = await _people.ResolveAllAsync(
+            memberIds.Where(id => id != _botUserId).Select(id => $"slack:{id}"), ct).ConfigureAwait(false);
+
+        session.IsPublicRoom = false;
+        session.ParticipantAliases = memberIds.Select(id => $"slack:{id}").ToList();
+        session.Room = participants.Count > 0
+            ? BrainContext.Group(participants, speaker)
+            : BrainContext.Unknown; // couldn't identify anyone — public-only recall, and no writes
+
+        Trace($"room for {thread.Channel}: {session.Room.Room} " +
+              $"({memberIds.Count} member(s), {participants.Count} identified)");
+    }
+
     private SlackThread GetThread(string channel, string threadTs)
     {
         string key = $"{channel}:{threadTs}";
@@ -454,8 +506,10 @@ public sealed class SlackGateway
             if (_threads.TryGetValue(key, out var existing)) return existing;
             var session = new Session($"slack:{key}");
             bool isDm = channel.StartsWith("D", StringComparison.OrdinalIgnoreCase);
-            session.PersonalMemoryEnabled = isDm;
-            Trace($"session created for thread {key}; DM={isDm}, personal memory {(isDm ? "enabled" : "disabled")}");
+            // A public channel ("C…") is open to the organisation; a DM ("D…") or private channel ("G…") has a
+            // membership that becomes the audience. The room itself is established per turn.
+            bool isPublic = channel.StartsWith("C", StringComparison.OrdinalIgnoreCase);
+            Trace($"session created for thread {key}; DM={isDm}, public={isPublic}");
             IEventSink sink = new SlackThreadSink(_api, channel, threadTs); // events -> this thread
             // Also mirror this thread's events to the Smarty.Control hub (cross-process, best-effort) so the
             // command centre shows Slack threads streaming live alongside the web chat.
@@ -469,7 +523,7 @@ public sealed class SlackGateway
                 sink = new CompositeEventSink(sink, forwarder);
             }
             session.Sink = sink;
-            var thread = new SlackThread { Session = session, Channel = channel, ThreadTs = threadTs };
+            var thread = new SlackThread { Session = session, Channel = channel, ThreadTs = threadTs, IsPublicChannel = isPublic };
             _threads[key] = thread;
             return thread;
         }

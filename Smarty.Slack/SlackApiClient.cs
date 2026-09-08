@@ -205,6 +205,92 @@ public sealed class SlackApiClient : ISlackThreadApi
         finally { _namesLock.Release(); }
     }
 
+    /// <summary>
+    /// A user's email address and display name — the canonical identity the brain scopes knowledge by, so the
+    /// same human in Slack, in email and in the web app is one person.
+    /// </summary>
+    /// <remarks>
+    /// Needs the <c>users:read.email</c> scope. Without it Slack returns the user with no email field, and the
+    /// caller gets null — which the brain treats as an unidentified participant, so the room becomes unknown and
+    /// recall falls back to public knowledge only. That's the safe failure, but it does mean no private recall
+    /// in Slack until the scope is granted.
+    /// </remarks>
+    public async Task<(string? Email, string? Name)> GetUserIdentityAsync(string? userId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrEmpty(userId)) return (null, null);
+        try
+        {
+            using var doc = await PostAsync("users.info", _botToken, new() { ["user"] = userId }, ct).ConfigureAwait(false);
+            var root = doc.RootElement;
+            if (!root.GetProperty("ok").GetBoolean() || !root.TryGetProperty("user", out var u))
+            {
+                Console.Error.WriteLine($"[slack] users.info for identity: {root.GetPropertyOrNull("error") ?? "not ok"}");
+                return (null, null);
+            }
+
+            var profile = u.TryGetProperty("profile", out var p) ? p : default;
+            var email = profile.GetPropertyOrNull("email");
+            var name = profile.GetPropertyOrNull("display_name") is { Length: > 0 } dn ? dn
+                : profile.GetPropertyOrNull("real_name") is { Length: > 0 } rn ? rn
+                : u.GetPropertyOrNull("name");
+
+            if (string.IsNullOrWhiteSpace(email))
+                Console.Error.WriteLine($"[slack] no email for {userId} — grant users:read.email, or this " +
+                                        "person can't be identified and their conversations stay public-only.");
+
+            return (email, name);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[slack] users.info identity error: {ex.Message}");
+            return (null, null);
+        }
+    }
+
+    /// <summary>
+    /// Who is in a channel — the participants a room's audience is built from. Paginated; bots are excluded
+    /// because Smarty being in the channel shouldn't widen or narrow who knowledge belongs to.
+    /// </summary>
+    /// <remarks>
+    /// A DM channel ("D…") returns its two members, which is exactly right: a DM is an audience of two, and
+    /// anything said there is recallable when those same two talk again. Returns empty when the call fails
+    /// (missing <c>conversations.members</c> scope), which makes the room unknown → public-only recall.
+    /// </remarks>
+    public async Task<IReadOnlyList<string>> GetChannelMembersAsync(string channelId, CancellationToken ct = default)
+    {
+        var members = new List<string>();
+        string? cursor = null;
+        try
+        {
+            do
+            {
+                var args = new Dictionary<string, string> { ["channel"] = channelId, ["limit"] = "200" };
+                if (cursor is { Length: > 0 }) args["cursor"] = cursor;
+
+                using var doc = await PostAsync("conversations.members", _botToken, args, ct).ConfigureAwait(false);
+                var root = doc.RootElement;
+                if (!root.GetProperty("ok").GetBoolean())
+                {
+                    Console.Error.WriteLine($"[slack] conversations.members: {root.GetPropertyOrNull("error") ?? "not ok"}");
+                    return members;
+                }
+
+                if (root.TryGetProperty("members", out var list) && list.ValueKind == JsonValueKind.Array)
+                    foreach (var m in list.EnumerateArray())
+                        if (m.GetString() is { Length: > 0 } id) members.Add(id);
+
+                cursor = root.TryGetProperty("response_metadata", out var meta)
+                    ? meta.GetPropertyOrNull("next_cursor") : null;
+            }
+            while (cursor is { Length: > 0 } && members.Count < 1000);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[slack] conversations.members error: {ex.Message}");
+        }
+        return members;
+    }
+
     // Slack's Web API methods take FORM-ENCODED params. (A JSON body is honoured for a few write methods like
     // chat.postMessage, but the read methods — users.info, conversations.replies — silently ignore it and fail
     // with user_not_found / missing args. Form-encoding works for every method, so we use it throughout.)

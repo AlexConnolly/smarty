@@ -21,7 +21,7 @@ npm run dev
 ```
 
 Then open the URL Vite prints (http://localhost:5173 if free). Requires the local Ollama
-gateway running qwen3 (the API reads `Ollama:BaseUrl` / `Ollama:Model` from `appsettings.json`).
+gateway running the base model (the API reads `Ollama:BaseUrl` / `Ollama:Model` from `appsettings.json`).
 
 ## Controls
 - **model** — pick any model the gateway reports (`GET /api/models`).

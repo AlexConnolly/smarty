@@ -6,9 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check:widgets": "node scripts/check-widgets.mjs",
+    "check:classes": "node scripts/check-classes.mjs",
+    "check:voice": "node --test scripts/wake.test.ts scripts/speech.test.ts"
   },
   "dependencies": {
+    "@babel/standalone": "^8.0.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",

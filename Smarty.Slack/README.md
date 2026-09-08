@@ -2,7 +2,8 @@
 
 Smarty, in your Slack workspace. Tag **@smarty** in any thread and it joins as a teammate: it reads what's
 going on in the thread, decides when it's actually being spoken to, and does real work in the background
-(web research), posting answers back into the thread. Casual, fast, snappy — not chunky.
+(files, memory — deliberately no web and no shell), posting answers back into the thread. Casual, fast,
+snappy — not chunky.
 
 It reuses the existing engine (`Smarty.Api`'s `Orchestrator` + `Session`) unchanged. The only differences
 are a Slack-flavoured system prompt, a project-free toolset, web-only workers, and a Slack output sink. The
@@ -68,7 +69,8 @@ $env:SLACK_BOT_TOKEN     = "xoxb-…"          # required
 $env:SLACK_APP_TOKEN     = "xapp-…"          # required (Socket Mode)
 $env:SMARTY_COMPANY_NAME = "Acme Ltd"        # who Smarty is working with (shown in its prompt)
 $env:SMARTY_COMPANY_CONTEXT = "We build…"    # optional: extra context/tone for the prompt
-$env:SMARTY_MODEL        = "qwen3:4b"         # optional (default qwen3:4b)
+$env:SMARTY_MODEL        = "qwen3.5:latest"   # optional (default deepseek-ai/DeepSeek-V4-Flash-0731)
+$env:TOGETHER_API_KEY    = "..."             # required unless SMARTY_MODEL is a local Ollama tag
 $env:OLLAMA_BASE_URL     = "http://localhost:11434"  # optional
 # $env:SMARTY_SLACK_DATA_DIR = "C:\…"        # optional; defaults to a local slack-data folder
 
@@ -89,7 +91,8 @@ Smarty acks in-thread, researches in the background, and replies with the answer
 | `SLACK_APP_TOKEN` | yes | — | App-level token (`xapp-…`) for Socket Mode |
 | `SMARTY_COMPANY_NAME` | no | `the team` | Who Smarty is working with |
 | `SMARTY_COMPANY_CONTEXT` | no | — | Extra workspace context/tone for the prompt |
-| `SMARTY_MODEL` | no | `qwen3:4b` | Ollama model |
+| `SMARTY_MODEL` | no | `deepseek-ai/DeepSeek-V4-Flash-0731` | model id — a `/` in it means Together AI, otherwise an Ollama tag |
+| `TOGETHER_API_KEY` | for a Together model | — | Together AI key |
 | `OLLAMA_BASE_URL` | no | `http://localhost:11434` | Ollama gateway |
 | `SMARTY_SLACK_DATA_DIR` | no | `./slack-data` | Isolated data dir (never the web app's data) |
 | `SMARTY_VOICE_NOTES` | no | `1` | Voice-note transcription. `0`/`false` to disable the local-Whisper fallback (then only Slack's own transcripts are used) |

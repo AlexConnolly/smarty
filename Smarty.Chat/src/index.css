@@ -2,6 +2,13 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Left at the browser default on purpose.
+ *
+ * Raising this scales Tailwind's SPACING as well as its type — px-4, h-9, gap-2 and max-w-reading are all rem —
+ * so a root bump inflates padding and control sizes by the same amount and the whole thing reads as blown up
+ * rather than more legible. The type sizes are set directly instead: body at 1rem, and nothing below 0.75rem.
+ */
 html,
 body,
 #root {
@@ -116,6 +123,68 @@ body {
   animation: slide-up 0.26s cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
+/*
+ * A sheet rises from the edge it came from, all the way.
+ *
+ * slide-up moves ten pixels, which is right for a card settling into place and wrong for a bottom sheet — that has to
+ * look like it came from off-screen, or it reads as a box that appeared in the middle of the page. Above `sm` the
+ * translate is dropped, since there the same component is a centred dialogue and sliding it would be motion for its
+ * own sake.
+ */
+@keyframes sheet-up {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/*
+ * The travel is 18px, not the sheet's own height.
+ *
+ * A full translateY(100%) looks more native and has one intolerable failure mode: Chrome pauses animation timelines in
+ * an unfocused tab, and an animation that is ACTIVE BUT AT TIME ZERO still applies its from-keyframe — fill-mode only
+ * governs what happens outside the active window. Measured exactly that: playState "running", currentTime 0,
+ * transform translateY(433px), a 434px sheet sitting entirely below a 660px viewport and staying there.
+ *
+ * So the resting position is never more than a few pixels away. It still reads as rising, and the worst case is a
+ * sheet that is 18px low for a moment rather than one that cannot be seen at all.
+ */
+/*
+ * The default way anything arrives on this page.
+ *
+ * Everything used to appear at once, fully formed, which is why the page felt like a document rather than something
+ * alive. A short rise with a per-item delay reads as the page assembling itself — and it costs nothing, because the
+ * delay is an inline style on each item rather than a class per position.
+ *
+ * Two levels of it, deliberately: panels stagger against each other, and the rows INSIDE a panel stagger against each
+ * other. The second is what makes a list feel considered instead of pasted in.
+ */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-rise {
+  animation: rise 0.42s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+}
+
+.animate-sheet-up {
+  animation: sheet-up 0.28s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+}
+@media (min-width: 640px) {
+  .animate-sheet-up {
+    animation: scale-in 0.2s ease-out forwards;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -147,4 +216,46 @@ body {
   width: 25%;
   background: #4f46e5;
   animation: slide-progress 1.4s ease-in-out infinite;
+}
+
+/*
+ * A panel that outgrows its box scrolls inside itself.
+ *
+ * The box is a fixed size on purpose — that is what makes the grid tile — and a generated component will sometimes
+ * want one row more than fits. Clipping loses the rest with no indication, which is the worst option; letting the
+ * box grow breaks the layout. So it scrolls, and the scrollbar is hidden so a panel that does fit looks untouched.
+ */
+.widget-scroll {
+  scrollbar-width: none;
+}
+.widget-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/*
+ * Nothing inside a panel may demand more width than the panel has.
+ *
+ * The flexbox trap, and it caught every generated component that laid out a row by hand: a flex child holding text
+ * keeps its content's intrinsic width unless it is told it may shrink, so a long headline pushes past the panel edge
+ * and the card's overflow-x-hidden slices it off mid-word. A news panel read "Using AI the wrong way could leave you
+ * worse off than never us" and stopped; a weather panel lost the right half of its "London" badge. Nothing threw,
+ * nothing logged, and the component looked reasonable in isolation.
+ *
+ * Fixed here rather than left to each generated component to remember, because the panel is a FIXED box and this is
+ * a property of the box, not of the thing inside it. Long words break rather than escape.
+ */
+.widget-scroll,
+.widget-scroll * {
+  min-width: 0;
+}
+
+/*
+ * break-word, not anywhere.
+ *
+ * `anywhere` breaks at any character the moment a line is tight, which turned a clock into "21:0 / 0" across two
+ * lines. `break-word` only breaks a word that cannot fit on a line of its own — so a long url still wraps instead of
+ * escaping, and a five-character time stays a time.
+ */
+.widget-scroll {
+  overflow-wrap: break-word;
 }

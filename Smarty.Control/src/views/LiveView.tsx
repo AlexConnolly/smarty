@@ -1,5 +1,5 @@
 import type { ControlState } from '../store'
-import { timeAgo } from '../api'
+import { timeAgo, readable } from '../api'
 import { Card, EmptyState, Pill, StatusDot, SurfaceBadge } from '../ui'
 import { Timeline } from '../Timeline'
 
@@ -39,7 +39,7 @@ export function LiveView({ state, onOpen }: { state: ControlState; onOpen: (id: 
                       <span className="flex items-center gap-2 text-xs text-ink-mute">
                         <SurfaceBadge surface={c.surface} />
                         {c.subtitle && <span className="truncate">{c.subtitle}</span>}
-                        {c.project && <Pill tone="accent">{c.project}</Pill>}
+                        {c.project && <Pill tone="accent">{readable(c.project)}</Pill>}
                       </span>
                     </span>
                     <span className="shrink-0 text-xs text-ink-mute">{timeAgo(c.lastActivityAt)}</span>

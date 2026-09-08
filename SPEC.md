@@ -14,14 +14,15 @@ var input = new AgentInput
 {
     SystemPrompt = "You are a system administrator assistant.",
     Tools = { shellTool },                 // a tool with multiple parameters
-    Model = ModelSpec.Ollama("qwen3:4b"),  // provider spec lives in the input
+    Model = ModelSpec.Default,             // provider spec lives in the input
 };
 
 string answer = await new SmartyAgent(input).Answer("What is the current system status?");
 ```
 
-The default model provider is the **local Ollama gateway** (`http://localhost:11434`)
-running **qwen3**.
+The default is the base model, **DeepSeek V4 Flash** on Together AI
+(`ModelSpec.DefaultModelName`); a model id with no `/` in it routes to a **local Ollama
+gateway** (`http://localhost:11434`) instead. `ModelRouting` owns that rule.
 
 ---
 
@@ -79,7 +80,8 @@ public interface IModelProvider
 - `ModelResponse` = the assistant message (clean text content + any tool calls + optional reasoning).
 
 `ModelSpec` selects a provider and model: `(Provider, Model, BaseUrl?)`. Factory helpers:
-`ModelSpec.Ollama("qwen3:4b")`, `ModelSpec.Default` (== Ollama qwen3:4b).
+`ModelSpec.Ollama("qwen3.5:latest")`, `ModelSpec.Together()`, `ModelSpec.Default`
+(== Together `ModelSpec.DefaultModelName`). `ModelRouting.Spec`/`.Provider` pick between them from a model id.
 
 `ModelProviderRegistry` resolves a `ModelSpec` to an `IModelProvider`. The default
 registry knows the `"ollama"` provider. Callers can register more providers later.
