@@ -19,6 +19,9 @@ Smarty.Api/sse_*.txt
 # Personal memory store
 Smarty.Api/data/
 data/
+# Snapshots taken before wiping the assistant's state, so a reset is never one-way.
+Smarty.Api/data-archive-*/
+data-archive-*/
 
 # Integration credentials (Kibana/GitHub/Jira tokens, endpoints) — NEVER commit
 integrations.json
@@ -32,3 +35,22 @@ slack-data/
 *.local.ps1
 .env
 .env.*
+
+# Generated patches are the deliverable, not part of the tree — and a patch that
+# contains itself is 160k lines of nothing.
+*.patch
+
+# Packaged plugins (scripts/pack-plugin.ps1) — build output, and the zip is whatever was last built.
+/dist/
+
+# Build output redirected into the repo so a build can run while the app holds bin/.
+.brainbin/
+
+# Scratch dumps from driving the widget/panel API by hand — API responses, not source.
+/w*.json
+/cs.json
+Smarty.Api/b64_*.txt
+Smarty.Api/leicester_2015-16_shirt.webp
+
+# Running spend accounting, rewritten on every turn.
+token_usage.json
